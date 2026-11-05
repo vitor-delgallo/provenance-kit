@@ -19,6 +19,10 @@ have counsel review anything marked as a risk before you distribute a product.
 | AudioSeal (`audioseal` 0.2.1) | `audio-watermark` | MIT | MIT (since 2024-04-02) | Low; use current weights only |
 | PDQ (`pdqhash` 0.2.8) | `image-hash` | MIT bindings + BSD-3-Clause PDQ | none | Low; no Linux wheels |
 | imagehash (`ImageHash` 4.3.2) | `image-hash` | BSD-2-Clause | none | Low |
+| PDQ NumPy port (in `provenance_kit.image`) | core install | BSD-3-Clause (Meta ThreatExchange; notice kept) | none | Low |
+| PDQ test vectors (ThreatExchange) | tests only | BSD-3-Clause; images downloaded at test time, not redistributed | none | None |
+| Aileron Regular (Pillow's default font) | core (`image.visible`) | CC0 (embedded in Pillow; not bundled by provenance-kit) | none | Low |
+| HEIC/HEIF decoders (`pillow-heif`, `pi-heif`) | **not a dependency** | `pillow-heif` wheels **GPL-2.0**; `pi-heif` LGPL-3.0, discontinued | none | **High if bundled; see below** |
 | c2pa-python (`c2pa-python` 0.38) | `c2pa` | MIT OR Apache-2.0 | none | Low |
 | OpenTimestamps (`opentimestamps` 0.5.0) | `timestamps` | **LGPL-3.0-or-later** | none | **Medium: weak copyleft** |
 | Chromaprint `fpcalc` 1.6.2 (binary) | `audio` | MIT source, **LGPL-2.1 as a whole** | none | **Medium if you ship the binary** |
@@ -47,6 +51,12 @@ them on your own servers does not trigger the distribution conditions.
   in production. Transitive dependencies are permissive: `torchvision`
   (BSD-3-Clause), `lightning` (Apache-2.0), `omegaconf` (BSD-3-Clause),
   `einops` (MIT).
+* provenance-kit does not use that loader: `image.watermark` pins the size
+  and SHA-256 of the config, encoder and decoder of variants Q, P, B and C
+  (`MODEL_FILES`, taken on 2026-11-05; every file's MD5 matched the package's
+  own `MODEL_CHECKSUMS`), loads them from a caller directory outside
+  `site-packages`, and downloads only through `download_trustmark_models`.
+  The watermark-remover and box-detector checkpoints are never fetched.
 
 ### VideoSeal (Meta)
 
@@ -67,6 +77,11 @@ them on your own servers does not trigger the distribution conditions.
   license" ([README](https://github.com/facebookresearch/videoseal#license)).
   This covers VideoSeal, PixelSeal and ChunkySeal; the third-party baseline
   models the repository can evaluate against are not covered and are not used.
+* Pinned file (verified 2026-11-05): `y_256b_img.jit`, 228,524,815 bytes,
+  SHA-256 `5c7a4581c36fc6090aafdcfb3999123bae5172a4847f22e2da4e7fd1a39d1e1b`
+  (computed from the file at the official URL, `Last-Modified` 2025-04-02;
+  upstream publishes no checksum). Loaded with `torch.jit.load` after the hash
+  check; never downloaded unless the caller asks.
 
 ### AudioSeal (Meta)
 
@@ -83,6 +98,23 @@ them on your own servers does not trigger the distribution conditions.
 * **Watch:** weights published before April 2024 were under a non-commercial
   license. Load only the current checkpoints from `facebook/audioseal`, pinned
   by hash.
+* Checked 2026-11-05 (video/audio module work): the GitHub repository shipped
+  `LICENSE_weights` (CC-BY-NC 4.0) until commit `2956515` of 2024-04-02
+  ("Re-update of license") removed it; a first relicensing on 2024-03-09 had
+  been reverted on 2024-03-11. The 16-bit base checkpoints used by
+  provenance-kit (`generator_base.pth`, SHA-256
+  `7a845b5fbe9364a63a3909d8ab3fe064d13a76ae4c2e983573e08c69b7b51748`;
+  `detector_base.pth`, SHA-256
+  `8a78e8a83584113523e161fc599fcab10fd0e94c04d2eb9d2fa1e9ec91ab69d9`) were
+  uploaded to Hugging Face on 2024-03-11 and are byte-identical at every
+  revision since, and also to the files first published on 2024-02-04 at
+  `dl.fbaipublicfiles.com/audioseal/6edcf62f/`. There is no separate
+  post-relicensing set of weights: the current files are the original ones,
+  covered by MIT through the licensor's 2024-04-02 statement. provenance-kit
+  pins them by SHA-256 and downloads them only from Hugging Face revision
+  `3c19eba53390776cf2cc9ed5f6c9ac67ce72ecba` (model card `license: mit`).
+  The checkpoints are pickles; they are read with an allowlist unpickler
+  after the hash check (see `docs/audio.md`).
 
 ### PDQ: `pdqhash`
 
@@ -118,6 +150,54 @@ them on your own servers does not trigger the distribution conditions.
   NumPy, Pillow.
 * Weights: none.
 
+### PDQ NumPy port and test vectors
+
+* `src/provenance_kit/image/_pdq_numpy.py` is a port of
+  `pdq/python/pdqhashing/hasher/pdq_hasher.py` and `utils/matrix.py` from
+  [meta/ThreatExchange](https://github.com/facebook/ThreatExchange) at commit
+  `a9a36d4552875c385c4b40f2be847db2b613ed44`, under the BSD-3-Clause "BSD
+  License for ThreatExchange software"
+  ([LICENSE](https://github.com/facebook/ThreatExchange/blob/main/LICENSE)).
+  The full notice is kept in the module docstring, as the license requires
+  for source redistribution; binary redistributions (wheels) carry it in the
+  same file. Torben's median routine in that code is marked public domain.
+* `tests/image/pdq_vectors.py` holds hash values only: hashes computed with
+  the unmodified reference on images the tests generate, and the expected
+  hashes published in ThreatExchange's `pdq_test.py`. The ThreatExchange
+  images themselves (photos and a LabelMe subset whose own terms are not
+  stated in the repository) are **not committed**; the integration test
+  downloads them at the pinned commit and checks their SHA-256.
+
+### Image formats in Pillow (AVIF, HEIC)
+
+* AVIF decoding uses Pillow's own wheels: libavif 1.4.2 (BSD-2-Clause) with
+  the dav1d decoder (BSD-2-Clause), listed in Pillow's bundled `LICENSE`.
+  Pillow is MIT-CMU; its wheels do not include the GPL `libimagequant`
+  (checked with `PIL.features`).
+* **HEIC/HEIF has no permissively licensed decoder today**, so
+  provenance-kit has no HEIF extra; `image.loading` accepts a decoder the
+  application chooses (`openers=`). Checked on 2026-11-05:
+  * [`pillow-heif`](https://pypi.org/project/pillow-heif/) 1.8.1: Python code
+    BSD-3-Clause, but `LICENSES_bundled.txt` says "License for pillow-heif
+    binary wheels: GPLv2, due to base library licenses": the wheels bundle
+    libheif 1.23.7 and libde265 1.1.3 (LGPL-3.0) and **x265 4.3 (GPL-2.0)**,
+    plus MinGW runtimes on Windows. Shipping it with a proprietary product
+    means GPL obligations; review with counsel.
+  * [`pi-heif`](https://pypi.org/project/pi-heif/) 1.4.0 (decode-only, LGPL
+    wheels) is **discontinued**; per the pillow-heif README its wheels bundle
+    libheif 1.23.0, affected by a heap buffer overflow on crafted HEIC files
+    (CVE-2026-84383). Do not use it for untrusted uploads.
+  * HEVC (the codec inside HEIC) is patent-encumbered in some jurisdictions,
+    independently of the copyright license.
+
+### Fonts
+
+* `image.visible` bundles no font. Without `font=`, it uses Pillow's
+  `ImageFont.load_default(size)`, a subset of **Aileron Regular** embedded in
+  Pillow (Basic Latin only), released by its author under CC0 1.0
+  ([dotcolon.net/fonts/aileron](https://dotcolon.net/fonts/aileron)). Fonts
+  passed by path carry their own licenses.
+
 ### c2pa-python
 
 * Package: [`c2pa-python` on PyPI](https://pypi.org/project/c2pa-python/) 0.38
@@ -134,6 +214,12 @@ them on your own servers does not trigger the distribution conditions.
 * Notes: 0.38.1 and 0.38.2 have no Windows wheels; the resolver picks 0.38.0
   there. Signing certificates and trust lists come from your certificate
   authority and carry their own terms.
+* `cryptography` (installed 50.0.2) is also a direct dependency of the `c2pa`
+  extra, for `LocalKeySigner`: Apache-2.0 OR BSD-3-Clause, no change in risk.
+* Data the module refers to but does not ship: the C2PA soft binding
+  algorithm list (algorithm identifiers such as `com.adobe.trustmark.Q` are
+  names, used as data) and the C2PA trust list (load it yourself under its
+  terms).
 
 ### OpenTimestamps
 
@@ -155,6 +241,14 @@ them on your own servers does not trigger the distribution conditions.
   ("User Products"). Running it on your own servers is not distribution. If
   even that is unacceptable, the alternative is an in-house implementation of
   the (small, documented) proof format, which this project does not plan.
+* provenance-kit imports python-opentimestamps only for the proof format and
+  its parser; the calendar HTTP client is its own (standard library), and
+  no LGPL code is copied into this repository. The example proofs of the
+  official client (an LGPL-3.0 repository without a separate data license)
+  are not used as fixtures: the committed `tests/provenance/fixtures/*.ots`
+  are generated by this project's own script. The test suite uses
+  `python-bitcoinlib` (installed with python-opentimestamps) to build
+  synthetic blocks.
 
 ### Chromaprint `fpcalc`
 

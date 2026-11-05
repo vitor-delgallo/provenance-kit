@@ -85,68 +85,145 @@ result = tools.run(
 
 The examples show the intended usage; names may change before release.
 
-### Image: invisible watermark (TrustMark)
+### Image (implemented)
+
+The image module is available; [docs/image.md](docs/image.md) has the
+details and the measured results.
 
 ```python
-from provenance_kit.image.watermark import TrustMarkWatermarker  # planned
+import io
 
-marker = TrustMarkWatermarker(device="cpu")
-marked = marker.embed(image, codec.encode(42))      # verifies the read-back,
-detection = marker.detect(marked, codec=codec)      # escalates strength if needed
+from provenance_kit.image.loading import load_image
+from provenance_kit.image.hashing import HashList, PdqHasher
+from provenance_kit.image.visible import tile_text
+from provenance_kit.image.watermark import (
+    ImageWatermarker, TrustMarkBackend, download_trustmark_models,
+)
+
+# Untrusted bytes: limits before decoding, type from content, orientation applied.
+image = load_image(data, limits=limits).image
+
+# Perceptual hash (PDQ; pdqhash if installed, else a built-in NumPy port)
+# against a list of known hashes shared by a partner organization.
+pdq = PdqHasher().hash_image(image)             # PdqHash(value=32 bytes, quality)
+known = HashList.from_hex(partner_hex_lines, keys=partner_ids)
+matches = known.match(pdq) if pdq.is_reliable() else []   # distance <= 31
+
+# Invisible watermark: models pinned by SHA-256, downloaded only on request.
+download_trustmark_models("Q", model_dir="/srv/models/trustmark")   # once, at deploy
+marker = ImageWatermarker(TrustMarkBackend(model_dir="/srv/models/trustmark"))
+
+def to_webp(img):
+    buffer = io.BytesIO()
+    img.save(buffer, "WEBP", quality=80)
+    return buffer.getvalue()
+
+result = marker.embed_verified(image, 123_456, encode=to_webp)  # escalates strength
+publish(result.encoded)                                          # verified or not
+detection = marker.detect_encoded(result.encoded)
+assert detection.found and detection.payload.valid
+
+# Visible, viewer-identifying overlay burned into the pixels.
+preview = tile_text(image, "viewer 1234", opacity=0.35, angle=30)
 ```
 
-### Image: visible tiled watermark
+HEIC/HEIF is not decoded out of the box: no permissively licensed decoder
+package exists today. `load_image(..., openers=...)` accepts one the
+application has chosen (see docs/image.md).
+
+### Video: frames, fingerprints, watermark (implemented)
+
+Probing and frame extraction through ffprobe/ffmpeg pipes, PDQ frame-hash
+fingerprints with temporal alignment, and the VideoSeal watermark on decoded
+frames. Details, thresholds and measured robustness:
+[docs/video.md](docs/video.md).
 
 ```python
-from provenance_kit.image.visible import tile_text  # planned
+from provenance_kit import PayloadCodec
+from provenance_kit.video.fingerprint import fingerprint_video, match_fingerprints
+from provenance_kit.video.frames import iter_frames
+from provenance_kit.video.watermark import RepetitionCode, VideoSealBackend, embed_verified
 
-preview = tile_text(image, "sample", opacity=0.25, angle=30)
+fp = fingerprint_video(data, tools=tools)           # PDQ per second; fp.to_bytes() to store
+match = match_fingerprints(clip_fp, fp)             # is_match, offset_seconds, matched_frames
+
+backend = VideoSealBackend(model_dir="/srv/models/videoseal", strength=0.5)
+code = RepetitionCode(copies=4)                     # 64-bit payload, majority vote
+codec = PayloadCodec(code.data_bits, version_bits=4, check_bits=12)
+frames = (f.image for f in iter_frames(data, sampling="all", tools=tools))
+result = embed_verified(frames, codec.encode(42), encoder=my_encoder,
+                        backend=backend, repetition=code, codec=codec)
 ```
 
-### Image: perceptual hashes (pHash, PDQ)
+### Audio: PCM, fingerprint and watermark (implemented)
+
+PCM decoding through ffmpeg pipes, Chromaprint fingerprints (`fpcalc`) with
+offset alignment by bit error rate, and the AudioSeal watermark on decoded
+PCM. Details, thresholds and measured robustness:
+[docs/audio.md](docs/audio.md).
 
 ```python
-from provenance_kit.image.hashing import pdq_hash, match_hashes  # planned
+from provenance_kit.audio.fingerprint import compare_fingerprints, fingerprint_audio
+from provenance_kit.audio.pcm import decode_pcm
+from provenance_kit.audio.watermark import AudioSealBackend, detect_watermark
 
-h = pdq_hash(image)                       # 256-bit hash and quality score
-matches = match_hashes(h, known_hashes, max_distance=31)
+fp = fingerprint_audio(data, tools=tools)           # fp.to_bytes() to store
+match = compare_fingerprints(clip_fp, fp)           # is_match, bit_error_rate, offset_seconds
+
+audio = decode_pcm(data, tools=tools)               # float32 (channels, samples)
+backend = AudioSealBackend(model_dir="/srv/models/audioseal")
+detection = detect_watermark(audio.samples, audio.sample_rate, backend=backend)
 ```
 
-### Video: frames, fingerprints, watermark (ffmpeg, VideoSeal)
+### C2PA manifests (implemented)
+
+Sign C2PA manifests into JPEG, PNG, WebP, GIF, TIFF, HEIF/AVIF, JPEG XL,
+MP4/MOV, AVI, WAV, MP3, FLAC and M4A, and read and validate them. The signer
+is a Protocol, so the private key can stay in a KMS or HSM (DER ECDSA
+signatures are converted for you); `LocalKeySigner` holds a PEM key for
+development. Reading never touches the network.
 
 ```python
-from provenance_kit.video.fingerprint import fingerprint_video, align  # planned
+from provenance_kit.provenance.c2pa import (
+    ActionType, DigitalSourceType, GeneratorInfo, ManifestAction, ManifestSpec,
+    TrainingMiningPolicy, ValidationState, read_manifest, sign_asset,
+)
 
-fp = fingerprint_video(data, tools=tools, fps=1)    # frame-hash sequence
-alignment = align(fp, reference_fp)                 # offset and similarity
+spec = ManifestSpec(
+    claim_generator=GeneratorInfo("my-pipeline", "1.0"),
+    actions=(
+        ManifestAction(action=ActionType.CREATED,
+                       digital_source_type=DigitalSourceType.DIGITAL_CAPTURE),
+        ManifestAction(action=ActionType.PUBLISHED),
+    ),
+    authors=("Jane Doe",),                            # cawg.metadata dc:creator
+    training_mining=TrainingMiningPolicy.not_allowed(),  # cawg.training-mining
+)
+signed = sign_asset(jpeg_bytes, "image/jpeg", spec, signer=kms_signer)
+
+report = read_manifest(untrusted_bytes, trust_anchors_pem=trust_list)
+report.state                         # UNSIGNED, INVALID, VALID or TRUSTED
+report.training_mining_not_allowed   # AI training, generative training, mining, inference
 ```
 
-### Audio: fingerprint and watermark (Chromaprint, AudioSeal)
+Labels, specification sources and the signature encodings are documented in
+[docs/provenance.md](docs/provenance.md).
+
+### OpenTimestamps (implemented)
 
 ```python
-from provenance_kit.audio.fingerprint import chromaprint  # planned
+from provenance_kit.provenance.timestamps import OpenTimestamper, sha256_file
 
-fp = chromaprint(data, tools=tools)
+ots = OpenTimestamper(min_calendars=2)        # the official client's calendars
+proof = ots.stamp(sha256_file("master.mov"))   # only a nonced commitment is sent
+proof = ots.upgrade(proof)                     # hours later: Bitcoin attestations
+info = ots.info(proof)                         # pending calendars, block heights
+result = ots.verify(proof, digest, block_source)  # offline, with your block headers
+open("master.mov.ots", "wb").write(proof.to_bytes())  # standard .ots format
 ```
 
-### C2PA manifests
-
-```python
-from provenance_kit.provenance.c2pa import sign_manifest, read_manifest  # planned
-
-signed = sign_manifest(data, manifest, signer=kms_signer)  # key stays in the KMS/HSM
-report = read_manifest(signed)                              # manifest + validation status
-```
-
-### OpenTimestamps
-
-```python
-from provenance_kit.provenance.timestamps import stamp, upgrade, inspect  # planned
-
-proof = stamp(sha256_digest, calendars=[...])   # submitted to several calendars
-proof = upgrade(proof)                           # once Bitcoin attestations exist
-info = inspect(proof)
-```
+Calendar responses and proofs are treated as untrusted (https only, deadlines,
+size caps, same-origin redirects, an allow-list for upgrades).
 
 ## Documentation
 
@@ -156,6 +233,8 @@ info = inspect(proof)
   checks and tests.
 * [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md): licenses of code, model weights
   and binaries.
+* [docs/video.md](docs/video.md) and [docs/audio.md](docs/audio.md): video and
+  audio modules, thresholds and measured robustness.
 * [SECURITY.md](SECURITY.md): reporting vulnerabilities and the threat model.
 * [CHANGELOG.md](CHANGELOG.md).
 
