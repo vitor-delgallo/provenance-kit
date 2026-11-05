@@ -1,7 +1,9 @@
 """Chromaprint fingerprints with the real ffmpeg and fpcalc binaries.
 
 Measured on the reference machine (2026-11-05; 60 s test songs at 44.1 kHz
-stereo, fpcalc 1.6.2, default threshold 0.20):
+stereo, fpcalc 1.6.2, default thresholds: 0.11 up to 5 s of compared span,
+0.20 from 20 s; the full study, 13 degradations x 6 lengths, is in
+docs/audio.md):
 
 =================================  ============  ==========================
 Variant                            Offset found  Bit error rate
@@ -25,17 +27,19 @@ import pytest
 
 from provenance_kit.audio.fingerprint import (
     DEFAULT_MAX_BIT_ERROR_RATE,
+    ITEM_SECONDS,
     MIN_COMPARED_ITEMS,
     SILENCE_VALUE,
     AudioFingerprint,
     compare_fingerprints,
     fingerprint_audio,
     fingerprint_pcm,
+    overlap_threshold,
 )
 from provenance_kit.audio.pcm import decode_pcm
 from provenance_kit.tools import ExternalTools, Tool
-from tests.audio.media import ffmpeg, lavfi, music, song, wav
-from tests.support import find_tools, require_tool
+from tests.audio.media import ffmpeg, lavfi, melody, music, song, wav
+from tests.support import SEED, find_tools, require_tool
 
 pytestmark = pytest.mark.integration
 
@@ -160,6 +164,94 @@ def test_short_audio_gives_an_empty_fingerprint(tools):
     fp = fingerprint_audio(clip, tools=tools)
     assert fp.values == ()
     assert fp.duration_seconds == pytest.approx(1.5, abs=0.01)
+
+
+# ------------------------------------------------------------ length-aware threshold
+
+
+@pytest.fixture(scope="module")
+def long_songs(tools) -> dict[int, AudioFingerprint]:
+    """The suite's songs, 120 s each: after about 20 s they sweep through similar ranges."""
+    return {
+        k: fingerprint_audio(
+            ffmpeg(tools, [*lavfi(song(k), 120), "-ac", "1", "-f", "wav", "pipe:1"]), tools=tools
+        )
+        for k in range(4)
+    }
+
+
+def test_short_windows_of_songs_that_sound_alike_do_not_match(long_songs):
+    """Windows of 5, 8 and 10 s of span from one song against another whole song.
+
+    With a flat threshold of 0.20, 36, 21 and 12 % of such windows matched
+    (1,000 windows each, eight songs); with the length-aware threshold, 0.2,
+    0.0 and 0.0 %.
+    """
+    rng = np.random.default_rng(SEED)
+    matched = []
+    for seconds in (5, 8, 10):
+        items = round(seconds / ITEM_SECONDS)
+        for _ in range(40):
+            a, b = (int(k) for k in rng.choice(4, 2, replace=False))
+            values = long_songs[a].values
+            start = int(rng.integers(0, len(values) - items))
+            window = AudioFingerprint(
+                values=values[start : start + items], duration_seconds=items * ITEM_SECONDS
+            )
+            match = compare_fingerprints(window, long_songs[b])
+            if match.is_match:
+                matched.append((seconds, round(match.bit_error_rate, 3)))
+    print(f"\nwindows of other songs reported as matches: {matched} of 120")
+    assert len(matched) <= 1
+
+
+@pytest.fixture(scope="module")
+def piece(tools) -> tuple[bytes, AudioFingerprint]:
+    """60 s of bass-heavy generated music (stereo WAV) and its fingerprint."""
+    samples = melody(60, 44100, 400)  # one of the measured pieces
+    data = wav(np.vstack([samples, samples]), 44100)
+    return data, fingerprint_audio(data, tools=tools)
+
+
+DEGRADED = {
+    "mp3-64k": ["-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3"],
+    "aac-64k": ["-c:a", "aac", "-b:a", "64k", "-f", "adts"],
+    "opus-32k": ["-c:a", "libopus", "-b:a", "32k", "-f", "ogg"],
+    "22.05 kHz": ["-ar", "22050", "-c:a", "flac", "-f", "flac"],
+    "treble +6 dB": ["-af", "treble=g=6", "-c:a", "flac", "-f", "flac"],
+    "volume -6 dB": ["-af", "volume=-6dB", "-c:a", "flac", "-f", "flac"],
+    "mono": ["-ac", "1", "-c:a", "flac", "-f", "flac"],
+}
+
+
+@pytest.mark.parametrize("name", sorted(DEGRADED))
+def test_degraded_clips_still_match(piece, tools, name):
+    data, reference = piece
+    for start, seconds in ((12.0, 8), (31.5, 15)):
+        cut = ["-ss", str(start), "-t", str(seconds)]
+        clip = ffmpeg(tools, ["-i", "pipe:0", *cut, *DEGRADED[name], "pipe:1"], stdin=data)
+        match = compare_fingerprints(fingerprint_audio(clip, tools=tools), reference)
+        print(
+            f"\n{name}, {seconds} s clip: BER {match.bit_error_rate:.3f} "
+            f"(threshold {match.bit_error_threshold:.3f})"
+        )
+        assert match.is_match
+        assert match.offset_seconds == pytest.approx(start, abs=0.25)
+
+
+def test_long_overlaps_keep_the_room_that_equalization_needs(piece, tools):
+    """A +6 dB bass shelf on bass-heavy music: above the short threshold, below the long one."""
+    data, reference = piece
+    shelved = ffmpeg(
+        tools,
+        ["-i", "pipe:0", "-af", "bass=g=6", "-c:a", "flac", "-f", "flac", "pipe:1"],
+        stdin=data,
+    )
+    match = compare_fingerprints(fingerprint_audio(shelved, tools=tools), reference)
+    print(f"\nbass +6 dB, whole piece: {match}")
+    assert match.is_match
+    assert match.bit_error_threshold == pytest.approx(DEFAULT_MAX_BIT_ERROR_RATE)
+    assert match.bit_error_rate > overlap_threshold(MIN_COMPARED_ITEMS)
 
 
 # ------------------------------------------------------------ low information

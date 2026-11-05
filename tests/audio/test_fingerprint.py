@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import struct
 
 import numpy as np
@@ -14,13 +15,17 @@ from provenance_kit.audio.fingerprint import (
     DEFAULT_MAX_BIT_ERROR_RATE,
     FORMAT_VERSION,
     ITEM_SECONDS,
+    LONG_OVERLAP_SECONDS,
     MAX_CHANCE_ERROR_FRACTION,
     MIN_COMPARED_ITEMS,
+    SHORT_OVERLAP_FACTOR,
+    SHORT_OVERLAP_SECONDS,
     SILENCE_VALUE,
     AudioFingerprint,
     compare_fingerprints,
     fingerprint_audio,
     fingerprint_pcm,
+    overlap_threshold,
 )
 from provenance_kit.audio.pcm import PcmAudio
 from provenance_kit.errors import MediaDecodeError, MediaLimitExceededError
@@ -242,6 +247,48 @@ def test_short_queries_never_match(rng):
     match = compare_fingerprints(at_floor, reference)
     assert match.is_match
     assert match.offset_items == 1000
+
+
+# ------------------------------------------------------------ length-aware threshold
+
+
+def test_overlap_threshold_is_stricter_for_short_overlaps():
+    short = round(SHORT_OVERLAP_SECONDS / ITEM_SECONDS)  # 40 items, 4.95 s of span
+    long = math.ceil(LONG_OVERLAP_SECONDS / ITEM_SECONDS)  # 162 items
+    assert overlap_threshold(0) == pytest.approx(0.11)
+    assert overlap_threshold(short) == pytest.approx(SHORT_OVERLAP_FACTOR * 0.20)
+    assert overlap_threshold(long) == pytest.approx(DEFAULT_MAX_BIT_ERROR_RATE)
+    assert overlap_threshold(10_000) == pytest.approx(0.20)
+    middle = round(12.5 / ITEM_SECONDS)  # halfway: 0.155
+    assert overlap_threshold(middle) == pytest.approx(0.155, abs=0.001)
+    assert overlap_threshold(0, max_bit_error_rate=0.30) == pytest.approx(0.165)
+    with pytest.raises(ValueError):
+        overlap_threshold(-1)
+    with pytest.raises(ValueError):
+        overlap_threshold(10, max_bit_error_rate=1.5)
+    with pytest.raises(TypeError):
+        overlap_threshold(1.5)  # type: ignore[arg-type]
+
+
+def test_short_overlaps_need_a_closer_agreement(rng):
+    # A flat 0.20 let 5 to 10 s windows of signals that sound alike match
+    # (12 to 36 % of the suite's synthetic song windows); the same bit error
+    # rate is still accepted over a long overlap.
+    reference = random_fp(rng, 2000)
+    short = noisy_clip(reference, 500, 540, rng, flip_rate=0.16)  # 4.95 s of span
+    match = compare_fingerprints(short, reference)
+    assert 0.13 < match.bit_error_rate < 0.19
+    assert match.bit_error_threshold == pytest.approx(0.11)
+    assert not match.is_match
+    assert match.offset_items == 500  # still reported as the best alignment
+    long = noisy_clip(reference, 500, 800, rng, flip_rate=0.16)  # 37 s of span
+    match = compare_fingerprints(long, reference)
+    assert match.is_match
+    assert match.bit_error_threshold == pytest.approx(0.20)
+    assert match.offset_items == 500
+    lenient = compare_fingerprints(short, reference, max_bit_error_rate=0.40)
+    assert lenient.is_match  # the short threshold scales with it: 0.22
+    assert lenient.bit_error_threshold == pytest.approx(0.22)
 
 
 # ------------------------------------------------------------ offset choice (P05)

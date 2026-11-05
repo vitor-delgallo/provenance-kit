@@ -8,7 +8,7 @@ import json
 import numpy as np
 import pytest
 
-from provenance_kit.audio.pcm import PcmAudio, decode_pcm, parse_probe_output, probe_audio
+from provenance_kit.audio.pcm import PcmAudio, _parse_probe_output, decode_pcm, probe_audio
 from provenance_kit.errors import (
     MediaDecodeError,
     MediaLimitExceededError,
@@ -35,6 +35,34 @@ def test_audio_modules_import_lightly():
             "provenance_kit.audio.watermark",
         ]
     )
+
+
+def test_pcm_exposes_only_its_public_api():
+    """Helpers start with an underscore (ARCHITECTURE.md, section 8)."""
+    from provenance_kit.audio import pcm
+
+    defined_here = {
+        name
+        for name, value in vars(pcm).items()
+        if not name.startswith("_") and getattr(value, "__module__", None) == pcm.__name__
+    }
+    assert defined_here == {"AudioInfo", "PcmAudio", "decode_pcm", "probe_audio"}
+    assert set(pcm.__all__) == defined_here | {"MAX_STREAMS", "MIN_SAMPLE_RATE"}
+    for helper in (
+        "pcm_args",
+        "read_pcm",
+        "sample_cap_bytes",
+        "duration_cap_bytes",
+        "check_declared_decoded_size",
+        "probe_staged",
+        "parse_probe_output",
+        "validate_probe_report",
+        "AUDIO_CONTAINERS",
+        "FFMPEG_COMMON",
+        "StagedInput",
+        "staged_input",
+    ):
+        assert not hasattr(pcm, helper), helper
 
 
 def test_decode_pcm_returns_channels_first_float32(rng):
@@ -200,7 +228,7 @@ def test_non_audio_bytes_are_refused():
 
 
 def parse(raw: bytes, limits: MediaLimits = LIMITS):
-    return parse_probe_output(raw, MediaType.WAV, limits)
+    return _parse_probe_output(raw, MediaType.WAV, limits)
 
 
 def test_probe_parses_a_normal_report():

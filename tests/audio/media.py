@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import wave
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -47,6 +48,87 @@ def music(seconds: float, rate: int, seed: int) -> np.ndarray:
         envelope = 0.5 + 0.5 * np.sin(2 * np.pi * rng.uniform(0.2, 3) * t + rng.uniform(0, 6))
         out += 0.15 * envelope * np.sin(phase)
     return out + 0.03 * rng.standard_normal(n)
+
+
+def melody(
+    seconds: float, rate: int, seed: int, *, noise_snr_db: float | None = None
+) -> np.ndarray:
+    """Structured mono "music" (float64): a scale melody, bass, pad chords and drums.
+
+    Each seed picks a tempo (80 to 140 BPM), a key and a mode. The bass line
+    and the kick drum make it bass-heavy, the hard case for bass shelving in
+    the fingerprint measurements of ``docs/audio.md`` (which used seeds 400
+    to 403, and 500 to 503 with ``noise_snr_db=20``).
+    """
+    rng = np.random.default_rng(seed)
+    n = int(seconds * rate)
+    out = np.zeros(n)
+    beat = 60.0 / rng.uniform(80, 140)
+    root = rng.integers(45, 57)  # MIDI note
+    major = rng.random() < 0.5
+    scale = np.array([0, 2, 4, 5, 7, 9, 11] if major else [0, 2, 3, 5, 7, 8, 10])
+
+    def hz(midi: float) -> float:
+        return 440.0 * 2 ** ((midi - 69) / 12)
+
+    def note(start: float, duration: float, freq: float, level: float, **shape: Any) -> None:
+        harmonics = shape.get("harmonics", (1.0, 0.5, 0.25))
+        attack = shape.get("attack", 0.01)
+        first, last = int(start * rate), min(n, int((start + duration + 0.08) * rate))
+        if first >= n:
+            return
+        t = np.arange(last - first) / rate
+        envelope = np.minimum(1.0, t / attack) * np.exp(-t / max(duration, 0.05) * 1.5)
+        tone = sum(h * np.sin(2 * np.pi * freq * (k + 1) * t) for k, h in enumerate(harmonics))
+        out[first:last] += level * envelope * tone
+
+    degree, step, position = 7, beat / 2, 0.0
+    while position < seconds:
+        chord = scale[rng.integers(0, 7)]
+        for k in (0, 2, 4):  # pad chord for the bar
+            index = (np.searchsorted(scale, chord) + k) % 7
+            note(
+                position,
+                4 * beat,
+                hz(root + 12 + scale[index]),
+                0.04,
+                harmonics=(1.0, 0.3),
+                attack=0.2,
+            )
+        note(position, 2 * beat, hz(root - 12 + chord), 0.12, harmonics=(1.0, 0.4))  # bass
+        note(position + 2 * beat, 2 * beat, hz(root - 12 + chord), 0.10, harmonics=(1.0, 0.4))
+        for s in range(8):  # melody in eighth notes, with rests
+            if rng.random() < 0.8:
+                degree = int(np.clip(degree + rng.integers(-2, 3), 0, 20))
+                octave, d = divmod(degree, 7)
+                length = step * rng.choice([1, 1, 2])
+                note(position + s * step, length, hz(root + 12 * (1 + octave) + scale[d]), 0.10)
+        for b in range(4):  # kick on 1 and 3, noise snare on 2 and 4, hi-hats on eighths
+            start = int((position + b * beat) * rate)
+            if start >= n:
+                break
+            length = min(n - start, int(0.25 * rate))
+            t = np.arange(length) / rate
+            if b % 2 == 0:
+                sweep = np.sin(2 * np.pi * (50 + 80 * np.exp(-t * 30)) * t)
+                out[start : start + length] += 0.3 * np.exp(-t * 18) * sweep
+            else:
+                out[start : start + length] += 0.12 * np.exp(-t * 25) * rng.standard_normal(length)
+            for h in (0, 1):
+                hat = int((position + b * beat + h * step) * rate)
+                hat_length = min(n - hat, int(0.05 * rate)) if hat < n else 0
+                if hat_length > 0:
+                    hiss = np.diff(rng.standard_normal(hat_length), prepend=0.0)
+                    decay = np.exp(-np.arange(hat_length) / rate * 80)
+                    out[hat : hat + hat_length] += 0.03 * decay * hiss
+        position += 4 * beat
+    out *= 0.7 / np.max(np.abs(out))
+    if noise_snr_db is not None:
+        noise = rng.standard_normal(n)
+        noise *= np.sqrt(np.mean(out**2) / 10 ** (noise_snr_db / 10)) / np.std(noise)
+        out = out + noise
+        out *= 0.8 / np.max(np.abs(out))
+    return out
 
 
 def wav(samples: np.ndarray, rate: int) -> bytes:

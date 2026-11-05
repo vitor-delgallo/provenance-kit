@@ -48,19 +48,8 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from provenance_kit import _ffmpeg
 from provenance_kit._checks import check_int, check_number
-from provenance_kit._ffmpeg import (
-    FFMPEG_COMMON,
-    StagedInput,
-    as_media_error,
-    check_media_input,
-    json_float,
-    json_int,
-    json_name,
-    load_json_object,
-    run_ffprobe_json,
-    staged_input,
-)
 from provenance_kit._logging import get_logger
 from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.errors import (
@@ -90,9 +79,9 @@ MAX_STREAMS = 64
 #: The lowest output sample rate :func:`decode_pcm` accepts.
 MIN_SAMPLE_RATE = 1000
 
-#: The containers the audio modules accept (detected from the bytes): audio
-#: files, and video containers for their audio track.
-AUDIO_CONTAINERS: frozenset[MediaType] = frozenset(
+# The containers the audio modules accept (detected from the bytes): audio
+# files, and video containers for their audio track (private).
+_AUDIO_CONTAINERS: frozenset[MediaType] = frozenset(
     {
         MediaType.WAV,
         MediaType.MP3,
@@ -234,9 +223,9 @@ def probe_audio(
     """
     limits = MediaLimits() if limits is None else limits
     tools = ExternalTools.from_env() if tools is None else tools
-    media_type = check_media_input(data, limits, AUDIO_CONTAINERS)
-    with staged_input(data, media_type, temp_dir=temp_dir) as staged:
-        return probe_staged(
+    media_type = _ffmpeg.check_media_input(data, limits, _AUDIO_CONTAINERS)
+    with _ffmpeg.staged_input(data, media_type, temp_dir=temp_dir) as staged:
+        return _probe_staged(
             staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout_seconds
         )
 
@@ -298,9 +287,9 @@ def decode_pcm(
         check_number(
             "max_duration_seconds", max_duration_seconds, minimum=0.0, exclusive_minimum=True
         )
-    media_type = check_media_input(data, limits, AUDIO_CONTAINERS)
-    with staged_input(data, media_type, temp_dir=temp_dir) as staged:
-        info = probe_staged(
+    media_type = _ffmpeg.check_media_input(data, limits, _AUDIO_CONTAINERS)
+    with _ffmpeg.staged_input(data, media_type, temp_dir=temp_dir) as staged:
+        info = _probe_staged(
             staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout_seconds
         )
         out_rate = info.sample_rate if sample_rate is None else sample_rate
@@ -310,14 +299,14 @@ def decode_pcm(
                 f"sample rates below {MIN_SAMPLE_RATE} Hz are not supported"
             )
         limits.check_audio(out_channels, out_rate)
-        check_declared_decoded_size(
+        _check_declared_decoded_size(
             info,
             limits,
             sample_rate=out_rate,
             channels=out_channels,
             max_duration_seconds=max_duration_seconds,
         )
-        raw = read_pcm(
+        raw = _read_pcm(
             staged,
             info,
             tools=tools,
@@ -338,12 +327,13 @@ def decode_pcm(
 
 
 # --------------------------------------------------------------------------
-# Internals shared with the fingerprint module
+# Internals (private; also used by provenance_kit.audio.fingerprint, which
+# decodes through the same probe and ffmpeg arguments)
 # --------------------------------------------------------------------------
 
 
-def pcm_args(
-    staged: StagedInput,
+def _pcm_args(
+    staged: _ffmpeg.StagedInput,
     info: AudioInfo,
     *,
     limits: MediaLimits,
@@ -371,7 +361,7 @@ def pcm_args(
         cap = min(cap, max_duration_seconds)
     codec = {"f32le": "pcm_f32le", "s16le": "pcm_s16le"}[sample_format]
     return [
-        *FFMPEG_COMMON,
+        *_ffmpeg.FFMPEG_COMMON,
         *staged.input_args(),
         "-map",
         f"0:{info.stream_index}",
@@ -398,7 +388,7 @@ def pcm_args(
     ]
 
 
-def check_declared_decoded_size(
+def _check_declared_decoded_size(
     info: AudioInfo,
     limits: MediaLimits,
     *,
@@ -410,7 +400,7 @@ def check_declared_decoded_size(
 
     The duration is the declared one, or the caller's truncation when that
     is shorter or nothing is declared. With neither, nothing is known up
-    front and :func:`read_pcm` counts the output instead.
+    front and :func:`_read_pcm` counts the output instead.
 
     Args:
         info: The probed stream.
@@ -432,7 +422,7 @@ def check_declared_decoded_size(
     limits.check_decoded_audio_bytes(size)
 
 
-def duration_cap_bytes(
+def _duration_cap_bytes(
     limits: MediaLimits,
     *,
     bytes_per_frame: int,
@@ -459,7 +449,7 @@ def duration_cap_bytes(
     return (math.ceil(seconds * sample_rate) + 1) * bytes_per_frame
 
 
-def sample_cap_bytes(
+def _sample_cap_bytes(
     limits: MediaLimits,
     *,
     bytes_per_frame: int,
@@ -468,7 +458,7 @@ def sample_cap_bytes(
 ) -> int:
     """Largest PCM output accepted in memory.
 
-    The smaller of :func:`duration_cap_bytes` and
+    The smaller of :func:`_duration_cap_bytes` and
     ``limits.max_decoded_audio_bytes``.
 
     Args:
@@ -480,7 +470,7 @@ def sample_cap_bytes(
     Returns:
         The byte cap; more output means the media exceeds a limit.
     """
-    duration_cap = duration_cap_bytes(
+    duration_cap = _duration_cap_bytes(
         limits,
         bytes_per_frame=bytes_per_frame,
         sample_rate=sample_rate,
@@ -489,8 +479,8 @@ def sample_cap_bytes(
     return min(duration_cap, limits.max_decoded_audio_bytes)
 
 
-def read_pcm(
-    staged: StagedInput,
+def _read_pcm(
+    staged: _ffmpeg.StagedInput,
     info: AudioInfo,
     *,
     tools: ExternalTools,
@@ -506,7 +496,7 @@ def read_pcm(
     The output is held in memory, so it is capped by both the duration limit
     and ``max_decoded_audio_bytes``; the error names the limit that was hit.
     """
-    args = pcm_args(
+    args = _pcm_args(
         staged,
         info,
         limits=limits,
@@ -516,7 +506,7 @@ def read_pcm(
         max_duration_seconds=max_duration_seconds,
     )
     bytes_per_frame = (4 if sample_format == "f32le" else 2) * channels
-    duration_cap = duration_cap_bytes(
+    duration_cap = _duration_cap_bytes(
         limits,
         bytes_per_frame=bytes_per_frame,
         sample_rate=sample_rate,
@@ -537,7 +527,7 @@ def read_pcm(
                     )
                 parts.append(chunk)
     except ExternalToolError as exc:
-        raise as_media_error(exc, "audio decoding") from exc
+        raise _ffmpeg.as_media_error(exc, "audio decoding") from exc
     if max_duration_seconds is None and total > duration_cap - bytes_per_frame:
         # Exactly at the cap: the stream ran into the duration limit.
         raise MediaLimitExceededError(
@@ -548,8 +538,8 @@ def read_pcm(
     return b"".join(parts)
 
 
-def probe_staged(
-    staged: StagedInput,
+def _probe_staged(
+    staged: _ffmpeg.StagedInput,
     media_type: MediaType,
     *,
     tools: ExternalTools,
@@ -569,7 +559,7 @@ def probe_staged(
         The validated audio stream information.
     """
     timeout = limits.subprocess_timeout_seconds if timeout_seconds is None else timeout_seconds
-    document = run_ffprobe_json(
+    document = _ffmpeg.run_ffprobe_json(
         staged,
         ["-print_format", "json", "-show_entries", _PROBE_ENTRIES],
         tools=tools,
@@ -577,10 +567,10 @@ def probe_staged(
         timeout_seconds=timeout,
         max_output_bytes=_MAX_PROBE_OUTPUT,
     )
-    return validate_probe_report(document, media_type, limits)
+    return _validate_probe_report(document, media_type, limits)
 
 
-def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -> AudioInfo:
+def _parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -> AudioInfo:
     """Parses and validates ffprobe's JSON report (internal; untrusted input).
 
     Args:
@@ -596,10 +586,10 @@ def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -
         UnsupportedMediaError: If there is no audio stream or too many streams.
         MediaLimitExceededError: If a declared value exceeds ``limits``.
     """
-    return validate_probe_report(load_json_object(raw, "audio probe"), media_type, limits)
+    return _validate_probe_report(_ffmpeg.load_json_object(raw, "audio probe"), media_type, limits)
 
 
-def validate_probe_report(
+def _validate_probe_report(
     document: Mapping[str, Any], media_type: MediaType, limits: MediaLimits
 ) -> AudioInfo:
     """Validates ffprobe's decoded report (internal; untrusted input).
@@ -633,30 +623,30 @@ def validate_probe_report(
     fmt = document.get("format")
     fmt = fmt if isinstance(fmt, dict) else {}
 
-    index = json_int(selected.get("index"))
+    index = _ffmpeg.json_int(selected.get("index"))
     if index is None or not 0 <= index < MAX_STREAMS:
         raise MediaDecodeError("audio probe: the audio stream has no valid index")
-    sample_rate = json_int(selected.get("sample_rate"))
-    channel_count = json_int(selected.get("channels"))
+    sample_rate = _ffmpeg.json_int(selected.get("sample_rate"))
+    channel_count = _ffmpeg.json_int(selected.get("channels"))
     if sample_rate is None or sample_rate < 1 or channel_count is None or channel_count < 1:
         raise MediaDecodeError("audio probe: the audio stream declares no sample rate or layout")
     limits.check_audio(channel_count, sample_rate)
 
-    duration = json_float(fmt.get("duration"))
+    duration = _ffmpeg.json_float(fmt.get("duration"))
     if duration is None or duration < 0:
-        duration = json_float(selected.get("duration"))
+        duration = _ffmpeg.json_float(selected.get("duration"))
     if duration is not None and duration < 0:
         duration = None
     if duration is not None:
         limits.check_duration(duration)
-    bit_rate = json_int(fmt.get("bit_rate"))
+    bit_rate = _ffmpeg.json_int(fmt.get("bit_rate"))
     return AudioInfo(
         container=media_type,
-        format_name=json_name(fmt.get("format_name")) or "unknown",
+        format_name=_ffmpeg.json_name(fmt.get("format_name")) or "unknown",
         duration_seconds=duration,
         sample_rate=sample_rate,
         channels=channel_count,
-        codec=json_name(selected.get("codec_name")) or "unknown",
+        codec=_ffmpeg.json_name(selected.get("codec_name")) or "unknown",
         audio_streams=len(audio),
         video_streams=video_count,
         stream_index=index,

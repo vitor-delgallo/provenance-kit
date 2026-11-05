@@ -25,15 +25,18 @@ chance level of its own bit statistics (:data:`MAX_CHANCE_ERROR_FRACTION`;
 stationary noise and steady tones agree by chance at bit error rates as
 low as 0.15) and it must hold :data:`MIN_DISTINCT_VALUES` distinct values.
 
-Thresholds (measured in ``tests/audio/test_fingerprint_integration.py``,
-numbers in ``docs/audio.md``): the same audio after lossy re-encoding,
-resampling, downmixing or trimming aligns at a bit error rate below 0.1;
-unrelated music stays above 0.24 even at its best offset. The default
-decision threshold is :data:`DEFAULT_MAX_BIT_ERROR_RATE` (0.20). Signals
-that sound alike over a few seconds (the test suite's synthetic glissando
-songs) can share 5 to 20 s windows at 0.10 to 0.20; for short queries
-against such content, lower the threshold (0.12 kept every genuine variant
-measured).
+The bit error rate threshold depends on the overlap
+(:func:`overlap_threshold`): :data:`DEFAULT_MAX_BIT_ERROR_RATE` (0.20) for
+overlaps of 20 s or more of compared span, down to 0.11 at 5 s or less,
+linear in between. Signals that sound alike over a few seconds share short
+windows at bit error rates of 0.10 to 0.20 (windows of the test suite's
+synthetic songs matched another song 36 % of the time at 5 s with a flat
+0.20; 0.2 % with this rule), while long genuine overlaps need the room: a
++6 dB bass shelf on bass-heavy music gives up to 0.14 on full tracks.
+Measured numbers (13 degradations, 6 clip lengths, false matches by window
+length) are in ``docs/audio.md``; in short, every degradation measured is
+found on clips of 15 s and longer, and on 5 to 10 s clips all but bass
+shelving of bass-heavy music and a few Opus-encoded synthetic chirps.
 
 Not handled: tempo or pitch changes, and heavy mixing with other audio;
 Chromaprint is not designed to survive them.
@@ -51,21 +54,19 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 
+from provenance_kit import _ffmpeg
 from provenance_kit._checks import check_int, check_number
-from provenance_kit._ffmpeg import (
-    as_media_error,
-    check_media_input,
-    load_json_object,
-    staged_input,
-)
 from provenance_kit._logging import get_logger
 from provenance_kit._typing import BytesLike, StrPath
+
+# The PCM module's private internals: fingerprints decode through the same
+# probe, limits and ffmpeg arguments.
 from provenance_kit.audio.pcm import (
-    AUDIO_CONTAINERS,
+    _AUDIO_CONTAINERS,
     PcmAudio,
-    duration_cap_bytes,
-    pcm_args,
-    probe_staged,
+    _duration_cap_bytes,
+    _pcm_args,
+    _probe_staged,
 )
 from provenance_kit.errors import (
     ExternalToolError,
@@ -82,16 +83,20 @@ __all__ = [
     "DEFAULT_MIN_OVERLAP_SECONDS",
     "FORMAT_VERSION",
     "ITEM_SECONDS",
+    "LONG_OVERLAP_SECONDS",
     "MAX_CHANCE_ERROR_FRACTION",
     "MAX_FINGERPRINT_ITEMS",
     "MIN_COMPARED_ITEMS",
     "MIN_DISTINCT_VALUES",
+    "SHORT_OVERLAP_FACTOR",
+    "SHORT_OVERLAP_SECONDS",
     "SILENCE_VALUE",
     "AudioFingerprint",
     "AudioMatch",
     "compare_fingerprints",
     "fingerprint_audio",
     "fingerprint_pcm",
+    "overlap_threshold",
 ]
 
 _log = get_logger(__name__)
@@ -109,14 +114,31 @@ CHROMAPRINT_SAMPLE_RATE = 11_025
 #: 11,025 Hz (4096-sample frames with two-thirds overlap).
 ITEM_SECONDS = 1365 / CHROMAPRINT_SAMPLE_RATE
 
-#: Default decision threshold on the bit error rate of a compared overlap.
-#: Measured: the same audio after MP3/AAC/Opus re-encoding, resampling,
-#: downmixing, volume change, low-pass filtering or trimming aligns at 0.001
-#: to 0.094 (full tracks and clips of 5 s and longer); unrelated music at
-#: 0.24 or more at its best offset; the suite's similar-structure songs at
-#: 0.32 to 0.37 for 10 s clips taken 10 s in, but lower for windows taken
-#: later (see ``docs/audio.md``).
+#: Default threshold on the bit error rate of a **long** overlap (at least
+#: :data:`LONG_OVERLAP_SECONDS` of compared span); shorter overlaps are held
+#: to a stricter one (:func:`overlap_threshold`). Measured on full tracks and
+#: 30 s clips of 16 generated pieces after 13 degradations (MP3 64 and
+#: 96 kb/s, AAC 64 kb/s, Opus 32 and 48 kb/s, 22.05 kHz, volume and bass or
+#: treble shelving at +-6 dB, mono): at most 0.144 (bass +6 dB on bass-heavy
+#: music), 0.097 without the bass shelving (``docs/audio.md``).
 DEFAULT_MAX_BIT_ERROR_RATE = 0.20
+
+#: Overlaps whose compared span (compared sub-fingerprints x
+#: :data:`ITEM_SECONDS`) is at most this many seconds must reach
+#: :data:`SHORT_OVERLAP_FACTOR` x ``max_bit_error_rate`` (0.11 by default).
+SHORT_OVERLAP_SECONDS = 5.0
+
+#: From this compared span on, ``max_bit_error_rate`` applies unchanged; the
+#: threshold rises linearly from the short one in between.
+LONG_OVERLAP_SECONDS = 20.0
+
+#: The fraction of ``max_bit_error_rate`` that short overlaps must reach.
+#: Short windows of different signals that sound alike agree far more often
+#: than long ones: windows of the test suite's synthetic songs matched
+#: another song 36 % (5 s span), 21 % (8 s) and 12 % (10 s) of the time at a
+#: flat 0.20, and 0.2 %, 0.0 % and 0.0 % with this rule (1,000 windows
+#: each; ``docs/audio.md``).
+SHORT_OVERLAP_FACTOR = 0.55
 
 #: Default minimum overlap for an offset to be considered (seconds), or the
 #: whole shorter fingerprint if it is shorter, but never fewer than
@@ -294,6 +316,9 @@ class AudioMatch:
             is how often the bit is 1 on each side of the overlap (silence
             excluded). About 0.42 for music, 0.16 to 0.32 for stationary
             noise, 0.0 for a constant value; 0.0 when nothing was compared.
+        bit_error_threshold: The bit error rate threshold that applied at
+            that offset: :func:`overlap_threshold` of ``overlap_items``
+            (stricter for short overlaps).
     """
 
     is_match: bool
@@ -305,6 +330,48 @@ class AudioMatch:
     overlap_seconds: float
     query_coverage: float
     chance_bit_error_rate: float
+    bit_error_threshold: float
+
+
+def overlap_threshold(
+    compared_items: int, *, max_bit_error_rate: float = DEFAULT_MAX_BIT_ERROR_RATE
+) -> float:
+    """Returns the bit error rate an overlap of ``compared_items`` must not exceed.
+
+    The compared span is ``compared_items * ITEM_SECONDS``. Up to
+    :data:`SHORT_OVERLAP_SECONDS` (5 s) the threshold is
+    :data:`SHORT_OVERLAP_FACTOR` x ``max_bit_error_rate`` (0.11 by default);
+    from :data:`LONG_OVERLAP_SECONDS` (20 s) on it is ``max_bit_error_rate``
+    (0.20); in between it rises linearly (0.155 at 12.5 s). Short windows of
+    different signals that sound alike agree by chance far more often than
+    long ones, so a short overlap needs a closer agreement.
+
+    Args:
+        compared_items: Compared sub-fingerprint pairs (silence excluded).
+        max_bit_error_rate: The threshold for long overlaps, in ``[0, 1]``.
+
+    Returns:
+        The threshold.
+
+    Raises:
+        TypeError: If an argument has the wrong type.
+        ValueError: If an argument is out of range.
+    """
+    check_int("compared_items", compared_items, minimum=0)
+    check_number("max_bit_error_rate", max_bit_error_rate, minimum=0.0, maximum=1.0)
+    return float(_thresholds(np.array([compared_items]), max_bit_error_rate)[0])
+
+
+def _thresholds(
+    compared: npt.NDArray[np.int64], max_bit_error_rate: float
+) -> npt.NDArray[np.float64]:
+    span = compared * ITEM_SECONDS
+    ramp = np.clip(
+        (span - SHORT_OVERLAP_SECONDS) / (LONG_OVERLAP_SECONDS - SHORT_OVERLAP_SECONDS), 0.0, 1.0
+    )
+    factor = SHORT_OVERLAP_FACTOR + (1.0 - SHORT_OVERLAP_FACTOR) * ramp
+    result: npt.NDArray[np.float64] = max_bit_error_rate * factor
+    return result
 
 
 def fingerprint_audio(
@@ -349,11 +416,13 @@ def fingerprint_audio(
         check_number(
             "max_duration_seconds", max_duration_seconds, minimum=0.0, exclusive_minimum=True
         )
-    media_type = check_media_input(data, limits, AUDIO_CONTAINERS)
+    media_type = _ffmpeg.check_media_input(data, limits, _AUDIO_CONTAINERS)
     timeout = limits.subprocess_timeout_seconds if timeout_seconds is None else timeout_seconds
-    with staged_input(data, media_type, temp_dir=temp_dir) as staged:
-        info = probe_staged(staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout)
-        args = pcm_args(
+    with _ffmpeg.staged_input(data, media_type, temp_dir=temp_dir) as staged:
+        info = _probe_staged(
+            staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout
+        )
+        args = _pcm_args(
             staged,
             info,
             limits=limits,
@@ -364,7 +433,7 @@ def fingerprint_audio(
         )
         # The PCM streams into fpcalc and is never held in memory, so only the
         # duration bounds it (max_decoded_audio_bytes is about memory).
-        cap = duration_cap_bytes(
+        cap = _duration_cap_bytes(
             limits,
             bytes_per_frame=2,
             sample_rate=CHROMAPRINT_SAMPLE_RATE,
@@ -387,7 +456,7 @@ def fingerprint_audio(
                 ) from exc
             if exc.tool == Tool.FPCALC.value:
                 raise
-            raise as_media_error(exc, "audio decoding") from exc
+            raise _ffmpeg.as_media_error(exc, "audio decoding") from exc
     decoded = decoder.bytes_read
     samples = decoded // 2
     if max_duration_seconds is None and decoded > cap - 2:
@@ -457,7 +526,11 @@ def compare_fingerprints(
     items of the shorter fingerprint, if it is shorter), and never fewer than
     :data:`MIN_COMPARED_ITEMS`. An eligible offset **passes** when
 
-    1. its bit error rate is at most ``max_bit_error_rate``;
+    1. its bit error rate is at most :func:`overlap_threshold` of its compared
+       pairs: ``max_bit_error_rate`` for overlaps of 20 s or more of compared
+       span, down to 0.55 x ``max_bit_error_rate`` at 5 s or less (0.11 to
+       0.20 by default), because short windows of signals that sound alike
+       agree by chance;
     2. its bit error rate is below :data:`MAX_CHANCE_ERROR_FRACTION` times its
        chance error rate (:attr:`AudioMatch.chance_bit_error_rate`), which
        rejects stationary noise, steady tones and other content whose bits
@@ -478,8 +551,9 @@ def compare_fingerprints(
     Args:
         query: The fingerprint to look up (for example a clip).
         reference: The fingerprint to search in.
-        max_bit_error_rate: Decision threshold on the bit error rate, in
-            ``[0, 1]``.
+        max_bit_error_rate: Threshold on the bit error rate of long
+            overlaps, in ``[0, 1]``; shorter overlaps are held to a
+            proportionally stricter one (:func:`overlap_threshold`).
         min_overlap_seconds: Minimum compared overlap, in seconds (at least
             :data:`MIN_COMPARED_ITEMS` sub-fingerprints in any case).
         max_offset_seconds: If given, only offsets with
@@ -516,6 +590,7 @@ def compare_fingerprints(
         overlap_seconds=0.0,
         query_coverage=0.0,
         chance_bit_error_rate=0.0,
+        bit_error_threshold=float(_thresholds(np.array([0]), max_bit_error_rate)[0]),
     )
     q = np.asarray(query.values, dtype=np.uint32)
     r = np.asarray(reference.values, dtype=np.uint32)
@@ -543,7 +618,8 @@ def compare_fingerprints(
     scores = (0.5 - rates) * np.sqrt(bits)
     order = np.lexsort((np.abs(offsets[candidates]), -compared[candidates], -scores))
     ranked = candidates[order]
-    passing = ranked[rates[order] <= max_bit_error_rate]
+    thresholds = _thresholds(compared[candidates], max_bit_error_rate)
+    passing = ranked[(rates <= thresholds)[order]]
     best, chance, matched = int(ranked[0]), None, False
     if passing.size:
         passing_chance = _chance_error_rates(q, r, offsets[passing])
@@ -573,6 +649,7 @@ def compare_fingerprints(
         overlap_seconds=overlap * ITEM_SECONDS,
         query_coverage=overlap / q.size,
         chance_bit_error_rate=chance,
+        bit_error_threshold=float(_thresholds(np.array([overlap]), max_bit_error_rate)[0]),
     )
 
 
@@ -629,7 +706,7 @@ def _fpcalc_values(
 
 
 def _parse_fpcalc(raw: bytes, max_items: int) -> tuple[int, ...]:
-    document = load_json_object(raw, "fingerprint")
+    document = _ffmpeg.load_json_object(raw, "fingerprint")
     values = document.get("fingerprint")
     if not isinstance(values, list) or len(values) > max_items:
         raise MediaDecodeError("fingerprint: fpcalc returned no usable fingerprint")
