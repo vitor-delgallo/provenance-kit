@@ -14,29 +14,37 @@ a callable and checks the watermark after that real encoding.
   :func:`embed_verified` hold the domain logic and accept any
   :class:`AudioWatermarkBackend`.
 
-The payload is 16 bits with no room for error correction (decision 8): rely
-on the detection probability and give the :class:`~provenance_kit.payload.PayloadCodec`
+The payload is 16 bits with no room for error correction (decision 8). The
+detector's ``found`` is not evidence on its own (unmarked impulse trains
+score up to 0.97): give the :class:`~provenance_kit.payload.PayloadCodec`
 check bits, for example ``PayloadCodec(16, version_bits=0, check_bits=4)``
-(4,096 identifiers, random bits pass the check with probability 1/16).
+(4,096 identifiers, random bits pass the check with probability 1/16), and
+rely on ``detection.verified`` (found and the check bits match).
 
 Example::
 
+    from provenance_kit import PayloadCodec
     from provenance_kit.audio.pcm import decode_pcm
     from provenance_kit.audio.watermark import AudioSealBackend, detect_watermark, embed_watermark
 
     backend = AudioSealBackend(model_dir="/srv/models/audioseal")
+    codec = PayloadCodec(16, version_bits=0, check_bits=4)
     audio = decode_pcm(data)
-    marked = embed_watermark(audio.samples, audio.sample_rate, "1010110011110000", backend=backend)
-    detection = detect_watermark(marked, audio.sample_rate, backend=backend)
+    marked = embed_watermark(audio.samples, audio.sample_rate, codec.encode(42), backend=backend)
+    detection = detect_watermark(marked, audio.sample_rate, backend=backend, codec=codec)
+    if detection.verified:  # found, and the check bits match
+        identifier = detection.payload.identifier
 
 Alignment matters: the models are sensitive to sample-level time shifts, so
 publish in containers that record the encoder delay (AAC in MP4/M4A, MP3
 files with the LAME/Info tag, Ogg Opus, FLAC) and check the real pipeline
 with :func:`embed_verified`. For audio that went through a pipeline that
 does not record the delay (raw ADTS AAC, MP3 written to a pipe), pass
-``alignment=AlignmentSearch()`` to :func:`detect_watermark`: an opt-in,
-bounded and slower search over sample offsets. Robustness numbers measured with real codecs are
-in ``docs/audio.md``.
+``alignment=AlignmentSearch()`` (with the codec) to :func:`detect_watermark`:
+an opt-in, bounded and slower search over sample offsets, whose shift is used
+only when it is corroborated (by the check bits; without them, only to
+refine a signal already found unshifted). Robustness numbers measured with
+real codecs are in ``docs/audio.md``.
 
 Thread safety: :class:`AudioSealBackend` can be shared between threads
 (model calls are serialized); the functions are thread-safe given a

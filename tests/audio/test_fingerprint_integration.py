@@ -20,10 +20,13 @@ Run with ``-s`` to print the numbers.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from provenance_kit.audio.fingerprint import (
     DEFAULT_MAX_BIT_ERROR_RATE,
+    MIN_COMPARED_ITEMS,
+    SILENCE_VALUE,
     AudioFingerprint,
     compare_fingerprints,
     fingerprint_audio,
@@ -31,7 +34,7 @@ from provenance_kit.audio.fingerprint import (
 )
 from provenance_kit.audio.pcm import decode_pcm
 from provenance_kit.tools import ExternalTools, Tool
-from tests.audio.media import ffmpeg, lavfi, song
+from tests.audio.media import ffmpeg, lavfi, music, song, wav
 from tests.support import find_tools, require_tool
 
 pytestmark = pytest.mark.integration
@@ -157,3 +160,89 @@ def test_short_audio_gives_an_empty_fingerprint(tools):
     fp = fingerprint_audio(clip, tools=tools)
     assert fp.values == ()
     assert fp.duration_seconds == pytest.approx(1.5, abs=0.01)
+
+
+# ------------------------------------------------------------ low information
+
+
+def test_digital_silence_has_one_code_and_is_never_compared(tools):
+    """An 8 s silent intro must not match an unrelated track's 8 s silent outro."""
+    rate = 44100
+    gap = np.zeros(8 * rate)
+    upload = fingerprint_audio(wav(np.concatenate([gap, music(30, rate, 11)]), rate), tools=tools)
+    original = fingerprint_audio(wav(np.concatenate([music(45, rate, 22), gap]), rate), tools=tools)
+    assert SILENCE_VALUE in upload.values
+    assert SILENCE_VALUE in original.values
+    match = compare_fingerprints(upload, original)
+    print(f"\nsilent gaps: {match}")
+    assert not match.is_match  # was a match at bit error rate 0.000
+    assert match.bit_error_rate > 0.3
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "anoisesrc=color=white:seed={seed}:sample_rate=44100:amplitude=0.3",
+        "anoisesrc=color=pink:seed={seed}:sample_rate=44100:amplitude=0.3",
+        "anoisesrc=color=white:seed={seed}:sample_rate=44100:amplitude=0.001",  # -60 dBFS floor
+    ],
+)
+def test_independent_noise_recordings_do_not_match(tools, source):
+    first, second = (
+        fingerprint_audio(
+            ffmpeg(tools, [*lavfi(source.format(seed=seed), 30), "-f", "wav", "pipe:1"]),
+            tools=tools,
+        )
+        for seed in (1, 2)
+    )
+    match = compare_fingerprints(first, second)
+    ratio = match.bit_error_rate / match.chance_bit_error_rate
+    print(f"\n{source}: BER {match.bit_error_rate:.3f}, chance {match.chance_bit_error_rate:.3f}")
+    assert not match.is_match
+    assert ratio > 0.75  # measured 0.82 to 0.94: agreement at chance level
+
+
+def test_short_unrelated_clips_never_match_a_long_reference(tools):
+    """Clips of 2.7 to 3.6 s give 1 to 8 sub-fingerprints: below MIN_COMPARED_ITEMS."""
+    rate = 11025
+    reference = fingerprint_audio(wav(music(300, rate, 1000), rate), tools=tools)
+    for seed in range(5):
+        for seconds in (2.8, 3.0, 3.5):
+            clip = fingerprint_audio(wav(music(seconds, rate, seed), rate), tools=tools)
+            assert 0 < len(clip) < MIN_COMPARED_ITEMS
+            match = compare_fingerprints(clip, reference)
+            assert not match.is_match
+            assert match.overlap_items == 0
+
+
+def test_clips_from_about_5_s_are_found(songs, fingerprints, tools):
+    for seconds, found in ((4.0, False), (5.0, True), (6.0, True)):
+        cut = ["-ss", "21", "-t", str(seconds)]
+        clip = ffmpeg(
+            tools, ["-i", "pipe:0", *cut, "-c:a", "aac", "-f", "adts", "pipe:1"], stdin=songs[0]
+        )
+        match = compare_fingerprints(fingerprint_audio(clip, tools=tools), fingerprints[0])
+        print(f"\n{seconds} s clip: {match}")
+        assert match.is_match is found
+        if found:
+            assert match.offset_seconds == pytest.approx(21.0, abs=0.13)
+
+
+def test_an_upload_that_starts_with_the_end_of_the_original_is_found(tools):
+    """The genuine 7 s overlap wins although a long unrelated overlap has a higher z-score."""
+    rate = 44100
+    original_audio = ffmpeg(tools, [*lavfi(song(1, rate), 90), "-ac", "1", "-f", "wav", "pipe:1"])
+    original = decode_pcm(original_audio, tools=tools).samples[0]
+    other = decode_pcm(
+        ffmpeg(tools, [*lavfi(song(2, rate), 120), "-ac", "1", "-f", "wav", "pipe:1"]),
+        tools=tools,
+    ).samples[0]
+    upload = np.concatenate([original[-10 * rate :], other])
+    match = compare_fingerprints(
+        fingerprint_audio(wav(upload, rate), tools=tools),
+        fingerprint_audio(original_audio, tools=tools),
+    )
+    print(f"\nupload starting with the original's end: {match}")
+    assert match.is_match
+    assert match.bit_error_rate < 0.05
+    assert match.offset_seconds == pytest.approx(80.0, abs=0.5)

@@ -67,6 +67,17 @@ def test_decode_pcm_resamples_and_downmixes_through_ffmpeg():
     assert args[args.index("-ar") + 1] == "16000"
 
 
+def test_downmix_matrix_is_normalized():
+    # ffmpeg's float output does not normalize its rematrix by default
+    # (+3 dB for identical stereo channels); the 16-bit output does.
+    for out_channels in (None, 1):
+        tools = FakeTools(ffprobe=probe_json(), ffmpeg=b"")
+        decode_pcm(WAV, channels=out_channels, tools=tools)  # type: ignore[arg-type]
+        (args,) = tools.args_of("ffmpeg")
+        assert args[args.index("-rematrix_maxval") + 1] == "1.0"
+        assert args.index("-rematrix_maxval") > args.index("-i")  # an output option
+
+
 def test_nan_samples_are_zeroed():
     tools = FakeTools(
         ffprobe=probe_json(channels=1), ffmpeg=np.array([np.nan, 0.5], "<f4").tobytes()
@@ -94,6 +105,54 @@ def test_caller_truncation_is_not_an_error():
     assert audio.frames == 480
     (args,) = tools.args_of("ffmpeg")
     assert float(args[args.index("-t") + 1]) == pytest.approx(0.01)
+
+
+def surround_report(seconds: float) -> bytes:
+    """An ffprobe report for 8-channel 192 kHz audio of the given declared duration."""
+    report = json.loads(probe_json(channels=8, sample_rate="192000", duration=str(seconds)))
+    report["format"]["duration"] = str(seconds)
+    return json.dumps(report).encode()
+
+
+def test_declared_decoded_size_is_refused_before_decoding():
+    # 20 s of 8-channel 192 kHz audio is 123 MB of float32: a 16 KB FLAC of
+    # silence declares that much. Three hours of it would be 66 GB.
+    small = dataclasses.replace(LIMITS, max_decoded_audio_bytes=100_000_000)
+    tools = FakeTools(ffprobe=surround_report(20))
+    with pytest.raises(MediaLimitExceededError) as info:
+        decode_pcm(WAV, tools=tools, limits=small)  # type: ignore[arg-type]
+    assert info.value.limit == "max_decoded_audio_bytes"
+    assert info.value.actual == 20 * 192_000 * 8 * 4
+    assert tools.args_of("ffmpeg") == []  # refused from the probe alone
+    tools = FakeTools(ffprobe=surround_report(10_000))
+    with pytest.raises(MediaLimitExceededError, match="max_decoded_audio_bytes"):
+        decode_pcm(WAV, tools=tools)  # type: ignore[arg-type]  # default limits
+    assert tools.args_of("ffmpeg") == []
+
+
+def test_decoded_size_uses_the_output_layout_and_the_truncation():
+    report = surround_report(20)
+    small = dataclasses.replace(LIMITS, max_decoded_audio_bytes=100_000_000)
+    tools = FakeTools(ffprobe=report, ffmpeg=np.zeros(160, "<f4").tobytes())
+    audio = decode_pcm(WAV, sample_rate=16000, channels=1, tools=tools, limits=small)  # type: ignore[arg-type]
+    assert audio.samples.shape == (1, 160)
+    tools = FakeTools(ffprobe=report, ffmpeg=np.zeros(8 * 192, "<f4").tobytes())
+    decode_pcm(WAV, max_duration_seconds=1.0, tools=tools, limits=small)  # type: ignore[arg-type]
+
+
+def test_undeclared_decoded_size_is_counted_while_decoding():
+    report = json.loads(probe_json(channels=2, duration=None))
+    report["format"].pop("duration")
+    tools = FakeTools(ffprobe=json.dumps(report).encode(), ffmpeg=np.zeros(4096, "<f4").tobytes())
+    small = dataclasses.replace(LIMITS, max_decoded_audio_bytes=8000)
+    with pytest.raises(MediaLimitExceededError) as info:
+        decode_pcm(WAV, tools=tools, limits=small)  # type: ignore[arg-type]
+    assert info.value.limit == "max_decoded_audio_bytes"
+    assert info.value.maximum == 8000
+    # The same output within the bound decodes.
+    fits = dataclasses.replace(LIMITS, max_decoded_audio_bytes=4096 * 4)
+    tools = FakeTools(ffprobe=json.dumps(report).encode(), ffmpeg=np.zeros(4096, "<f4").tobytes())
+    assert decode_pcm(WAV, tools=tools, limits=fits).frames == 2048  # type: ignore[arg-type]
 
 
 def test_requested_layout_is_checked_against_limits():

@@ -413,6 +413,65 @@ def test_timespan_soft_binding_and_constrained_training_mining():
     assert policy.use_of("cawg.ai_inference") is TrainingMiningUse.ALLOWED
 
 
+def standard_policy(*uses: TrainingMiningUse) -> TrainingMiningPolicy:
+    keys = (
+        TrainingMiningKey.AI_TRAINING,
+        TrainingMiningKey.AI_GENERATIVE_TRAINING,
+        TrainingMiningKey.DATA_MINING,
+        TrainingMiningKey.AI_INFERENCE,
+    )
+    return TrainingMiningPolicy(
+        tuple(TrainingMiningEntry(key, use, "ask") for key, use in zip(keys, uses, strict=False))
+    )
+
+
+def test_constrained_uses_count_as_not_allowed():
+    """CAWG TDM 1.1: "constrained shall be treated as equivalent to notAllowed"."""
+    not_allowed, constrained, allowed = (
+        TrainingMiningUse.NOT_ALLOWED,
+        TrainingMiningUse.CONSTRAINED,
+        TrainingMiningUse.ALLOWED,
+    )
+    every_use_constrained = standard_policy(*[constrained] * 4)
+    assert every_use_constrained.all_not_allowed
+    assert not every_use_constrained.all_declared_not_allowed  # the literal view
+    assert every_use_constrained.effective_use_of("cawg.ai_training") is not_allowed
+    assert every_use_constrained.use_of("cawg.ai_training") is constrained
+    mixed = standard_policy(not_allowed, constrained, not_allowed, constrained)
+    assert mixed.all_not_allowed
+    assert not mixed.all_declared_not_allowed
+    assert TrainingMiningPolicy.not_allowed().all_declared_not_allowed
+    assert TrainingMiningPolicy.not_allowed().all_not_allowed
+    assert not standard_policy(constrained, constrained, constrained, allowed).all_not_allowed
+    assert not standard_policy(constrained, constrained, constrained).all_not_allowed  # 3 of 4
+    assert every_use_constrained.effective_use_of("cawg.unknown") is None
+    assert standard_policy(allowed).effective_use_of("cawg.ai_training") is allowed
+
+
+def test_report_flag_treats_constrained_as_not_allowed():
+    store = json.loads(store_json())
+    store["manifests"]["urn:c2pa:1"]["assertions"] = [
+        {
+            "label": "cawg.training-mining",
+            "data": {
+                "entries": {
+                    key: {"use": "constrained", "constraint_info": "contact the artist"}
+                    for key in (
+                        "cawg.ai_training",
+                        "cawg.ai_generative_training",
+                        "cawg.data_mining",
+                        "cawg.ai_inference",
+                    )
+                }
+            },
+        }
+    ]
+    report = parse_manifest_store(json.dumps(store))
+    assert report.training_mining_not_allowed
+    assert report.training_mining is not None
+    assert not report.training_mining.all_declared_not_allowed
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

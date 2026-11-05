@@ -552,6 +552,23 @@ def test_manifest_rejected_by_the_library_is_a_signing_error(pki):
         sign_asset(image_bytes("JPEG"), "image/jpeg", simple_spec(), signer)
 
 
+@pytest.mark.parametrize("key_usage", ["nonRepudiation", "none"])
+def test_leaf_without_digital_signature_is_refused_for_every_signer(key_usage):
+    """C2PA 2.3, section 14.5.1: claim-signing certificates assert digitalSignature.
+
+    c2pa-rs 0.91 signs with a nonRepudiation-only leaf and reads the result
+    back as trusted; the adapter refuses such a leaf before the library sees
+    it, for KMS-style signers and for LocalKeySigner.
+    """
+    bad = make_c2pa_pki("es256", key_usage=key_usage)
+    with pytest.raises(ValueError, match="digitalSignature"):
+        LocalKeySigner(bad.key_pem, bad.leaf_pem)
+    kms = FakeKms(bad)
+    with pytest.raises(ValueError, match="digitalSignature"):
+        sign_asset(image_bytes("JPEG"), "image/jpeg", simple_spec(), kms)
+    assert kms.calls == 0
+
+
 def test_corrupt_asset_or_ingredient_is_a_media_error(signer):
     corrupt = image_bytes("JPEG")[:40]
     with pytest.raises(MediaDecodeError):

@@ -11,8 +11,12 @@ import pytest
 
 from provenance_kit.audio.fingerprint import (
     CHROMAPRINT_SAMPLE_RATE,
+    DEFAULT_MAX_BIT_ERROR_RATE,
     FORMAT_VERSION,
     ITEM_SECONDS,
+    MAX_CHANCE_ERROR_FRACTION,
+    MIN_COMPARED_ITEMS,
+    SILENCE_VALUE,
     AudioFingerprint,
     compare_fingerprints,
     fingerprint_audio,
@@ -27,6 +31,22 @@ from tests.audio.fakes import WAV, FakeTools, probe_json
 def random_fp(rng: np.random.Generator, count: int) -> AudioFingerprint:
     values = tuple(int(v) for v in rng.integers(0, 2**32, size=count, dtype=np.uint64))
     return AudioFingerprint(values=values, duration_seconds=count * ITEM_SECONDS)
+
+
+def fp(values: tuple[int, ...]) -> AudioFingerprint:
+    return AudioFingerprint(values=tuple(values), duration_seconds=len(values) * ITEM_SECONDS)
+
+
+# The same per-bit bias for every "recording", as Chromaprint's filters give
+# stationary noise: most bits are almost always 1 or almost always 0.
+_BIAS_SIGNS = np.array([1.0 if bit % 3 else -1.0 for bit in range(32)])
+
+
+def biased_fp(rng: np.random.Generator, count: int, strength: float = 0.8) -> AudioFingerprint:
+    """Independent random sub-fingerprints whose bits are biased (|2p - 1| = strength)."""
+    ones = rng.random((count, 32)) < 0.5 + 0.5 * strength * _BIAS_SIGNS
+    weights = np.left_shift(np.uint64(1), np.arange(32, dtype=np.uint64))
+    return fp(tuple(int(v) for v in (ones * weights).sum(axis=1, dtype=np.uint64)))
 
 
 def noisy_clip(
@@ -101,6 +121,7 @@ def test_identical_fingerprints_match_exactly(rng):
     assert match.offset_items == 0
     assert match.overlap_items == 200
     assert match.query_coverage == 1.0
+    assert match.chance_bit_error_rate == pytest.approx(0.5, abs=0.02)  # random bits
 
 
 @pytest.mark.parametrize("start", [0, 13, 250])
@@ -146,8 +167,98 @@ def test_min_overlap_and_max_offset(rng):
     clip = noisy_clip(reference, 200, 300, rng, flip_rate=0.0)
     assert compare_fingerprints(clip, reference, max_offset_seconds=10).bit_error_rate > 0.3
     assert compare_fingerprints(clip, reference).offset_items == 200
-    tiny = noisy_clip(reference, 0, 3, rng, flip_rate=0.0)
-    assert compare_fingerprints(tiny, reference).overlap_items == 3  # whole query
+    short = noisy_clip(reference, 0, 30, rng, flip_rate=0.0)
+    assert compare_fingerprints(short, reference).overlap_items == 30  # whole query
+    # min_overlap_seconds=0 still needs MIN_COMPARED_ITEMS: the edge offsets
+    # with 1 to 19 items of overlap are never eligible.
+    edge = compare_fingerprints(short, reference, min_overlap_seconds=0, max_bit_error_rate=1.0)
+    assert edge.overlap_items >= MIN_COMPARED_ITEMS
+
+
+# ------------------------------------------------------------ low information (P01, P02)
+
+
+def test_silence_does_not_match_silence(rng):
+    gap = (SILENCE_VALUE,) * 64  # about 8 s of digital silence
+    upload = fp(gap + random_fp(rng, 300).values)  # silent intro, then other music
+    original = fp(random_fp(rng, 480).values + gap)  # silent outro
+    match = compare_fingerprints(upload, original)
+    assert not match.is_match
+    assert match.bit_error_rate > 0.4  # the silence pairs are not counted
+    silence_only = compare_fingerprints(fp(gap), fp(gap * 3))
+    assert not silence_only.is_match
+    assert silence_only.overlap_items == 0  # nothing informative to compare
+
+
+def test_silence_is_left_out_of_the_comparison(rng):
+    values = list(random_fp(rng, 400).values)
+    values[150:190] = [SILENCE_VALUE] * 40
+    reference = fp(tuple(values))
+    clip = noisy_clip(reference, 100, 260, rng, flip_rate=0.05)
+    match = compare_fingerprints(clip, reference)
+    assert match.is_match
+    assert match.offset_items == 100
+    assert match.overlap_items == 160 - 40  # compared pairs only
+    assert 0.02 < match.bit_error_rate < 0.08
+
+
+def test_constant_codes_carry_no_information(rng):
+    hum = (0x12345678,) * 120  # a steady tone gives one value, like silence
+    upload = fp(hum + random_fp(rng, 200).values)
+    original = fp(random_fp(rng, 400).values + hum)
+    assert not compare_fingerprints(upload, original).is_match
+    alone = compare_fingerprints(fp(hum), fp(hum * 3))
+    assert not alone.is_match
+    assert alone.bit_error_rate == 0.0
+    assert alone.chance_bit_error_rate == 0.0
+
+
+def test_independent_stationary_noise_does_not_match(rng):
+    # Two noise recordings agree on the biased bits by chance: BER about 0.18,
+    # below the 0.20 threshold, but no better than chance.
+    match = compare_fingerprints(biased_fp(rng, 300), biased_fp(rng, 500))
+    assert match.bit_error_rate < DEFAULT_MAX_BIT_ERROR_RATE
+    assert match.chance_bit_error_rate == pytest.approx(0.18, abs=0.02)
+    assert not match.is_match
+
+
+def test_a_copy_of_noise_still_matches(rng):
+    noise = biased_fp(rng, 400)
+    clip = noisy_clip(noise, 50, 250, rng, flip_rate=0.01)
+    match = compare_fingerprints(clip, noise)
+    assert match.is_match
+    assert match.offset_items == 50
+    assert match.bit_error_rate < MAX_CHANCE_ERROR_FRACTION * match.chance_bit_error_rate
+
+
+def test_short_queries_never_match(rng):
+    reference = random_fp(rng, 4000)
+    for count in (1, 3, MIN_COMPARED_ITEMS - 1):
+        exact = noisy_clip(reference, 1000, 1000 + count, rng, flip_rate=0.0)
+        match = compare_fingerprints(exact, reference)
+        assert not match.is_match
+        assert match.overlap_items == 0
+    at_floor = noisy_clip(reference, 1000, 1000 + MIN_COMPARED_ITEMS, rng, flip_rate=0.05)
+    match = compare_fingerprints(at_floor, reference)
+    assert match.is_match
+    assert match.offset_items == 1000
+
+
+# ------------------------------------------------------------ offset choice (P05)
+
+
+def test_a_genuine_edge_overlap_beats_a_long_unrelated_one(rng):
+    # The upload starts with the original's last 60 items, then other
+    # material; both have biased bits, so long overlaps of the two reach a
+    # high z-score at a bit error rate of about 0.32.
+    original = biased_fp(rng, 800, strength=0.6)
+    tail = noisy_clip(original, 740, 800, rng, flip_rate=0.01)
+    upload = fp(tail.values + biased_fp(rng, 1200, strength=0.6).values)
+    match = compare_fingerprints(upload, original)
+    assert match.is_match
+    assert match.offset_items == 740
+    assert match.overlap_items == 60
+    assert match.bit_error_rate < 0.03
 
 
 def test_empty_fingerprints_never_match(rng):

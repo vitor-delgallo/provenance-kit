@@ -4,7 +4,8 @@
   profile c2pa-rs checks (C2PA 2.x, "Certificate profile"): X.509 v3, leaf not
   a CA, ``digitalSignature`` key usage (critical), extended key usages
   ``id-kp-emailProtection`` and ``id-kp-documentSigning``, authority and
-  subject key identifiers.
+  subject key identifiers (or, for negative tests, a leaf without the EKUs
+  or without ``digitalSignature``).
 * :func:`make_tls_contexts` builds a CA and a ``127.0.0.1`` server certificate
   for HTTPS tests.
 
@@ -46,15 +47,16 @@ def _name(common_name: str) -> x509.Name:
     )
 
 
-def _key_usage(*, signing: bool) -> x509.KeyUsage:
+def _key_usage(*, signing: bool, non_repudiation: bool = False) -> x509.KeyUsage:
+    ca = not signing and not non_repudiation
     return x509.KeyUsage(
         digital_signature=signing,
-        content_commitment=False,
+        content_commitment=non_repudiation,
         key_encipherment=False,
         data_encipherment=False,
         key_agreement=False,
-        key_cert_sign=not signing,
-        crl_sign=not signing,
+        key_cert_sign=ca,
+        crl_sign=ca,
         encipher_only=False,
         decipher_only=False,
     )
@@ -88,10 +90,15 @@ def _root(
     return key, certificate
 
 
-def make_c2pa_pki(kind: str = "es256", *, with_eku: bool = True) -> C2paPki:
+def make_c2pa_pki(
+    kind: str = "es256", *, with_eku: bool = True, key_usage: str = "digitalSignature"
+) -> C2paPki:
     """Returns a fresh root CA and a C2PA leaf with a ``kind`` key.
 
     ``kind`` is ``es256``, ``es384``, ``es512``, ``ed25519`` or ``rsa``.
+    ``key_usage`` is ``digitalSignature`` (the C2PA profile),
+    ``nonRepudiation`` (that bit only, no ``digitalSignature``) or ``none``
+    (no key usage extension); the last two are for negative tests.
     """
     now = dt.datetime.now(dt.UTC)
     root_key, root = _root(now, "provenance-kit test root")
@@ -116,13 +123,20 @@ def make_c2pa_pki(kind: str = "es256", *, with_eku: bool = True) -> C2paPki:
         .not_valid_before(now - dt.timedelta(days=1))
         .not_valid_after(now + dt.timedelta(days=30))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .add_extension(_key_usage(signing=True), critical=True)
         .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
         .add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(root_key.public_key()),
             critical=False,
         )
     )
+    if key_usage == "digitalSignature":
+        builder = builder.add_extension(_key_usage(signing=True), critical=True)
+    elif key_usage == "nonRepudiation":
+        builder = builder.add_extension(
+            _key_usage(signing=False, non_repudiation=True), critical=True
+        )
+    elif key_usage != "none":
+        raise ValueError(key_usage)
     if with_eku:
         builder = builder.add_extension(
             x509.ExtendedKeyUsage([ExtendedKeyUsageOID.EMAIL_PROTECTION, ID_KP_DOCUMENT_SIGNING]),

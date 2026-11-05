@@ -129,7 +129,13 @@ class DigitalSourceType(enum.StrEnum):
 
 
 class TrainingMiningUse(enum.StrEnum):
-    """Whether a use is permitted (CAWG Training and Data Mining 1.1)."""
+    """Whether a use is permitted (CAWG Training and Data Mining 1.1).
+
+    CAWG TDM 1.1: "In the absence of additional information, ``constrained``
+    shall be treated as equivalent to ``notAllowed``" (the constraints are
+    free text that software cannot evaluate);
+    :meth:`TrainingMiningPolicy.effective_use_of` applies that rule.
+    """
 
     ALLOWED = "allowed"
     NOT_ALLOWED = "notAllowed"
@@ -390,7 +396,8 @@ class TrainingMiningPolicy:
             key: The entry key.
 
         Returns:
-            The use, or ``None`` if the policy has no such entry.
+            The use as declared (``constrained`` stays ``constrained``), or
+            ``None`` if the policy has no such entry.
         """
         wanted = {str(key)}
         if str(key).startswith("cawg."):
@@ -400,9 +407,48 @@ class TrainingMiningPolicy:
                 return entry.use
         return None
 
+    def effective_use_of(self, key: TrainingMiningKey | str) -> TrainingMiningUse | None:
+        """Returns the use a consumer must apply for a key, per CAWG TDM 1.1.
+
+        ``constrained`` becomes ``notAllowed`` ("in the absence of additional
+        information, ``constrained`` shall be treated as equivalent to
+        ``notAllowed``"): software cannot evaluate the free-text constraints,
+        so it must not treat them as permission. Read
+        :attr:`TrainingMiningEntry.constraint_info` and :meth:`use_of` when a
+        person can.
+
+        Args:
+            key: The entry key (C2PA 1.x spellings match as in :meth:`use_of`).
+
+        Returns:
+            ``ALLOWED`` or ``NOT_ALLOWED``, or ``None`` if the policy has no
+            such entry (the policy says nothing about that use).
+        """
+        use = self.use_of(key)
+        if use is TrainingMiningUse.CONSTRAINED:
+            return TrainingMiningUse.NOT_ALLOWED
+        return use
+
     @property
     def all_not_allowed(self) -> bool:
-        """Whether all four standard uses are declared ``notAllowed``."""
+        """Whether none of the four standard uses is permitted, per CAWG TDM 1.1.
+
+        True when AI training, generative AI training, data mining and AI
+        inference are each declared ``notAllowed`` or ``constrained`` (which
+        CAWG says to treat as ``notAllowed``; see :meth:`effective_use_of`).
+        False when a standard use is ``allowed`` or not declared at all.
+        :attr:`all_declared_not_allowed` is the literal reading.
+        """
+        return all(self.effective_use_of(key) is TrainingMiningUse.NOT_ALLOWED for key in _KEYS)
+
+    @property
+    def all_declared_not_allowed(self) -> bool:
+        """Whether all four standard uses are declared exactly ``notAllowed``.
+
+        The literal view: a policy with a ``constrained`` use is not counted.
+        For deciding whether a use is permitted, use :attr:`all_not_allowed`
+        or :meth:`effective_use_of`.
+        """
         return all(self.use_of(key) is TrainingMiningUse.NOT_ALLOWED for key in _KEYS)
 
 

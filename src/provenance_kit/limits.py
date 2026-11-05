@@ -57,6 +57,17 @@ class MediaLimits:
       bombs that multiply memory use.
     * ``max_sample_rate`` = 192,000 Hz. The highest rate in common studio use;
       refuses declared rates that inflate decoded size.
+    * ``max_decoded_audio_bytes`` = 1 GiB. Bounds the decoded PCM that one
+      call holds in memory: duration x output sample rate x output channels
+      x bytes per sample (4 for the float32 of
+      :func:`~provenance_kit.audio.pcm.decode_pcm`). The duration, rate and
+      channel limits above are separate and multiply to about 66 GB (3 hours
+      of 8-channel 192 kHz float32), which a 16 KB FLAC of silence can
+      request: compressed silence decodes at ratios above 7,000. 1 GiB holds
+      46 minutes of 48 kHz stereo, 3 hours of 16 kHz mono (what the
+      AudioSeal models use) and is in line with the ~770 MB that
+      ``max_pixels`` allows for an image tensor. Decode long media at a
+      lower rate or channel count, or raise the limit.
     * ``subprocess_timeout_seconds`` = 600 (10 minutes). Bounds one external
       tool invocation (ffmpeg, ffprobe, fpcalc) so that a hung or pathological
       decode is killed. Long videos processed in one call may need more.
@@ -76,6 +87,7 @@ class MediaLimits:
     max_image_frames: int = 5_000
     max_audio_channels: int = 8
     max_sample_rate: int = 192_000
+    max_decoded_audio_bytes: int = 1024 * _MIB
     subprocess_timeout_seconds: float = 600.0
 
     def __post_init__(self) -> None:
@@ -167,6 +179,48 @@ class MediaLimits:
             raise MediaLimitExceededError("max_audio_channels", self.max_audio_channels, channels)
         if sample_rate > self.max_sample_rate:
             raise MediaLimitExceededError("max_sample_rate", self.max_sample_rate, sample_rate)
+
+    def check_decoded_audio_bytes(self, size: int) -> None:
+        """Checks the size of decoded PCM, declared or counted.
+
+        Call this with the size computed from the probe (see
+        :meth:`decoded_audio_bytes`) **before** decoding, and again with the
+        running byte count while reading the decoder's output, because
+        containers can under-declare their duration.
+
+        Args:
+            size: The decoded size in bytes.
+
+        Raises:
+            MediaLimitExceededError: If ``size`` exceeds
+                ``max_decoded_audio_bytes``.
+        """
+        if size > self.max_decoded_audio_bytes:
+            raise MediaLimitExceededError(
+                "max_decoded_audio_bytes", self.max_decoded_audio_bytes, size
+            )
+
+    @staticmethod
+    def decoded_audio_bytes(
+        seconds: float, *, sample_rate: int, channels: int, bytes_per_sample: int = 4
+    ) -> int:
+        """Returns the size of ``seconds`` of decoded PCM.
+
+        Args:
+            seconds: The duration (declared, or the caller's truncation).
+            sample_rate: The output sample rate in hertz.
+            channels: The output channel count.
+            bytes_per_sample: 4 for float32 (the default), 2 for 16-bit PCM.
+
+        Returns:
+            ``ceil(seconds * sample_rate) * channels * bytes_per_sample``.
+
+        Raises:
+            ValueError: If ``seconds`` is negative or not finite.
+        """
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError(f"seconds must be finite and non-negative, got {seconds}")
+        return math.ceil(seconds * sample_rate) * channels * bytes_per_sample
 
 
 def _check_positive_int(name: str, value: object) -> None:

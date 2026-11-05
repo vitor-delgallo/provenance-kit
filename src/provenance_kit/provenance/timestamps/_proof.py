@@ -100,16 +100,18 @@ class TimestampProof:
 
     @classmethod
     def from_bytes(
-        cls, data: BytesLike, *, max_bytes: int = DEFAULT_MAX_PROOF_BYTES
+        cls, data: BytesLike, *, max_proof_bytes: int = DEFAULT_MAX_PROOF_BYTES
     ) -> TimestampProof:
         """Parses and validates an ``.ots`` file (untrusted input).
 
         The proof is parsed completely with python-opentimestamps and stored
-        re-serialized, so equal proofs have equal bytes.
+        re-serialized, so equal proofs have equal bytes. The size is checked
+        first, before the library is needed.
 
         Args:
             data: The ``.ots`` bytes.
-            max_bytes: The size limit.
+            max_proof_bytes: The size limit (the same name and default as
+                :class:`OpenTimestamper`'s).
 
         Returns:
             The proof.
@@ -118,14 +120,15 @@ class TimestampProof:
             TypeError: If ``data`` is not bytes-like.
             BackendUnavailableError: If opentimestamps is not installed
                 (extra ``timestamps``).
-            MediaLimitExceededError: If ``data`` exceeds ``max_bytes``.
+            MediaLimitExceededError: If ``data`` exceeds ``max_proof_bytes``
+                (``limit="max_proof_bytes"``).
             InvalidProofError: If the proof is malformed.
             UnsupportedMediaError: If it is not a SHA-256 proof.
         """
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError("proof data must be bytes-like")
         raw = bytes(memoryview(data).cast("B"))
-        detached = parse_detached(raw, max_bytes=max_bytes)
+        detached = parse_detached(raw, max_bytes=max_proof_bytes)
         return cls(serialize_detached(detached))
 
     def to_bytes(self) -> bytes:

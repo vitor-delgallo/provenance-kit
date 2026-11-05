@@ -7,10 +7,15 @@ module does not import it. The calendar HTTP client is provenance-kit's own
 
 Typical use::
 
-    from provenance_kit.provenance.timestamps import OpenTimestamper, sha256_file
+    from provenance_kit.provenance.timestamps import (
+        OpenTimestamper,
+        TimestampProof,
+        sha256_file,
+    )
 
     ots = OpenTimestamper()  # the official client's calendars, 2 must answer
-    proof = ots.stamp(sha256_file("master.mov"))  # pending, a few hundred bytes
+    digest = sha256_file("master.mov")  # keep it: verification needs it
+    proof = ots.stamp(digest)  # pending, a few hundred bytes
     store(proof.to_bytes())  # the standard .ots format
 
     # hours later (a background job):

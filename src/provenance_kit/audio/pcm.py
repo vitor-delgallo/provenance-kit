@@ -13,12 +13,24 @@ Limits (:class:`~provenance_kit.limits.MediaLimits`), in order:
 
 1. the byte size, before anything else;
 2. what ffprobe declares: channels, sample rate and duration;
-3. the requested output layout (channels, sample rate);
+3. the requested output layout (channels, sample rate), and the decoded size
+   it implies: declared duration (or the caller's truncation) x output rate
+   x output channels x 4 bytes must fit ``max_decoded_audio_bytes``, checked
+   before ffmpeg starts. The separate limits alone would let a 16 KB FLAC of
+   8-channel 192 kHz silence decode to gigabytes;
 4. while decoding: ffmpeg runs with ``-t`` slightly above
-   ``max_duration_seconds`` and the samples are counted, so a container that
-   under-declares its duration is refused with
+   ``max_duration_seconds`` and the output is counted against both the
+   duration and ``max_decoded_audio_bytes``, so a container that
+   under-declares its duration (or declares none) is refused with
    :class:`~provenance_kit.errors.MediaLimitExceededError` instead of
    decoding without bound.
+
+Downmixing (``channels`` below the source's) uses ffmpeg's matrix normalized
+so that no output sample can exceed full scale (``-rematrix_maxval 1.0``):
+stereo to mono is the mean of the two channels, as in the 16-bit path that
+fingerprints use. Without it, ffmpeg's float output sums the channels at
+-3 dB each, which raises identical channels by 3 dB and would then be
+clipped to ``[-1, 1]``.
 
 Untrusted input never reaches a shell; ffprobe's report is parsed
 defensively (wrong types, ``NaN``, absurd values are refused or ignored).
@@ -247,10 +259,13 @@ def decode_pcm(
         sample_rate: Output sample rate in hertz (ffmpeg resamples), or
             ``None`` to keep the source rate.
         channels: Output channel count (1 = mono downmix, 2 = stereo, ...),
-            or ``None`` to keep the source layout. ffmpeg's default matrix
-            is used: stereo to mono sums the channels at -3 dB each.
+            or ``None`` to keep the source layout. ffmpeg's matrix is
+            normalized so that downmixing cannot exceed full scale: stereo to
+            mono is the mean of the channels. (Mono to stereo copies the
+            channel at -3 dB, ffmpeg's default.)
         max_duration_seconds: Decode at most this much audio (truncation, not
-            an error).
+            an error). It also bounds the decoded size checked against
+            ``limits.max_decoded_audio_bytes``.
         tools: Where the binaries are. Defaults to ``ExternalTools.from_env()``.
         limits: The limits to enforce. Defaults to ``MediaLimits()``.
         temp_dir: Directory for a private temporary file, if the container
@@ -266,7 +281,8 @@ def decode_pcm(
         ValueError: If ``sample_rate``, ``channels`` or
             ``max_duration_seconds`` is out of range.
         MediaLimitExceededError: If the media or the requested layout exceeds
-            ``limits`` (declared, or counted while decoding).
+            ``limits`` (declared, or counted while decoding), including a
+            decoded size above ``max_decoded_audio_bytes``.
         UnsupportedMediaError: If the media holds no audio stream.
         MediaDecodeError: If the media cannot be decoded.
         BackendUnavailableError: If ffmpeg or ffprobe is not available.
@@ -294,6 +310,13 @@ def decode_pcm(
                 f"sample rates below {MIN_SAMPLE_RATE} Hz are not supported"
             )
         limits.check_audio(out_channels, out_rate)
+        check_declared_decoded_size(
+            info,
+            limits,
+            sample_rate=out_rate,
+            channels=out_channels,
+            max_duration_seconds=max_duration_seconds,
+        )
         raw = read_pcm(
             staged,
             info,
@@ -357,6 +380,12 @@ def pcm_args(
         "-dn",
         "-ac",
         str(channels),
+        # Normalize the rematrix so a downmix cannot exceed full scale. The
+        # 16-bit output already does this (swresample's default maxval is 1
+        # for integer formats); float output would otherwise sum stereo to
+        # mono at -3 dB per channel (+3 dB for identical channels).
+        "-rematrix_maxval",
+        "1.0",
         "-ar",
         str(sample_rate),
         "-t",
@@ -369,14 +398,51 @@ def pcm_args(
     ]
 
 
-def sample_cap_bytes(
+def check_declared_decoded_size(
+    info: AudioInfo,
+    limits: MediaLimits,
+    *,
+    sample_rate: int,
+    channels: int,
+    max_duration_seconds: float | None,
+) -> None:
+    """Refuses, from the probe alone, a float32 decode above ``max_decoded_audio_bytes``.
+
+    The duration is the declared one, or the caller's truncation when that
+    is shorter or nothing is declared. With neither, nothing is known up
+    front and :func:`read_pcm` counts the output instead.
+
+    Args:
+        info: The probed stream.
+        limits: The limits in force.
+        sample_rate: Output rate.
+        channels: Output channels.
+        max_duration_seconds: Caller's truncation, if any.
+
+    Raises:
+        MediaLimitExceededError: If the decoded size would exceed
+            ``max_decoded_audio_bytes``.
+    """
+    candidates = [s for s in (info.duration_seconds, max_duration_seconds) if s is not None]
+    if not candidates:
+        return
+    size = MediaLimits.decoded_audio_bytes(
+        min(candidates), sample_rate=sample_rate, channels=channels, bytes_per_sample=4
+    )
+    limits.check_decoded_audio_bytes(size)
+
+
+def duration_cap_bytes(
     limits: MediaLimits,
     *,
     bytes_per_frame: int,
     sample_rate: int,
     max_duration_seconds: float | None,
 ) -> int:
-    """Largest PCM output accepted: the duration limit, plus one frame of slack.
+    """Largest PCM output the duration limit allows, plus one frame of slack.
+
+    Used as is when the PCM is streamed to another tool (fingerprints) and
+    never held in memory.
 
     Args:
         limits: The limits in force.
@@ -385,12 +451,42 @@ def sample_cap_bytes(
         max_duration_seconds: Caller's truncation, if any.
 
     Returns:
-        The byte cap; more output means the media exceeds the limit.
+        The byte cap; more output means the media exceeds the duration limit.
     """
     seconds = limits.max_duration_seconds
     if max_duration_seconds is not None:
         seconds = min(seconds, max_duration_seconds)
     return (math.ceil(seconds * sample_rate) + 1) * bytes_per_frame
+
+
+def sample_cap_bytes(
+    limits: MediaLimits,
+    *,
+    bytes_per_frame: int,
+    sample_rate: int,
+    max_duration_seconds: float | None,
+) -> int:
+    """Largest PCM output accepted in memory.
+
+    The smaller of :func:`duration_cap_bytes` and
+    ``limits.max_decoded_audio_bytes``.
+
+    Args:
+        limits: The limits in force.
+        bytes_per_frame: Bytes per sample frame (all channels).
+        sample_rate: Output rate.
+        max_duration_seconds: Caller's truncation, if any.
+
+    Returns:
+        The byte cap; more output means the media exceeds a limit.
+    """
+    duration_cap = duration_cap_bytes(
+        limits,
+        bytes_per_frame=bytes_per_frame,
+        sample_rate=sample_rate,
+        max_duration_seconds=max_duration_seconds,
+    )
+    return min(duration_cap, limits.max_decoded_audio_bytes)
 
 
 def read_pcm(
@@ -405,7 +501,11 @@ def read_pcm(
     max_duration_seconds: float | None,
     timeout_seconds: float | None,
 ) -> bytes:
-    """Runs ffmpeg and returns the raw PCM bytes, counting them against the limits."""
+    """Runs ffmpeg and returns the raw PCM bytes, counting them against the limits.
+
+    The output is held in memory, so it is capped by both the duration limit
+    and ``max_decoded_audio_bytes``; the error names the limit that was hit.
+    """
     args = pcm_args(
         staged,
         info,
@@ -416,7 +516,7 @@ def read_pcm(
         max_duration_seconds=max_duration_seconds,
     )
     bytes_per_frame = (4 if sample_format == "f32le" else 2) * channels
-    cap = sample_cap_bytes(
+    duration_cap = duration_cap_bytes(
         limits,
         bytes_per_frame=bytes_per_frame,
         sample_rate=sample_rate,
@@ -429,7 +529,8 @@ def read_pcm(
         with tools.stream(Tool.FFMPEG, args, stdin=staged.stdin, timeout_seconds=timeout) as proc:
             for chunk in proc.iter_chunks(_READ_CHUNK):
                 total += len(chunk)
-                if total > cap:
+                limits.check_decoded_audio_bytes(total)  # before keeping the chunk
+                if total > duration_cap:
                     seconds = total / (bytes_per_frame * sample_rate)
                     raise MediaLimitExceededError(
                         "max_duration_seconds", limits.max_duration_seconds, seconds
@@ -437,7 +538,7 @@ def read_pcm(
                 parts.append(chunk)
     except ExternalToolError as exc:
         raise as_media_error(exc, "audio decoding") from exc
-    if max_duration_seconds is None and total > cap - bytes_per_frame:
+    if max_duration_seconds is None and total > duration_cap - bytes_per_frame:
         # Exactly at the cap: the stream ran into the duration limit.
         raise MediaLimitExceededError(
             "max_duration_seconds",

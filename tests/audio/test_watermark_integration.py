@@ -224,27 +224,61 @@ def test_alignment_search_recovers_unsignaled_delays(backend, sources, tools, co
         assert found.offset_samples is not None
         assert abs(found.offset_samples - delay) <= 16
         assert found.found
+        assert found.verified
         assert found.bits == bits
         assert found.payload is not None
         assert found.payload.valid
         assert plain.decoded_bits != bits
 
 
-def test_alignment_search_on_unmarked_audio(backend, sources):
-    """No offset of unmarked audio reaches the bit-confidence floor (measured best: 0.04 to 0.05).
+def click_train(rate: int, hz: int, *, seconds: float, phase: int = 0, level: float = 0.9):
+    """Unmarked one-sample clicks every ``rate // hz`` samples, shaped (1, n)."""
+    clicks = ((np.arange(int(seconds * rate)) + phase) % (rate // hz)) == 0
+    return (clicks * level).astype(np.float32)[None, :]
 
-    Without the floor, the near-random best offset of the sparse tones moved
-    the detection probability from 0.25 to 0.62, a false positive.
+
+def test_alignment_search_on_unmarked_audio(backend, sources):
+    """The search does not turn unmarked audio into a detection.
+
+    Broadband audio: no offset reaches the bit-confidence floor (best 0.04 to
+    0.05). A 100 Hz click train does (0.205 at offset 380), its bits repeat
+    in every window, and dropping those 380 samples raised its detection
+    probability from 0.14 to 0.95: the shift is not corroborated (no check
+    bits to pass, and the signal is not found unshifted), so it is not used.
     """
     search = AlignmentSearch()
-    for name, samples in sources.items():
-        detection = detect_watermark(samples, 44100, backend=backend, alignment=search)
+    signals = {
+        "broadband": (sources["broadband"], 44100),
+        "100 Hz clicks": (click_train(44100, 100, seconds=4.0, level=0.2), 44100),
+    }
+    for name, (samples, rate) in signals.items():
+        detection = detect_watermark(samples, rate, backend=backend, alignment=search)
         print(
             f"\n{name} unmarked with search: offset {detection.offset_samples}, "
             f"detection probability {detection.confidence:.3f}"
         )
         assert not detection.found
         assert detection.offset_samples == 0
+
+
+def test_unmarked_click_trains_fool_the_detector_but_not_the_check_bits(backend):
+    """``found`` is not evidence; ``verified`` (check bits) is.
+
+    Measured: 12 of 24 unmarked click trains (50 and 100 Hz; 16, 44.1 and
+    48 kHz; four phases) reach the 0.5 threshold, with detection
+    probabilities up to 0.97; none passes 4 check bits.
+    """
+    found = verified = 0
+    for rate in (44100, 48000):
+        period = rate // 50
+        for phase in (0, period // 4, period // 2):
+            samples = click_train(rate, 50, seconds=6.0, phase=phase)
+            detection = detect_watermark(samples, rate, backend=backend, codec=CODEC)
+            print(f"\n50 Hz clicks @ {rate} phase {phase}: p={detection.confidence:.3f}")
+            found += detection.found
+            verified += detection.verified
+    assert found >= 4  # measured 6 of 6: the detector alone is fooled
+    assert verified == 0
 
 
 def _matching(read: str | None, bits: str) -> int:

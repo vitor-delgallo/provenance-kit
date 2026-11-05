@@ -229,11 +229,18 @@ class ManifestReport:
 
     @property
     def training_mining_not_allowed(self) -> bool:
-        """Whether the manifest declares all four standard uses ``notAllowed``.
+        """Whether the manifest permits none of the four standard uses.
 
         The four uses are AI training, generative AI training, data mining
-        and AI inference. ``False`` when there is no training-mining
-        assertion. Like every claim in the report, it binds the asset only if
+        and AI inference. Each must be declared ``notAllowed`` or
+        ``constrained``: CAWG TDM 1.1 says that "in the absence of additional
+        information, ``constrained`` shall be treated as equivalent to
+        ``notAllowed``" (see :meth:`TrainingMiningPolicy.effective_use_of`;
+        :attr:`TrainingMiningPolicy.all_declared_not_allowed` is the literal
+        reading). ``False`` when there is no training-mining assertion or a
+        standard use is allowed or undeclared, so gate each use on
+        ``training_mining.effective_use_of(key)`` when the policy is partial.
+        Like every claim in the report, it binds the asset only if
         :attr:`state` is valid.
         """
         return self.training_mining is not None and self.training_mining.all_not_allowed

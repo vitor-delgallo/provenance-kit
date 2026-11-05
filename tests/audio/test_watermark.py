@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sysconfig
 import types
 
@@ -25,7 +26,9 @@ from provenance_kit.audio.watermark import (
     embed_verified,
     embed_watermark,
 )
-from provenance_kit.errors import BackendUnavailableError, ModelLoadError
+from provenance_kit.errors import BackendUnavailableError, MediaLimitExceededError, ModelLoadError
+from provenance_kit.limits import MediaLimits
+from tests.audio.fakes import WAV, FakeTools, probe_json
 
 
 class FakeBackend:
@@ -98,6 +101,25 @@ def test_codec_check_bits_flag_invalid_payloads():
     assert not bad.payload.valid
 
 
+def test_verified_needs_check_bits_that_match():
+    """``found`` is the detector's opinion; ``verified`` adds the payload's check bits."""
+    backend = FakeBackend()
+    codec = PayloadCodec(16, version_bits=0, check_bits=4)
+    marked = embed_watermark(silence(), 16000, codec.encode(1234), backend=backend)
+    assert detect_watermark(marked, 16000, backend=backend, codec=codec).verified
+    tampered = np.array(marked)
+    tampered[:, 0] *= -1
+    bad = detect_watermark(tampered, 16000, backend=backend, codec=codec)
+    assert bad.found
+    assert not bad.verified
+    # Without check bits nothing corroborates the detector: never verified.
+    assert not detect_watermark(marked, 16000, backend=backend).verified
+    no_check = PayloadCodec(16, version_bits=0)
+    assert not detect_watermark(marked, 16000, backend=backend, codec=no_check).verified
+    unfound = detect_watermark(marked, 16000, backend=FakeBackend(probability=0.1), codec=codec)
+    assert not unfound.verified
+
+
 def test_argument_validation():
     backend = FakeBackend()
     with pytest.raises(ValueError):
@@ -167,8 +189,9 @@ def test_alignment_search_cost_is_bounded():
     backend.windows.clear()
     detection = detect_watermark(delayed(marked, 24), 16000, backend=backend, alignment=search)
     assert detection.offset_samples == 24
-    # One call per candidate on a 0.1 s excerpt, then one on the whole signal.
-    assert backend.windows == [1600] * 11 + [4000]
+    # One call per candidate on a 0.1 s excerpt, then the whole signal
+    # unshifted and shifted (the shift must be corroborated against it).
+    assert backend.windows == [1600] * 11 + [4024, 4000]
     # An offset off the step grid is not found (the step bounds the precision).
     off_grid = detect_watermark(delayed(marked, 25), 16000, backend=backend, alignment=search)
     assert off_grid.bit_confidence == 0.0
@@ -189,7 +212,64 @@ def test_alignment_search_keeps_the_signal_when_no_offset_stands_out():
     eager = AlignmentSearch(
         max_offset_samples=10, step_samples=1, window_seconds=1.0, min_bit_confidence=0.15
     )
-    assert detect_watermark(samples, 1000, backend=Lukewarm(), alignment=eager).offset_samples == 6
+    # The unshifted signal is found (0.3 >= 0.25), so the shift may refine it.
+    assert (
+        detect_watermark(
+            samples, 1000, backend=Lukewarm(), alignment=eager, threshold=0.25
+        ).offset_samples
+        == 6
+    )
+
+
+class FooledAtOffset(FakeBackend):
+    """Unmarked audio that the detector takes for marked once 6 samples are dropped.
+
+    Mimics an unmarked click train (measured with AudioSeal: detection 0.14
+    unshifted, 0.95 after dropping 380 samples, excerpt bit confidence 0.205,
+    payload check bits wrong). The samples are a ramp, so the first value
+    tells which offset the backend is looking at.
+    """
+
+    def __init__(self, bits: str) -> None:
+        super().__init__()
+        self.bits = bits
+
+    def score(self, samples, sample_rate):
+        if int(samples[0, 0]) == 6:
+            probabilities = tuple(0.9 if b == "1" else 0.1 for b in self.bits)
+            return AudioScores(detection_probability=0.95, bit_probabilities=probabilities)
+        return AudioScores(detection_probability=0.1, bit_probabilities=(0.5,) * 16)
+
+
+def ramp(frames: int = 1000) -> np.ndarray:
+    return np.arange(frames, dtype=np.float32)[None, :]
+
+
+def test_alignment_search_does_not_turn_unmarked_audio_into_a_detection():
+    search = AlignmentSearch(max_offset_samples=10, step_samples=1, window_seconds=0.1)
+    codec = PayloadCodec(16, version_bits=0, check_bits=4)
+    valid = codec.encode(99)
+    invalid = valid[:-1] + ("1" if valid[-1] == "0" else "0")
+    # Without check bits nothing corroborates the shift: the signal, not
+    # found unshifted, stays unshifted and not found.
+    alone = detect_watermark(ramp(), 1000, backend=FooledAtOffset(valid), alignment=search)
+    assert alone.offset_samples == 0
+    assert not alone.found
+    # With a codec, the shifted payload must pass the check bits.
+    wrong = detect_watermark(
+        ramp(), 1000, backend=FooledAtOffset(invalid), codec=codec, alignment=search
+    )
+    assert wrong.offset_samples == 0
+    assert not wrong.found
+    assert not wrong.verified
+    right = detect_watermark(
+        ramp(), 1000, backend=FooledAtOffset(valid), codec=codec, alignment=search
+    )
+    assert right.offset_samples == 6
+    assert right.found
+    assert right.verified
+    assert right.payload is not None
+    assert right.payload.identifier == 99
 
 
 def test_alignment_search_stops_at_the_end_of_the_signal():
@@ -263,6 +343,27 @@ def test_embed_verified_reports_bit_errors(monkeypatch):
     result = embed_verified(silence(), 22050, "1" * 16, encoder=encoder, backend=FakeBackend())
     assert not result.verified
     assert result.bit_errors == 16
+
+
+def test_embed_verified_bounds_the_decoded_read_back():
+    # The encoder's output is untrusted media too: its declared decoded size
+    # is checked against max_decoded_audio_bytes before it is decoded.
+    report = json.loads(probe_json(channels=8, sample_rate="192000", duration="20"))
+    report["format"]["duration"] = "20"
+    tools = FakeTools(ffprobe=json.dumps(report).encode())
+    limits = MediaLimits(max_decoded_audio_bytes=1_000_000)
+    with pytest.raises(MediaLimitExceededError) as info:
+        embed_verified(
+            silence(),
+            16000,
+            "0" * 16,
+            encoder=lambda s, r: WAV,
+            backend=FakeBackend(),
+            tools=tools,  # type: ignore[arg-type]
+            limits=limits,
+        )
+    assert info.value.limit == "max_decoded_audio_bytes"
+    assert tools.args_of("ffmpeg") == []
 
 
 def test_embed_verified_requires_bytes():

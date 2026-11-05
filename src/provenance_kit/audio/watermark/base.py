@@ -86,8 +86,13 @@ class AudioWatermarkDetection(WatermarkDetection):
 
     ``confidence`` is the detector's ``detection_probability``; ``found`` is
     ``confidence >= threshold``. ``bits`` (16 for AudioSeal) and ``payload``
-    are set only when ``found``. AudioSeal has no room for error correction
-    (decision 8): check ``payload.valid`` when the codec has check bits.
+    are set only when ``found``.
+
+    ``found`` alone is **not evidence** of a watermark: unmarked periodic
+    signals fool the AudioSeal detector (impulse trains at 50 Hz score up to
+    1.0; see ``docs/audio.md``). AudioSeal has no room for error correction
+    (decision 8), so the evidence is the codec's check bits: rely on
+    :attr:`verified`.
 
     Attributes:
         decoded_bits: The thresholded bits, also when ``found`` is false
@@ -95,10 +100,27 @@ class AudioWatermarkDetection(WatermarkDetection):
         bit_confidence: Mean of ``|2p - 1|`` over the bit probabilities: 1.0
             when every bit is certain, 0.0 when all are coin flips.
         offset_samples: With an alignment search, the number of leading
-            samples dropped before detection (the offset the search chose);
+            samples dropped before detection: the offset the search chose,
+            or 0 when no offset stood out or the best one was not
+            corroborated (see :class:`~provenance_kit.audio.watermark.AlignmentSearch`);
             ``None`` without a search.
     """
 
     decoded_bits: str | None = None
     bit_confidence: float = 0.0
     offset_samples: int | None = None
+
+    @property
+    def verified(self) -> bool:
+        """Whether the detection is corroborated by the payload's check bits.
+
+        True only when ``found`` is true **and** the bits were decoded with a
+        :class:`~provenance_kit.payload.PayloadCodec` that has check bits,
+        and they match (``payload.check_ok``) and the version is known. With
+        ``check_bits=c``, random bits pass with probability ``2**-c`` (1/16
+        for the recommended ``c=4``). Without a codec, or with a codec that
+        has no check bits, this is always false: nothing but the detector's
+        own score would back the result.
+        """
+        payload = self.payload
+        return self.found and payload is not None and payload.check_ok is True and payload.valid

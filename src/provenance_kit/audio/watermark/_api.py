@@ -9,6 +9,7 @@ from provenance_kit._checks import check_int, check_number
 from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.audio.pcm import decode_pcm
 from provenance_kit.audio.watermark.base import (
+    AudioScores,
     AudioWatermarkBackend,
     AudioWatermarkDetection,
     Samples,
@@ -30,10 +31,14 @@ __all__ = [
 ]
 
 #: Default decision threshold on the detection probability (AudioSeal's own
-#: default). Measured on unmarked synthetic signals: 0.0 to 0.27; on marked ones
-#: after AAC in M4A, MP3 files and Ogg Opus: 0.995 to 1.0; after encodings that
-#: shift the audio without recording the delay (raw ADTS AAC, MP3 written to a
-#: pipe): 0.36 to 1.0 (see docs/audio.md).
+#: default). Measured on unmarked signals: 0.0 to 0.25 for broadband content,
+#: tonal content and noise; up to 0.43 for a steady 1 kHz sine; **up to
+#: 0.97 for impulse trains** (12 of 24 click trains at 50 and 100 Hz were
+#: "found", none passed 4 check bits). On marked signals after AAC in M4A,
+#: MP3 files and Ogg Opus: 0.995 to 1.0; after encodings that shift the
+#: audio without recording the delay (raw ADTS AAC, MP3 written to a pipe):
+#: 0.36 to 1.0 (see docs/audio.md). The probability alone is therefore not
+#: evidence: rely on :attr:`AudioWatermarkDetection.verified`.
 DEFAULT_DETECTION_THRESHOLD = 0.5
 
 #: The encoder callable of :func:`embed_verified`: watermarked PCM and its
@@ -57,7 +62,7 @@ class AlignmentSearch:
     LAME). The search tries dropping ``0, step_samples, 2 * step_samples,
     ...`` up to ``max_offset_samples`` leading samples (samples at the
     signal's own rate), scores the first ``window_seconds`` after each
-    offset, and keeps the offset whose bits are the most confident (highest
+    offset, and picks the offset whose bits are the most confident (highest
     mean ``|2p - 1|``; ties: higher detection probability, then smaller
     offset). If even that offset stays below ``min_bit_confidence``, nothing
     stands out and the signal is detected unshifted (offset 0). The detection
@@ -65,17 +70,33 @@ class AlignmentSearch:
     range of misalignments, while the bit confidence peaks near the true
     delay.
 
+    A non-zero offset is then used only if it is **corroborated**; otherwise
+    the result is the unshifted detection (offset 0):
+
+    * with a codec that has check bits, the payload read after the shift
+      must pass them (random bits do with probability ``2**-check_bits``);
+    * without check bits, nothing independent backs the shift, so it may
+      only refine the bits of a signal that is already found unshifted: the
+      search never turns "not found" into "found".
+
+    The bit confidence alone is no evidence: an unmarked 100 Hz click train
+    at 44.1 kHz reaches 0.205 at offset 380, its bits are identical in every
+    window (the content repeats), and dropping those samples raised its
+    detection probability from 0.14 to 0.95; its check bits fail.
+
     Measured (``docs/audio.md``): on broadband content after raw ADTS AAC and
     MP3 to a pipe, the search lands within 10 samples of the encoder delay
-    and all 16 bits come back (without it: 8 to 12 of 16). Best excerpt
-    confidence 0.36 to 0.44 there, and 0.04 to 0.05 on unmarked audio, hence
-    the default floor of 0.2: without it, the near-random best offset of an
-    unmarked tonal signal raised its detection probability from 0.25 to
-    0.62. On sparse tonal content the bit confidence is not a reliable guide
-    (the 16 bits do not survive there even when aligned).
+    and all 16 bits come back and pass the check bits (without it: 8 to 12
+    of 16). Best excerpt confidence 0.36 to 0.41 there; 0.04 to 0.05 on
+    unmarked broadband and tonal audio, and 0.12 to 0.21 on unmarked click
+    trains. On sparse tonal content the bit confidence is not a reliable
+    guide (the 16 bits do not survive there even when aligned). Pass a codec
+    with check bits: a signal that is shifted and weakly detected (raw ADTS
+    AAC measured 0.42 unshifted) is recovered only with them.
 
     Cost: ``max_offset_samples // step_samples + 1`` backend calls on a
-    ``window_seconds`` excerpt, plus the final detection. With the defaults
+    ``window_seconds`` excerpt, plus the detection of the whole signal
+    unshifted and, when an offset stands out, shifted. With the defaults
     that is 1,025 calls on 0.5 s of audio: about 20 to 40 s per search with
     AudioSeal on the reference CPU (44.1 kHz input; about 20 to 40 ms per
     call, most of it the detector, the rest resampling to 16 kHz). The cost
@@ -90,7 +111,9 @@ class AlignmentSearch:
         window_seconds: The length of the excerpt scored at each offset
             (default 0.5 s).
         min_bit_confidence: The excerpt bit confidence an offset needs to be
-            used (default 0.2); below it the signal is detected unshifted.
+            considered (default 0.2); below it the signal is detected
+            unshifted. Reaching it is necessary, not sufficient (see the
+            corroboration rule above).
 
     Raises:
         TypeError: If a field has the wrong type.
@@ -210,22 +233,26 @@ def detect_watermark(
 ) -> AudioWatermarkDetection:
     """Looks for a watermark in decoded audio.
 
-    The decision is the detector's: ``found`` when its detection probability
-    reaches ``threshold``. The 16 bits are thresholded at 0.5; with only 16
-    bits there is no room for error correction (ARCHITECTURE.md, decision 8),
-    so give the codec check bits and read ``payload.valid``.
+    ``found`` is the detector's decision: its detection probability reaches
+    ``threshold``. It is **not evidence on its own**: unmarked periodic
+    signals (impulse trains at 50 or 100 Hz) score up to 0.97. The 16 bits
+    are thresholded at 0.5; with only 16 bits there is no room for error
+    correction (ARCHITECTURE.md, decision 8), so give a codec with check bits
+    and rely on :attr:`AudioWatermarkDetection.verified` (found and the check
+    bits match) before trusting the identifier.
 
     With ``alignment``, an :class:`AlignmentSearch` first chooses how many
     leading samples to drop (for audio shifted by an unsignaled encoder
-    delay); the result's ``offset_samples`` says which. It multiplies the
-    cost (see :class:`AlignmentSearch`).
+    delay); the result's ``offset_samples`` says which (0 when no offset was
+    corroborated). It multiplies the cost (see :class:`AlignmentSearch`).
 
     Args:
         samples: ``float32`` PCM shaped ``(channels, samples)``.
         sample_rate: The sample rate in hertz.
         backend: The model. Defaults to ``AudioSealBackend()``.
         codec: Decodes the bits into ``payload`` when given; its
-            ``total_bits`` must equal ``backend.payload_bits``.
+            ``total_bits`` must equal ``backend.payload_bits``. Its check
+            bits also corroborate an alignment search's shift.
         threshold: Decision threshold on the detection probability, in
             ``[0, 1]``.
         alignment: An optional search over sample offsets (opt-in; off by
@@ -246,16 +273,29 @@ def detect_watermark(
         raise TypeError("alignment must be an AlignmentSearch or None")
     backend = _default_backend() if backend is None else backend
     _check_codec(codec, backend.payload_bits)
-    offset: int | None = None
-    if alignment is not None:
-        offset = _best_offset(samples, sample_rate, backend, alignment)
-        samples = samples[:, offset:]
-    scores = backend.score(samples, sample_rate)
+    if alignment is None:
+        return _detection(backend.score(samples, sample_rate), backend, codec, threshold, None)
+    candidate = _best_offset(samples, sample_rate, backend, alignment)
+    unshifted = _detection(backend.score(samples, sample_rate), backend, codec, threshold, 0)
+    if candidate == 0:
+        return unshifted
+    shifted = _detection(
+        backend.score(samples[:, candidate:], sample_rate), backend, codec, threshold, candidate
+    )
+    return shifted if _corroborated(shifted, unshifted, codec) else unshifted
+
+
+def _detection(
+    scores: AudioScores,
+    backend: AudioWatermarkBackend,
+    codec: PayloadCodec | None,
+    threshold: float,
+    offset: int | None,
+) -> AudioWatermarkDetection:
     if len(scores.bit_probabilities) != backend.payload_bits:
         raise ValueError("the backend returned the wrong number of bit probabilities")
     bits = "".join("1" if p > 0.5 else "0" for p in scores.bit_probabilities)
     found = scores.detection_probability >= threshold
-    bit_confidence = sum(abs(2.0 * p - 1.0) for p in scores.bit_probabilities) / len(bits)
     payload = codec.decode(bits) if codec is not None and found else None
     return AudioWatermarkDetection(
         found=found,
@@ -263,9 +303,31 @@ def detect_watermark(
         bits=bits if found else None,
         payload=payload,
         decoded_bits=bits,
-        bit_confidence=bit_confidence,
+        bit_confidence=_bit_confidence(scores.bit_probabilities),
         offset_samples=offset,
     )
+
+
+def _corroborated(
+    shifted: AudioWatermarkDetection,
+    unshifted: AudioWatermarkDetection,
+    codec: PayloadCodec | None,
+) -> bool:
+    """Whether a non-zero shift chosen by the search may be used.
+
+    The bit confidence that picked the shift is no evidence on its own:
+    unmarked periodic content (a 100 Hz click train) reaches the floor, its
+    bits are identical in every window, and dropping samples raised its
+    detection probability from 0.14 to 0.95 (measured, ``docs/audio.md``).
+    With check bits, the shifted payload must pass them (random bits do with
+    probability ``2**-check_bits``). Without them, nothing independent backs
+    the shift, so it may only refine the bits of a signal that is already
+    found unshifted; it never turns "not found" into "found".
+    """
+    if codec is not None and codec.check_bits > 0:
+        decoded = codec.decode(shifted.decoded_bits or "0" * codec.total_bits)
+        return decoded.check_ok is True and decoded.valid
+    return unshifted.found
 
 
 def _bit_confidence(probabilities: tuple[float, ...]) -> float:
@@ -317,9 +379,11 @@ def embed_verified(
     """Watermarks audio, encodes it with the caller's encoder and reads the mark back.
 
     The encoder's output is decoded with
-    :func:`~provenance_kit.audio.pcm.decode_pcm` (at its own rate and layout)
-    and the watermark is detected, so the verification covers the real
-    encoding the application will publish (ARCHITECTURE.md, decision 2).
+    :func:`~provenance_kit.audio.pcm.decode_pcm` (at its own rate and layout,
+    under ``limits``, including ``max_decoded_audio_bytes``, checked from the
+    probe before decoding) and the watermark is detected, so the
+    verification covers the real encoding the application will publish
+    (ARCHITECTURE.md, decision 2).
 
     Args:
         samples: ``float32`` PCM shaped ``(channels, samples)``.

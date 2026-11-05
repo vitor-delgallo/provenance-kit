@@ -140,14 +140,32 @@ Other properties of the bridge:
   reserved; the adapter checks lengths, so that cannot happen.
 
 **Certificates.** `certificate_chain_pem` is the signing certificate followed
-by intermediates, without the root. c2pa-rs checks the C2PA certificate
-profile (section 14.5.1; c2pa-rs `crypto/cose/certificate_profile.rs`): X.509
-v3; ECDSA P-256/P-384/P-521, RSA of at least 2048 bits or Ed25519; key usage
-with `digitalSignature`; an extended key usage it accepts (for example
+by intermediates, without the root. c2pa-rs checks most of the C2PA
+certificate profile (section 14.5.1; c2pa-rs `crypto/cose/certificate_profile.rs`):
+X.509 v3; ECDSA P-256/P-384/P-521, RSA of at least 2048 bits or Ed25519; a key
+usage extension; an extended key usage it accepts (for example
 `id-kp-emailProtection` 1.3.6.1.5.5.7.3.4 or `id-kp-documentSigning`
 1.3.6.1.5.5.7.3.36) and not `anyExtendedKeyUsage`; not a CA; an authority key
-identifier. A leaf without an accepted EKU is refused at signing time. The
-tests generate such a PKI at test time (`tests/provenance/_certs.py`).
+identifier. A leaf without an accepted EKU, or without a key usage extension,
+is refused at signing time.
+
+The specification also says that claim-signing certificates "shall assert the
+digitalSignature bit". c2pa-rs 0.91 does not enforce that bit. Measured on
+2026-11-05 with a KMS-style signer before provenance-kit added its own check:
+a leaf whose key usage asserts only `nonRepudiation` signs, and the library
+reads the manifest back as `TRUSTED` when its root is a trust anchor (a
+`keyAgreement`-only leaf and a leaf without the extension are refused).
+provenance-kit closes the gap on its side: `LocalKeySigner` refuses such a
+leaf when it is constructed, and `sign_asset` checks the leaf of every signer
+(KMS signers included) once the library is loaded, before any signature is
+requested; both raise `ValueError` naming `digitalSignature`. **On reading,
+the gap remains**: the library's reports do not expose the signing
+certificate (only its issuer, common name and serial number), so
+`read_manifest` cannot re-check its key usage, and a manifest signed elsewhere
+with such a leaf is reported `TRUSTED` if it chains to your anchors. Trust
+lists such as the C2PA trust list only admit CAs that issue conforming
+certificates, which bounds the exposure. The tests generate the PKI at test
+time (`tests/provenance/_certs.py`).
 
 **Time-stamp authority.** `tsa_url` (default `None`) names an RFC 3161
 time-stamp authority that counter-signs the claim signature. Without it the
@@ -242,8 +260,20 @@ say which list an assertion came from.
 report = read_manifest(upload_bytes, trust_anchors_pem=c2pa_trust_list_pem)
 report.state  # ValidationState
 report.errors  # failure codes of the active manifest
-report.training_mining_not_allowed  # all four standard uses are notAllowed
+report.training_mining_not_allowed  # no standard use permitted (constrained counts as notAllowed)
 ```
+
+**Training and data mining policy.** CAWG TDM 1.1: "In the absence of
+additional information, `constrained` shall be treated as equivalent to
+`notAllowed`." `training_mining_not_allowed` and
+`TrainingMiningPolicy.all_not_allowed` follow that rule: they are true when
+AI training, generative AI training, data mining and AI inference are each
+`notAllowed` or `constrained`, and false when a standard use is `allowed`,
+undeclared, or there is no policy. For one use, `effective_use_of(key)` returns
+`ALLOWED`, `NOT_ALLOWED` (also for `constrained`) or `None` (undeclared).
+The literal views remain: `use_of(key)` returns the declared value and
+`all_declared_not_allowed` counts only `notAllowed`; the free-text
+`constraint_info` is in `training_mining.entries`.
 
 | `ValidationState` | Meaning |
 |---|---|
@@ -306,13 +336,17 @@ covered by the default allow-list (the `network` test prints them).
 from provenance_kit.provenance.timestamps import OpenTimestamper, TimestampProof, sha256_file
 
 ots = OpenTimestamper()  # the official client's calendars; 2 must answer
-proof = ots.stamp(sha256_file("master.mov"))  # pending; proof.failed_calendars lists failures
+digest = sha256_file("master.mov")  # store it with the proof: verify needs it
+proof = ots.stamp(digest)  # pending; proof.failed_calendars lists failures
 data = proof.to_bytes()  # standard .ots, readable by `ots info`
 
 proof = ots.upgrade(TimestampProof.from_bytes(data))  # hours later
 info = ots.info(proof)  # pending calendars, Bitcoin heights
 result = ots.verify(proof, digest, block_source)  # offline, against your block headers
 ```
+
+`block_source` is your `BitcoinBlockSource` (see "Verifying against
+Bitcoin" below).
 
 Like the official client, `stamp` appends a random 16-byte nonce to the
 digest and hashes again: calendars only ever see that commitment.
@@ -343,7 +377,8 @@ python-opentimestamps' `RemoteCalendar`, so that every limit is enforced:
   never contacted). At most 32 requests per call.
 
 Proofs are untrusted input as well. `TimestampProof.from_bytes` caps the size
-(`max_proof_bytes`, 64 KiB: complete proofs from the public calendars are 1 to
+before parsing (`max_proof_bytes=`, the same keyword and default as
+`OpenTimestamper`'s; 64 KiB: complete proofs from the public calendars are 1 to
 10 KiB, and an operation result can be up to 4 KiB, so fan-out in a hostile
 proof multiplies memory by a few hundred at most), relies on the parser's
 recursion limit (256) and raises `InvalidProofError` (a `MediaDecodeError`)

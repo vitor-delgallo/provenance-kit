@@ -38,6 +38,7 @@ from provenance_kit.provenance.c2pa._signer import (
     SigningAlgorithm,
     SigningError,
     check_signer,
+    check_signing_certificate,
     normalize_signature,
 )
 
@@ -240,12 +241,16 @@ def sign_with_c2pa(
 
     Raises:
         BackendUnavailableError: If c2pa-python is not installed.
+        ValueError: If the signer's leaf certificate lacks the
+            ``digitalSignature`` key usage (checked here, because c2pa-rs
+            0.91 accepts a ``nonRepudiation``-only leaf).
         MediaDecodeError: If the asset or an ingredient cannot be parsed.
         UnsupportedMediaError: If the library refuses the media type.
         SigningError: For every other failure (see :class:`SigningError`).
     """
     settings = sign_settings(tsa_url=tsa_url)
     c2pa = load_c2pa()
+    check_signing_certificate(bridge.certificate_chain_pem)
     algorithm = getattr(c2pa.C2paSigningAlg, bridge.algorithm.name)
     resources: list[Any] = []
     try:

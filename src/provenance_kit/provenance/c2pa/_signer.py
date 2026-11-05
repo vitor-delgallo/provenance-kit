@@ -11,6 +11,7 @@ from provenance_kit._typing import BytesLike
 from provenance_kit.errors import ProvenanceKitError
 
 if TYPE_CHECKING:
+    from cryptography import x509
     from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
 
 __all__ = [
@@ -130,9 +131,10 @@ class C2paSigner(Protocol):
         algorithm: The signature algorithm; it must match the key.
         certificate_chain_pem: The signing certificate followed by any
             intermediate certificates, PEM-encoded, without the root. The
-            leaf must be a C2PA claim-signing certificate (digitalSignature
-            key usage, an allowed extended key usage such as
-            ``id-kp-emailProtection`` or ``id-kp-documentSigning``, not a
+            leaf must be a C2PA claim-signing certificate (a key usage
+            extension with ``digitalSignature``, which ``sign_asset`` checks
+            itself; an allowed extended key usage such as
+            ``id-kp-emailProtection`` or ``id-kp-documentSigning``; not a
             CA). It is embedded in every manifest and is therefore public.
         signature_format: The encoding :meth:`sign` returns.
     """
@@ -268,6 +270,55 @@ def check_signer(signer: C2paSigner) -> tuple[SigningAlgorithm, str, SignatureFo
     return algorithm, chain, signature_format
 
 
+def check_signing_certificate(certificate_chain_pem: str) -> None:
+    """Checks that a signer's leaf certificate may sign C2PA claims (internal).
+
+    C2PA 2.3, section 14.5.1: certificates used to sign C2PA manifests "shall
+    assert the digitalSignature bit" of the key usage extension. c2pa-rs 0.91
+    refuses a leaf without the extension but accepts one that asserts only
+    ``nonRepudiation``, and then reads the manifests it signed back as
+    trusted. This check closes that gap before the library is called.
+
+    Args:
+        certificate_chain_pem: The chain, leaf first, PEM-encoded.
+
+    Raises:
+        BackendUnavailableError: If ``cryptography`` is not installed (extra
+            ``c2pa``).
+        ValueError: If the chain holds no loadable certificate, or the leaf
+            has no key usage extension or one without ``digitalSignature``.
+    """
+    _require_cryptography()
+    from cryptography import x509  # noqa: PLC0415 - optional dependency
+
+    try:
+        certificates = x509.load_pem_x509_certificates(certificate_chain_pem.encode("ascii"))
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("the certificate chain could not be loaded") from exc
+    if not certificates:
+        raise ValueError("the certificate chain is empty")
+    _check_leaf_key_usage(certificates[0])
+
+
+def _check_leaf_key_usage(leaf: x509.Certificate) -> None:
+    from cryptography import x509  # noqa: PLC0415 - optional dependency
+
+    try:
+        usage = leaf.extensions.get_extension_for_class(x509.KeyUsage).value
+    except x509.ExtensionNotFound:
+        raise ValueError(
+            "the signing certificate has no key usage extension; C2PA requires "
+            "digitalSignature (C2PA 2.3, section 14.5.1)"
+        ) from None
+    except ValueError as exc:  # a malformed extension
+        raise ValueError("the signing certificate's extensions could not be parsed") from exc
+    if not usage.digital_signature:
+        raise ValueError(
+            "the signing certificate's key usage lacks digitalSignature, which C2PA "
+            "requires of claim-signing certificates (C2PA 2.3, section 14.5.1)"
+        )
+
+
 def normalize_signature(
     signature: object,
     algorithm: SigningAlgorithm,
@@ -326,7 +377,8 @@ class LocalKeySigner:
     P-384 or P-521 keys, ED25519 for Ed25519 keys and PS256 for RSA keys (pass
     PS384 or PS512 to choose another hash). Signatures are returned as
     :attr:`SignatureFormat.RAW`. The constructor checks that the first
-    certificate of the chain holds the key's public key.
+    certificate of the chain holds the key's public key and asserts the
+    ``digitalSignature`` key usage.
 
     Thread safety: safe to share between threads.
 
@@ -342,7 +394,8 @@ class LocalKeySigner:
         TypeError: If an argument has the wrong type.
         ValueError: If the key or the chain cannot be loaded, the key type or
             size does not fit the algorithm, or the leaf certificate does not
-            match the key. Messages never contain key material.
+            match the key or lacks the ``digitalSignature`` key usage.
+            Messages never contain key material.
     """
 
     __slots__ = ("_algorithm", "_chain", "_sign")
@@ -389,6 +442,7 @@ class LocalKeySigner:
         leaf_public = certificates[0].public_key().public_bytes(der, spki)
         if leaf_public != key.public_key().public_bytes(der, spki):
             raise ValueError("the first certificate of the chain does not match the private key")
+        _check_leaf_key_usage(certificates[0])
 
         self._algorithm, self._sign = _key_signer(key, algorithm)
         self._chain = certificate_chain_pem
@@ -481,7 +535,8 @@ def _key_signer(
         rsa_key = key
 
         def sign_pss(data: bytes) -> bytes:
-            return rsa_key.sign(data, pss, hash_class())
+            # bytes() keeps the declared type when cryptography's stubs are absent.
+            return bytes(rsa_key.sign(data, pss, hash_class()))
 
         return chosen, sign_pss
 

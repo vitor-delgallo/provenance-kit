@@ -15,7 +15,11 @@ import time
 
 import pytest
 
-from provenance_kit.errors import BackendUnavailableError, UnsupportedMediaError
+from provenance_kit.errors import (
+    BackendUnavailableError,
+    MediaLimitExceededError,
+    UnsupportedMediaError,
+)
 from provenance_kit.provenance.timestamps import (
     DEFAULT_CALENDARS,
     DEFAULT_MIN_CALENDARS,
@@ -181,6 +185,16 @@ def test_proof_header_checks():
         TimestampProof(proof_bytes(hash_tag=0x02))  # SHA-1
     with pytest.raises(TypeError):
         TimestampProof("text")  # type: ignore[arg-type]
+
+
+def test_from_bytes_names_its_cap_like_the_timestamper():
+    # The size is checked before python-opentimestamps is needed.
+    with pytest.raises(MediaLimitExceededError) as info:
+        TimestampProof.from_bytes(proof_bytes(), max_proof_bytes=10)
+    assert info.value.limit == "max_proof_bytes"
+    assert info.value.maximum == 10
+    with pytest.raises(TypeError):
+        TimestampProof.from_bytes(proof_bytes(), max_bytes=10)  # type: ignore[call-arg]
 
 
 def test_block_header_and_results():

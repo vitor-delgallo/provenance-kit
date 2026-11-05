@@ -18,7 +18,12 @@ def test_defaults_are_valid_and_documented_values():
     assert limits.max_image_frames == 5_000
     assert limits.max_audio_channels == 8
     assert limits.max_sample_rate == 192_000
+    assert limits.max_decoded_audio_bytes == 1024**3
     assert limits.subprocess_timeout_seconds == 600.0
+    # The separate audio limits multiply to far more than the decoded bound:
+    # 3 h x 192 kHz x 8 channels of float32 is about 66 GB.
+    worst = limits.max_duration_seconds * limits.max_sample_rate * limits.max_audio_channels * 4
+    assert worst > 60 * limits.max_decoded_audio_bytes
     # Pillow refuses images above twice its 89,478,485-pixel warning threshold;
     # the default must stay under the warning itself.
     assert limits.max_pixels < 89_478_485
@@ -40,7 +45,10 @@ def test_non_positive_values_are_refused(field, value):
         MediaLimits(**{field: value})
 
 
-@pytest.mark.parametrize("field", ["max_bytes", "max_pixels", "max_frames", "max_sample_rate"])
+@pytest.mark.parametrize(
+    "field",
+    ["max_bytes", "max_pixels", "max_frames", "max_sample_rate", "max_decoded_audio_bytes"],
+)
 @pytest.mark.parametrize("value", [1.5, "10", True, None])
 def test_integer_fields_refuse_other_types(field, value):
     with pytest.raises(TypeError, match=field):
@@ -99,3 +107,19 @@ def test_check_frames_and_audio():
         limits.check_audio(3, 8000)
     with pytest.raises(MediaLimitExceededError, match="max_sample_rate"):
         limits.check_audio(1, 96_000)
+
+
+def test_check_decoded_audio_bytes():
+    limits = MediaLimits(max_decoded_audio_bytes=1000)
+    limits.check_decoded_audio_bytes(1000)
+    with pytest.raises(MediaLimitExceededError) as info:
+        limits.check_decoded_audio_bytes(1001)
+    assert info.value.limit == "max_decoded_audio_bytes"
+    assert (info.value.maximum, info.value.actual) == (1000, 1001)
+
+
+def test_decoded_audio_size():
+    assert MediaLimits.decoded_audio_bytes(2.0, sample_rate=48_000, channels=2) == 768_000
+    assert MediaLimits.decoded_audio_bytes(0.5, sample_rate=3, channels=1, bytes_per_sample=2) == 4
+    with pytest.raises(ValueError):
+        MediaLimits.decoded_audio_bytes(-1.0, sample_rate=48_000, channels=2)

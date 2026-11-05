@@ -14,18 +14,26 @@ a database column (4 bytes per sub-fingerprint plus a 20-byte header, about
 116 KiB per hour); :meth:`AudioFingerprint.from_bytes` validates it strictly.
 
 :func:`compare_fingerprints` aligns two fingerprints by **bit error rate**:
-for every offset it compares the overlapping sub-fingerprints bit by bit and
-keeps the offset with the lowest rate (computed for all offsets at once with
-FFT cross-correlations of the 32 bit planes, so long references are cheap).
-A clip cut from a longer recording is found at its offset; the overlap must
-be at least ``min_overlap_seconds`` (or the whole shorter fingerprint).
+for every offset it compares the overlapping sub-fingerprints bit by bit
+(all offsets at once with FFT cross-correlations of the 32 bit planes, so
+long references are cheap). A clip cut from a longer recording is found at
+its offset. Low-information overlaps cannot match: digital silence
+(:data:`SILENCE_VALUE`) is left out of the comparison, an overlap needs at
+least :data:`MIN_COMPARED_ITEMS` compared sub-fingerprints (audio shorter
+than about 4.6 s never matches), its agreement must be well above the
+chance level of its own bit statistics (:data:`MAX_CHANCE_ERROR_FRACTION`;
+stationary noise and steady tones agree by chance at bit error rates as
+low as 0.15) and it must hold :data:`MIN_DISTINCT_VALUES` distinct values.
 
 Thresholds (measured in ``tests/audio/test_fingerprint_integration.py``,
 numbers in ``docs/audio.md``): the same audio after lossy re-encoding,
 resampling, downmixing or trimming aligns at a bit error rate below 0.1;
-unrelated audio stays above 0.3 even at its best offset (about 0.5 on
-average). The default decision threshold is
-:data:`DEFAULT_MAX_BIT_ERROR_RATE` (0.20).
+unrelated music stays above 0.24 even at its best offset. The default
+decision threshold is :data:`DEFAULT_MAX_BIT_ERROR_RATE` (0.20). Signals
+that sound alike over a few seconds (the test suite's synthetic glissando
+songs) can share 5 to 20 s windows at 0.10 to 0.20; for short queries
+against such content, lower the threshold (0.12 kept every genuine variant
+measured).
 
 Not handled: tempo or pitch changes, and heavy mixing with other audio;
 Chromaprint is not designed to survive them.
@@ -55,9 +63,9 @@ from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.audio.pcm import (
     AUDIO_CONTAINERS,
     PcmAudio,
+    duration_cap_bytes,
     pcm_args,
     probe_staged,
-    sample_cap_bytes,
 )
 from provenance_kit.errors import (
     ExternalToolError,
@@ -74,7 +82,11 @@ __all__ = [
     "DEFAULT_MIN_OVERLAP_SECONDS",
     "FORMAT_VERSION",
     "ITEM_SECONDS",
+    "MAX_CHANCE_ERROR_FRACTION",
     "MAX_FINGERPRINT_ITEMS",
+    "MIN_COMPARED_ITEMS",
+    "MIN_DISTINCT_VALUES",
+    "SILENCE_VALUE",
     "AudioFingerprint",
     "AudioMatch",
     "compare_fingerprints",
@@ -97,16 +109,50 @@ CHROMAPRINT_SAMPLE_RATE = 11_025
 #: 11,025 Hz (4096-sample frames with two-thirds overlap).
 ITEM_SECONDS = 1365 / CHROMAPRINT_SAMPLE_RATE
 
-#: Default decision threshold on the bit error rate at the best offset.
+#: Default decision threshold on the bit error rate of a compared overlap.
 #: Measured: the same audio after MP3/AAC/Opus re-encoding, resampling,
-#: downmixing, volume change, low-pass filtering or trimming aligns at 0.002
-#: to 0.08; unrelated signals of a similar synthetic structure at 0.32 to
-#: 0.37, unrelated noise at about 0.44.
+#: downmixing, volume change, low-pass filtering or trimming aligns at 0.001
+#: to 0.094 (full tracks and clips of 5 s and longer); unrelated music at
+#: 0.24 or more at its best offset; the suite's similar-structure songs at
+#: 0.32 to 0.37 for 10 s clips taken 10 s in, but lower for windows taken
+#: later (see ``docs/audio.md``).
 DEFAULT_MAX_BIT_ERROR_RATE = 0.20
 
 #: Default minimum overlap for an offset to be considered (seconds), or the
-#: whole shorter fingerprint if it is shorter.
+#: whole shorter fingerprint if it is shorter, but never fewer than
+#: :data:`MIN_COMPARED_ITEMS` compared sub-fingerprints.
 DEFAULT_MIN_OVERLAP_SECONDS = 5.0
+
+#: The sub-fingerprint Chromaprint (algorithm 2) gives digital silence: every
+#: frame of an all-zero signal quantizes the same way. Pairs where either side
+#: holds it are left out of the comparison, as AcoustID's ``acoustid_compare``
+#: does: silence carries no information about which recording it is.
+SILENCE_VALUE = 627_964_279
+
+#: The fewest compared sub-fingerprints (silence excluded) an offset needs,
+#: whatever ``min_overlap_seconds`` says: 16 items span 2 s of hops, so a
+#: query needs at least 4.6 s of audio (Chromaprint's first item needs
+#: 2.7 s). Below it the best of thousands of offsets passes the bit error
+#: rate threshold by chance: measured with unrelated 2.7 to 3.6 s clips (1
+#: to 8 items) against a 6-minute reference, 90 % down to 1 % of them did.
+MIN_COMPARED_ITEMS = 16
+
+#: An offset matches only if its bit error rate is below this fraction of its
+#: chance error rate (:attr:`AudioMatch.chance_bit_error_rate`): the agreement
+#: must be well above what the bits' own statistics give unrelated signals.
+#: Measured: genuine matches stay at or below 0.43 of chance (0.29 with 5 s
+#: of overlap or more); independent recordings of stationary noise (white,
+#: pink, brown, blue, violet, velvet, hiss, a -60 dBFS noise floor) are at
+#: 0.82 to 0.94 of it at their best offset, although their bit error rate
+#: (0.13 to 0.30) is as low as that of a genuine match. 0.6 would leave more
+#: room for genuine short clips but let more windows of the suite's
+#: similar-structure songs through (``docs/audio.md``).
+MAX_CHANCE_ERROR_FRACTION = 0.5
+
+#: The fewest distinct sub-fingerprint values each side of a matching overlap
+#: must hold (silence excluded). A steady tone or hum yields one value over
+#: and over, which agrees perfectly with itself and says nothing.
+MIN_DISTINCT_VALUES = MIN_COMPARED_ITEMS // 2
 
 #: The longest fingerprint accepted (about 34 hours).
 MAX_FINGERPRINT_ITEMS = 1_000_000
@@ -130,6 +176,9 @@ _FPCALC_ARGS = (
 )
 # Chromaprint needs 4096 + 19 * 1365 samples for its first sub-fingerprint.
 _MIN_SAMPLES = 4096 + 19 * 1365
+# Passing offsets whose diversity is checked, best first, before giving up:
+# bounds the cost when a long low-information overlap passes everywhere.
+_MAX_DIVERSITY_CHECKS = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,17 +273,27 @@ class AudioMatch:
     """The best alignment of a query fingerprint against a reference.
 
     Attributes:
-        is_match: ``bit_error_rate <= max_bit_error_rate`` at the best offset.
-        bit_error_rate: Fraction of differing bits over the overlap at the
-            best offset (1.0 when no offset could be compared).
+        is_match: Whether some offset passed every test of
+            :func:`compare_fingerprints` (then the fields below describe the
+            best passing offset; otherwise the best-scoring eligible one).
+        bit_error_rate: Fraction of differing bits over the compared pairs
+            at that offset (1.0 when no offset could be compared).
         similarity: ``1 - bit_error_rate``.
         offset_seconds: Where the query starts in the reference:
             ``reference_time = query_time + offset_seconds`` (negative when
             the query starts before the reference).
         offset_items: The same offset in sub-fingerprints.
-        overlap_items: Sub-fingerprints compared at that offset.
-        overlap_seconds: The overlap in seconds.
+        overlap_items: Sub-fingerprint pairs compared at that offset: the
+            overlap without the pairs where either side is silence
+            (:data:`SILENCE_VALUE`).
+        overlap_seconds: ``overlap_items`` in seconds.
         query_coverage: ``overlap_items / len(query)``.
+        chance_bit_error_rate: The bit error rate two unrelated signals with
+            the same bit statistics would show at that offset:
+            ``mean over bits of p_q (1 - p_r) + p_r (1 - p_q)``, where ``p``
+            is how often the bit is 1 on each side of the overlap (silence
+            excluded). About 0.42 for music, 0.16 to 0.32 for stationary
+            noise, 0.0 for a constant value; 0.0 when nothing was compared.
     """
 
     is_match: bool
@@ -245,6 +304,7 @@ class AudioMatch:
     overlap_items: int
     overlap_seconds: float
     query_coverage: float
+    chance_bit_error_rate: float
 
 
 def fingerprint_audio(
@@ -302,7 +362,9 @@ def fingerprint_audio(
             channels=1,
             max_duration_seconds=max_duration_seconds,
         )
-        cap = sample_cap_bytes(
+        # The PCM streams into fpcalc and is never held in memory, so only the
+        # duration bounds it (max_decoded_audio_bytes is about memory).
+        cap = duration_cap_bytes(
             limits,
             bytes_per_frame=2,
             sample_rate=CHROMAPRINT_SAMPLE_RATE,
@@ -385,29 +447,48 @@ def compare_fingerprints(
     min_overlap_seconds: float = DEFAULT_MIN_OVERLAP_SECONDS,
     max_offset_seconds: float | None = None,
 ) -> AudioMatch:
-    """Aligns ``query`` with ``reference`` by bit error rate over the overlap.
+    """Aligns ``query`` with ``reference`` and decides whether they share audio.
 
-    Every offset is scored by the binomial z-score of its bit agreement,
-    ``(0.5 - bit_error_rate) * sqrt(compared_bits)``, and the best one wins:
-    for a clip that lies inside the reference (constant overlap) that is the
-    offset of lowest bit error rate, and when overlaps differ it prefers a
-    long low-error overlap to a short one that is low by chance or because
-    the content repeats. Offsets whose overlap is shorter than
-    ``min_overlap_seconds`` (or than the shorter fingerprint, if that is
-    shorter) are not considered. Ties go to the larger overlap, then the
-    smaller absolute offset. The decision compares the bit error rate at the
-    chosen offset with ``max_bit_error_rate``.
+    Every offset is compared over the overlapping sub-fingerprints at once
+    (FFT cross-correlations of the 32 bit planes). Pairs where either side is
+    digital silence (:data:`SILENCE_VALUE`) are left out of both the bit count
+    and the overlap. An offset is **eligible** when at least
+    ``min_overlap_seconds`` of pairs are compared (or all the informative
+    items of the shorter fingerprint, if it is shorter), and never fewer than
+    :data:`MIN_COMPARED_ITEMS`. An eligible offset **passes** when
+
+    1. its bit error rate is at most ``max_bit_error_rate``;
+    2. its bit error rate is below :data:`MAX_CHANCE_ERROR_FRACTION` times its
+       chance error rate (:attr:`AudioMatch.chance_bit_error_rate`), which
+       rejects stationary noise, steady tones and other content whose bits
+       agree by chance;
+    3. each side of the compared pairs holds at least
+       :data:`MIN_DISTINCT_VALUES` distinct values.
+
+    The result is a match when **any** offset passes; the reported one is
+    the passing offset with the highest binomial z-score,
+    ``(0.5 - bit_error_rate) * sqrt(compared_bits)`` (a long low-error
+    overlap rather than a short one, which matters for repetitive content).
+    When none passes, the eligible offset with the highest z-score is
+    reported, with ``is_match=False``. Ties go to the larger overlap, then
+    the smaller absolute offset. So a genuine short overlap (an upload that
+    starts with the last seconds of the reference) is found even when a long
+    unrelated overlap scores a higher z-score.
 
     Args:
         query: The fingerprint to look up (for example a clip).
         reference: The fingerprint to search in.
-        max_bit_error_rate: Decision threshold, in ``[0, 1]``.
-        min_overlap_seconds: Minimum overlap considered, in seconds.
+        max_bit_error_rate: Decision threshold on the bit error rate, in
+            ``[0, 1]``.
+        min_overlap_seconds: Minimum compared overlap, in seconds (at least
+            :data:`MIN_COMPARED_ITEMS` sub-fingerprints in any case).
         max_offset_seconds: If given, only offsets with
             ``abs(offset_seconds) <= max_offset_seconds`` are considered.
 
     Returns:
-        The best alignment; ``is_match`` is false when nothing overlaps.
+        The alignment; ``is_match`` is false when nothing passes, including
+        when a fingerprint has fewer than :data:`MIN_COMPARED_ITEMS`
+        informative sub-fingerprints (audio shorter than about 4.6 s).
 
     Raises:
         TypeError: If an argument has the wrong type.
@@ -425,7 +506,6 @@ def compare_fingerprints(
         seconds = check_number("max_offset_seconds", max_offset_seconds, minimum=0.0)
         max_offset = math.floor(seconds / ITEM_SECONDS + 1e-9)
 
-    n_q, n_r = len(query), len(reference)
     nothing = AudioMatch(
         is_match=False,
         bit_error_rate=1.0,
@@ -435,38 +515,64 @@ def compare_fingerprints(
         overlap_items=0,
         overlap_seconds=0.0,
         query_coverage=0.0,
+        chance_bit_error_rate=0.0,
     )
-    if n_q == 0 or n_r == 0:
+    q = np.asarray(query.values, dtype=np.uint32)
+    r = np.asarray(reference.values, dtype=np.uint32)
+    q_informative = int(np.count_nonzero(q != SILENCE_VALUE))
+    r_informative = int(np.count_nonzero(r != SILENCE_VALUE))
+    needed = max(
+        MIN_COMPARED_ITEMS,
+        min(math.ceil(min_overlap / ITEM_SECONDS - 1e-9), q_informative, r_informative),
+    )
+    if min(q_informative, r_informative) < needed:
         return nothing
-    errors, overlaps = _error_counts(query.values, reference.values)
-    offsets = np.arange(-(n_q - 1), n_r)
-    needed = max(1, min(math.ceil(min_overlap / ITEM_SECONDS - 1e-9), n_q, n_r))
-    eligible = overlaps >= needed
+    errors, compared = _offset_counts(q, r)
+    offsets = np.arange(-(q.size - 1), r.size)
+    eligible = compared >= needed
     if max_offset is not None:
         eligible &= np.abs(offsets) <= max_offset
     if not eligible.any():
         return nothing
     candidates = np.flatnonzero(eligible)
-    bits = _BITS * overlaps[candidates]
+    bits = _BITS * compared[candidates]
     rates = errors[candidates] / bits
-    # The binomial z-score of the agreement: favors long overlaps with a low
-    # error rate over short overlaps that are low by chance (or by the
-    # periodicity of the content).
+    # The binomial z-score of the agreement: among offsets that pass, it
+    # prefers long overlaps with a low error rate over short overlaps that
+    # are low by chance (or by the periodicity of the content).
     scores = (0.5 - rates) * np.sqrt(bits)
-    order = np.lexsort((np.abs(offsets[candidates]), -overlaps[candidates], -scores))
-    best = int(candidates[order[0]])
-    rate = float(errors[best] / (_BITS * overlaps[best]))
-    overlap = int(overlaps[best])
+    order = np.lexsort((np.abs(offsets[candidates]), -compared[candidates], -scores))
+    ranked = candidates[order]
+    passing = ranked[rates[order] <= max_bit_error_rate]
+    best, chance, matched = int(ranked[0]), None, False
+    if passing.size:
+        passing_chance = _chance_error_rates(q, r, offsets[passing])
+        informative = errors[passing] < (
+            MAX_CHANCE_ERROR_FRACTION * passing_chance * _BITS * compared[passing]
+        )
+        for index, rate in zip(
+            passing[informative][:_MAX_DIVERSITY_CHECKS],
+            passing_chance[informative][:_MAX_DIVERSITY_CHECKS],
+            strict=True,
+        ):
+            if _diverse(q, r, int(offsets[index])):
+                best, chance, matched = int(index), float(rate), True
+                break
+    if chance is None:
+        chance = float(_chance_error_rates(q, r, offsets[[best]])[0])
+    rate = float(errors[best] / (_BITS * compared[best]))
+    overlap = int(compared[best])
     offset = int(offsets[best])
     return AudioMatch(
-        is_match=rate <= max_bit_error_rate,
+        is_match=matched,
         bit_error_rate=rate,
         similarity=1.0 - rate,
         offset_seconds=offset * ITEM_SECONDS,
         offset_items=offset,
         overlap_items=overlap,
         overlap_seconds=overlap * ITEM_SECONDS,
-        query_coverage=overlap / n_q,
+        query_coverage=overlap / q.size,
+        chance_bit_error_rate=chance,
     )
 
 
@@ -535,30 +641,78 @@ def _parse_fpcalc(raw: bytes, max_items: int) -> tuple[int, ...]:
     return tuple(parsed)
 
 
-def _error_counts(
-    query: Sequence[int], reference: Sequence[int]
+def _offset_counts(
+    q: npt.NDArray[np.uint32], r: npt.NDArray[np.uint32]
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
-    """Bit errors and overlap length for every offset, via FFT correlation.
+    """Bit errors and compared pairs for every offset, via FFT correlation.
 
-    Offset ``d`` (index ``d + len(query) - 1``) pairs query item ``i`` with
-    reference item ``i + d``. Each bit plane is mapped to ``±1``; the
-    cross-correlation of two planes is (agreements - disagreements) at every
-    offset, and the 32 planes are summed in the frequency domain.
+    Offset ``d`` (index ``d + len(q) - 1``) pairs query item ``i`` with
+    reference item ``i + d``. Each bit plane is mapped to ``±1``, and to 0
+    where the item is silence, so that pairs involving silence add nothing;
+    the cross-correlation of two planes is (agreements - disagreements) at
+    every offset, and the 32 planes are summed in the frequency domain. The
+    correlation of the two non-silence masks counts the compared pairs.
     """
-    q = np.asarray(query, dtype=np.uint32)
-    r = np.asarray(reference, dtype=np.uint32)
     n_q, n_r = q.size, r.size
+    q_ok = (q != SILENCE_VALUE).astype(np.float64)
+    r_ok = (r != SILENCE_VALUE).astype(np.float64)
     size = 1 << (n_q + n_r - 1).bit_length()
     spectrum = np.zeros(size // 2 + 1, dtype=np.complex128)
     for bit in range(_BITS):
-        q_plane = ((q >> bit) & 1).astype(np.float64) * 2.0 - 1.0
-        r_plane = ((r >> bit) & 1).astype(np.float64) * 2.0 - 1.0
+        q_plane = (((q >> bit) & 1).astype(np.float64) * 2.0 - 1.0) * q_ok
+        r_plane = (((r >> bit) & 1).astype(np.float64) * 2.0 - 1.0) * r_ok
         spectrum += np.conj(np.fft.rfft(q_plane, size)) * np.fft.rfft(r_plane, size)
-    correlation = np.fft.irfft(spectrum, size)
-    # correlation[k] = sum_i q[i] r[i + k]; negative k wrap around to the end.
-    by_offset = np.concatenate((correlation[size - (n_q - 1) :], correlation[:n_r]))
-    offsets = np.arange(-(n_q - 1), n_r)
-    overlaps = np.minimum(n_q, n_r - offsets) - np.maximum(0, -offsets)
-    overlaps = np.clip(overlaps, 0, None).astype(np.int64)
-    errors = np.rint((_BITS * overlaps - by_offset) / 2.0).astype(np.int64)
-    return np.clip(errors, 0, _BITS * overlaps), overlaps
+    pairs = np.conj(np.fft.rfft(q_ok, size)) * np.fft.rfft(r_ok, size)
+
+    def by_offset(spectrum: npt.NDArray[np.complex128]) -> npt.NDArray[np.float64]:
+        correlation = np.fft.irfft(spectrum, size)
+        # correlation[k] = sum_i q[i] r[i + k]; negative k wrap around to the end.
+        return np.concatenate((correlation[size - (n_q - 1) :], correlation[:n_r]))
+
+    compared = np.clip(np.rint(by_offset(pairs)), 0, None).astype(np.int64)
+    errors = np.rint((_BITS * compared - by_offset(spectrum)) / 2.0).astype(np.int64)
+    return np.clip(errors, 0, _BITS * compared), compared
+
+
+def _chance_error_rates(
+    q: npt.NDArray[np.uint32], r: npt.NDArray[np.uint32], offsets: npt.NDArray[np.int64]
+) -> npt.NDArray[np.float64]:
+    """The bit error rate unrelated signals with the same bit statistics would show.
+
+    For each offset: the mean over the 32 bits of ``p_q (1 - p_r) + p_r (1 -
+    p_q)``, where ``p_q`` and ``p_r`` are how often the bit is 1 in the query
+    and the reference over the overlap, silence excluded on each side
+    (prefix sums: linear in the fingerprint lengths and the offsets).
+    """
+    n_q, n_r = q.size, r.size
+    q0 = np.maximum(0, -offsets)
+    q1 = np.minimum(n_q, n_r - offsets)
+    r0, r1 = q0 + offsets, q1 + offsets
+    q_ok = (q != SILENCE_VALUE).astype(np.int64)
+    r_ok = (r != SILENCE_VALUE).astype(np.int64)
+    q_count = np.concatenate(([0], np.cumsum(q_ok)))
+    r_count = np.concatenate(([0], np.cumsum(r_ok)))
+    q_items = np.maximum(q_count[q1] - q_count[q0], 1)
+    r_items = np.maximum(r_count[r1] - r_count[r0], 1)
+    total = np.zeros(offsets.size, dtype=np.float64)
+    for bit in range(_BITS):
+        q_ones = np.concatenate(([0], np.cumsum(((q >> bit) & 1).astype(np.int64) * q_ok)))
+        r_ones = np.concatenate(([0], np.cumsum(((r >> bit) & 1).astype(np.int64) * r_ok)))
+        p_q = (q_ones[q1] - q_ones[q0]) / q_items
+        p_r = (r_ones[r1] - r_ones[r0]) / r_items
+        total += p_q * (1.0 - p_r) + p_r * (1.0 - p_q)
+    result: npt.NDArray[np.float64] = total / _BITS
+    return result
+
+
+def _diverse(q: npt.NDArray[np.uint32], r: npt.NDArray[np.uint32], offset: int) -> bool:
+    """Whether both sides of the compared pairs hold enough distinct values."""
+    start = max(0, -offset)
+    stop = min(q.size, r.size - offset)
+    q_part = q[start:stop]
+    r_part = r[start + offset : stop + offset]
+    compared = (q_part != SILENCE_VALUE) & (r_part != SILENCE_VALUE)
+    return (
+        np.unique(q_part[compared]).size >= MIN_DISTINCT_VALUES
+        and np.unique(r_part[compared]).size >= MIN_DISTINCT_VALUES
+    )

@@ -1,7 +1,9 @@
-"""Synthetic test audio generated with ffmpeg's lavfi sources (integration tests)."""
+"""Synthetic test audio generated with ffmpeg's lavfi sources and NumPy (integration tests)."""
 
 from __future__ import annotations
 
+import io
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,41 @@ def song(k: int, rate: int = 44100) -> str:
         f"+0.2*sin(2*PI*({500 + 30 * k}+300*sin(2*PI*0.0{31 + k}*t))*t)"
         f"+0.05*random({k}):s={rate}"
     )
+
+
+def music(seconds: float, rate: int, seed: int) -> np.ndarray:
+    """A non-periodic mono "song" (float64 samples): four wobbling tones plus noise.
+
+    Unlike :func:`song`, different seeds give tones in unrelated ranges with
+    unrelated modulations, so windows of two seeds do not resemble each
+    other (the fingerprint false-positive tests use it as unrelated music).
+    """
+    rng = np.random.default_rng(seed)
+    n = int(seconds * rate)
+    t = np.arange(n) / rate
+    out = np.zeros(n)
+    for _ in range(4):
+        base = rng.uniform(150, 1500)
+        wobble = rng.uniform(50, 400) * np.sin(
+            2 * np.pi * rng.uniform(0.05, 0.4) * t + rng.uniform(0, 6)
+        )
+        phase = 2 * np.pi * np.cumsum(base + wobble) / rate
+        envelope = 0.5 + 0.5 * np.sin(2 * np.pi * rng.uniform(0.2, 3) * t + rng.uniform(0, 6))
+        out += 0.15 * envelope * np.sin(phase)
+    return out + 0.03 * rng.standard_normal(n)
+
+
+def wav(samples: np.ndarray, rate: int) -> bytes:
+    """16-bit WAV bytes of float samples shaped ``(n,)`` or ``(channels, n)``."""
+    matrix = np.atleast_2d(np.asarray(samples, dtype=np.float64))
+    pcm = np.clip(np.round(matrix.T * 32767), -32768, 32767).astype("<i2")
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as output:
+        output.setnchannels(matrix.shape[0])
+        output.setsampwidth(2)
+        output.setframerate(rate)
+        output.writeframes(pcm.tobytes())
+    return buffer.getvalue()
 
 
 #: Broadband, speech-like test signal for AudioSeal: pink noise with a slow
