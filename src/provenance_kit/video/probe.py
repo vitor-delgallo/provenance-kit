@@ -1,0 +1,469 @@
+"""Probe untrusted video with ffprobe before decoding it.
+
+:func:`probe_video` returns a :class:`VideoInfo`: duration, dimensions,
+rotation, frame rate, codecs and stream counts of the first video stream
+(cover-art pictures are skipped). It enforces
+:class:`~provenance_kit.limits.MediaLimits` on what the container declares,
+so that :mod:`provenance_kit.video.frames` can refuse a decompression bomb
+before decoding a single frame.
+
+Both the media and ffprobe's report are treated as untrusted:
+
+* the container is detected from the bytes and passed to ffprobe explicitly
+  (``-f mov``, ``-f matroska``, ...), with ``-protocol_whitelist pipe`` (or
+  ``file,pipe`` for a temporary file), so the media cannot make ffprobe open
+  URLs or other files;
+* the media goes through a pipe, except ISO base media files whose ``moov``
+  box follows the media data, which need a seekable private temporary file
+  (see :mod:`provenance_kit.video._ffmpeg`);
+* ffprobe is asked for the few fields used here, its output is capped at
+  1 MiB, and the JSON is parsed defensively: wrong types, missing fields,
+  ``NaN``/``Infinity``, absurd values and too many streams are refused or
+  ignored, never trusted.
+
+Example::
+
+    from provenance_kit.video.probe import probe_video
+
+    info = probe_video(data)  # data: bytes of an uploaded video
+    print(info.duration_seconds, info.display_width, info.display_height)
+
+Thread safety: the functions are thread-safe; each call runs its own ffprobe
+process.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, TypeVar
+
+from provenance_kit._logging import get_logger
+from provenance_kit._typing import BytesLike, StrPath
+from provenance_kit.errors import ExternalToolError, MediaDecodeError, UnsupportedMediaError
+from provenance_kit.limits import MediaLimits
+from provenance_kit.mediatype import MediaType
+from provenance_kit.tools import ExternalTools, Tool
+from provenance_kit.video._ffmpeg import (
+    FFPROBE_COMMON,
+    VIDEO_CONTAINERS,
+    StagedInput,
+    as_media_error,
+    check_video_input,
+    staged_input,
+)
+
+__all__ = ["MAX_STREAMS", "VideoInfo", "probe_video"]
+
+_log = get_logger(__name__)
+
+#: Containers declaring more streams than this are refused.
+MAX_STREAMS = 64
+
+_MAX_PROBE_OUTPUT = 1024 * 1024
+_MAX_NAME_CHARS = 64
+_MAX_NUMBER_CHARS = 32
+_MAX_FRAME_RATE = 10_000.0
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.,+-]+$")
+_RATIONAL_RE = re.compile(r"^(-?\d{1,12})[/:](-?\d{1,12})$")
+
+_N = TypeVar("_N", int, float)
+
+_PROBE_ENTRIES = (
+    "format=format_name,duration,bit_rate,nb_streams"
+    ":stream=index,codec_type,codec_name,width,height,pix_fmt,avg_frame_rate,"
+    "r_frame_rate,nb_frames,duration,start_time"
+    ":stream_disposition=attached_pic"
+    ":stream_tags=rotate"
+    ":stream_side_data=rotation"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class VideoInfo:
+    """What ffprobe reports about a video, after validation.
+
+    Dimensions are those of the stored (coded) frames. ``rotation`` is how
+    far the frames must be turned clockwise for display; the
+    ``display_width`` / ``display_height`` properties account for it, and
+    :mod:`provenance_kit.video.frames` applies it.
+
+    Attributes:
+        container: The container detected from the bytes.
+        format_name: ffprobe's demuxer name list, for example
+            ``"mov,mp4,m4a,3gp,3g2,mj2"``.
+        duration_seconds: The declared duration, or ``None`` if unknown.
+        width: Stored frame width in pixels.
+        height: Stored frame height in pixels.
+        rotation: Clockwise display rotation: 0, 90, 180 or 270 degrees.
+        frame_rate: Average frame rate in frames per second, or ``None``.
+        frame_count: Declared number of frames of the stream, or ``None``.
+        video_codec: Codec of the selected video stream, for example
+            ``"h264"``.
+        pixel_format: Pixel format, for example ``"yuv420p"``, or ``None``.
+        audio_codec: Codec of the first audio stream, or ``None``.
+        video_streams: Number of video streams (cover-art pictures included).
+        audio_streams: Number of audio streams.
+        subtitle_streams: Number of subtitle streams.
+        other_streams: Number of data, attachment and unknown streams.
+        bit_rate: Declared overall bit rate in bits per second, or ``None``.
+        stream_index: ffprobe index of the selected video stream (used to map
+            it in ffmpeg).
+        start_time: Start time of the selected stream in seconds (0.0 when
+            not declared).
+    """
+
+    container: MediaType
+    format_name: str
+    duration_seconds: float | None
+    width: int
+    height: int
+    rotation: int
+    frame_rate: float | None
+    frame_count: int | None
+    video_codec: str
+    pixel_format: str | None
+    audio_codec: str | None
+    video_streams: int
+    audio_streams: int
+    subtitle_streams: int
+    other_streams: int
+    bit_rate: int | None
+    stream_index: int
+    start_time: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Validates the fields."""
+        if self.width < 1 or self.height < 1:
+            raise ValueError("width and height must be positive")
+        if self.rotation not in (0, 90, 180, 270):
+            raise ValueError("rotation must be 0, 90, 180 or 270")
+
+    @property
+    def display_width(self) -> int:
+        """Width of the frames as displayed (after rotation)."""
+        return self.height if self.rotation in (90, 270) else self.width
+
+    @property
+    def display_height(self) -> int:
+        """Height of the frames as displayed (after rotation)."""
+        return self.width if self.rotation in (90, 270) else self.height
+
+
+def probe_video(
+    data: BytesLike,
+    *,
+    tools: ExternalTools | None = None,
+    limits: MediaLimits | None = None,
+    temp_dir: StrPath | None = None,
+    timeout_seconds: float | None = None,
+) -> VideoInfo:
+    """Probes untrusted video bytes with ffprobe and checks the limits.
+
+    Args:
+        data: The encoded video (untrusted).
+        tools: Where the binaries are. Defaults to
+            :meth:`ExternalTools.from_env() <provenance_kit.tools.ExternalTools.from_env>`.
+        limits: The limits to enforce. Defaults to ``MediaLimits()``.
+        temp_dir: Directory for the private temporary file that MP4 files with
+            a trailing ``moov`` box need; ``None`` uses the platform default.
+        timeout_seconds: The ffprobe timeout. Defaults to
+            ``limits.subprocess_timeout_seconds``.
+
+    Returns:
+        The validated stream information.
+
+    Raises:
+        TypeError: If ``data`` is not bytes-like.
+        MediaLimitExceededError: If the size, dimensions, duration or declared
+            frame count exceed ``limits``.
+        UnsupportedMediaError: If the bytes are not a supported video
+            container, or contain no video stream.
+        MediaDecodeError: If ffprobe cannot read the media or reports
+            something unusable.
+        BackendUnavailableError: If ffprobe is not available.
+        ExternalToolTimeoutError: If ffprobe times out.
+    """
+    limits = MediaLimits() if limits is None else limits
+    tools = ExternalTools.from_env() if tools is None else tools
+    media_type = check_video_input(data, limits)
+    demuxer = VIDEO_CONTAINERS[media_type]
+    with staged_input(data, media_type, demuxer, temp_dir=temp_dir) as staged:
+        return probe_staged(
+            staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout_seconds
+        )
+
+
+def probe_staged(
+    staged: StagedInput,
+    media_type: MediaType,
+    *,
+    tools: ExternalTools,
+    limits: MediaLimits,
+    timeout_seconds: float | None,
+) -> VideoInfo:
+    """Runs ffprobe on an already staged input (internal, shared with frames).
+
+    Args:
+        staged: The staged input.
+        media_type: The sniffed container.
+        tools: Where the binaries are.
+        limits: The limits to enforce.
+        timeout_seconds: The ffprobe timeout, or ``None`` for the limits'.
+
+    Returns:
+        The validated stream information.
+    """
+    args = [
+        *FFPROBE_COMMON,
+        *staged.input_args(),
+        "-print_format",
+        "json",
+        "-show_entries",
+        _PROBE_ENTRIES,
+    ]
+    timeout = limits.subprocess_timeout_seconds if timeout_seconds is None else timeout_seconds
+    try:
+        result = tools.run(
+            Tool.FFPROBE,
+            args,
+            stdin=staged.stdin,
+            timeout_seconds=timeout,
+            max_stdout_bytes=_MAX_PROBE_OUTPUT,
+        )
+    except ExternalToolError as exc:
+        raise as_media_error(exc, "video probe") from exc
+    return parse_probe_output(result.stdout, media_type, limits)
+
+
+def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -> VideoInfo:
+    """Parses and validates ffprobe's JSON report (internal; untrusted input).
+
+    Args:
+        raw: ffprobe's standard output.
+        media_type: The sniffed container.
+        limits: The limits to enforce.
+
+    Returns:
+        The validated stream information.
+
+    Raises:
+        MediaDecodeError: If the report is not usable JSON or lacks required
+            fields.
+        UnsupportedMediaError: If there is no video stream or too many streams.
+        MediaLimitExceededError: If a declared value exceeds ``limits``.
+    """
+    document = load_json_object(raw, "video probe")
+    summary = _summarize_streams(document.get("streams"))
+    selected = summary.selected
+    fmt = document.get("format")
+    fmt = fmt if isinstance(fmt, dict) else {}
+
+    index = _int(selected.get("index"))
+    if index is None or not 0 <= index < MAX_STREAMS:
+        raise MediaDecodeError("video probe: the video stream has no valid index")
+    width = _int(selected.get("width"))
+    height = _int(selected.get("height"))
+    if width is None or height is None or width < 1 or height < 1:
+        raise MediaDecodeError("video probe: the video stream declares no frame size")
+    limits.check_dimensions(width, height)
+
+    duration = _non_negative(_float(fmt.get("duration")))
+    if duration is None:
+        duration = _non_negative(_float(selected.get("duration")))
+    if duration is not None:
+        limits.check_duration(duration)
+
+    frame_rate = _rate(selected.get("avg_frame_rate")) or _rate(selected.get("r_frame_rate"))
+    frame_count = _non_negative(_int(selected.get("nb_frames")))
+    if frame_count is not None:
+        limits.check_frames(frame_count)
+    if frame_rate is not None and duration is not None:
+        estimate = duration * frame_rate
+        if estimate > limits.max_frames:
+            limits.check_frames(math.ceil(estimate))
+
+    start_time = _non_negative(_float(selected.get("start_time")))
+    if start_time is None or start_time > limits.max_duration_seconds:
+        start_time = 0.0
+
+    return VideoInfo(
+        container=media_type,
+        format_name=_name(fmt.get("format_name")) or "unknown",
+        duration_seconds=duration,
+        width=width,
+        height=height,
+        rotation=_rotation(selected),
+        frame_rate=frame_rate,
+        frame_count=frame_count,
+        video_codec=_name(selected.get("codec_name")) or "unknown",
+        pixel_format=_name(selected.get("pix_fmt")),
+        audio_codec=summary.audio_codec,
+        video_streams=summary.video,
+        audio_streams=summary.audio,
+        subtitle_streams=summary.subtitle,
+        other_streams=summary.other,
+        bit_rate=_non_negative(_int(fmt.get("bit_rate"))),
+        stream_index=index,
+        start_time=start_time,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamSummary:
+    selected: Mapping[str, Any]
+    audio_codec: str | None
+    video: int
+    audio: int
+    subtitle: int
+    other: int
+
+
+def _summarize_streams(streams_raw: object) -> _StreamSummary:
+    """Counts the streams and selects the first non-cover-art video stream."""
+    if not isinstance(streams_raw, list):
+        raise MediaDecodeError("video probe: the report lists no streams")
+    if len(streams_raw) > MAX_STREAMS:
+        raise UnsupportedMediaError(
+            f"the media has too many streams ({len(streams_raw)} > {MAX_STREAMS})"
+        )
+    counts = {"video": 0, "audio": 0, "subtitle": 0, "other": 0}
+    selected: Mapping[str, Any] | None = None
+    audio_codec: str | None = None
+    for stream in streams_raw:
+        if not isinstance(stream, dict):
+            continue
+        kind = stream.get("codec_type")
+        counts[kind if kind in ("video", "audio", "subtitle") else "other"] += 1
+        if kind == "audio" and audio_codec is None:
+            audio_codec = _name(stream.get("codec_name"))
+        if kind == "video" and selected is None and not _is_attached_picture(stream):
+            selected = stream
+    if selected is None:
+        raise UnsupportedMediaError("the media contains no video stream")
+    return _StreamSummary(
+        selected=selected,
+        audio_codec=audio_codec,
+        video=counts["video"],
+        audio=counts["audio"],
+        subtitle=counts["subtitle"],
+        other=counts["other"],
+    )
+
+
+# --------------------------------------------------------------------------
+# Defensive JSON helpers (also used by frames for keyframe timestamps)
+# --------------------------------------------------------------------------
+
+
+def _refuse_constant(name: str) -> Any:
+    raise ValueError(f"non-finite number {name} in the report")
+
+
+def load_json_object(raw: bytes, what: str) -> dict[str, Any]:
+    """Decodes a JSON object from untrusted tool output (internal).
+
+    Args:
+        raw: The tool's standard output.
+        what: A short, safe description for error messages.
+
+    Returns:
+        The decoded object.
+
+    Raises:
+        MediaDecodeError: If the output is not a UTF-8 JSON object.
+    """
+    try:
+        document = json.loads(raw.decode("utf-8"), parse_constant=_refuse_constant)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise MediaDecodeError(f"{what}: the tool report is not valid JSON") from exc
+    if not isinstance(document, dict):
+        raise MediaDecodeError(f"{what}: the tool report is not a JSON object")
+    return document
+
+
+def _is_attached_picture(stream: Mapping[str, Any]) -> bool:
+    disposition = stream.get("disposition")
+    return isinstance(disposition, dict) and _int(disposition.get("attached_pic")) == 1
+
+
+def _non_negative(value: _N | None) -> _N | None:
+    return value if value is not None and value >= 0 else None
+
+
+def _int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and 0 < len(value) <= _MAX_NUMBER_CHARS:
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    number: float
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str) and 0 < len(value) <= _MAX_NUMBER_CHARS:
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _rate(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    match = _RATIONAL_RE.match(value.strip())
+    if match is None:
+        return None
+    num, den = int(match.group(1)), int(match.group(2))
+    if num <= 0 or den <= 0:
+        return None
+    rate = num / den
+    return rate if 0.0 < rate <= _MAX_FRAME_RATE else None
+
+
+def _name(value: object) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > _MAX_NAME_CHARS:
+        return None
+    return value if _NAME_RE.match(value) else None
+
+
+def _rotation(stream: Mapping[str, Any]) -> int:
+    """Clockwise display rotation from the display matrix or the legacy tag."""
+    degrees: float | None = None
+    side_data = stream.get("side_data_list")
+    if isinstance(side_data, list):
+        for entry in side_data[:16]:
+            if isinstance(entry, dict):
+                value = _float(entry.get("rotation"))
+                if value is not None:
+                    # ffprobe reports the display matrix rotation
+                    # counterclockwise; ffmpeg's autorotate turns the frame by
+                    # its negation.
+                    degrees = -value
+                    break
+    if degrees is None:
+        tags = stream.get("tags")
+        if isinstance(tags, dict):
+            degrees = _float(tags.get("rotate"))  # legacy tag: clockwise
+    if degrees is None or abs(degrees) > 3600:
+        return 0
+    quarter = round(degrees / 90.0)
+    if abs(degrees - 90.0 * quarter) > 2.0:
+        _log.debug("ignoring a display rotation that is not a multiple of 90 degrees")
+        return 0
+    return (quarter % 4) * 90
