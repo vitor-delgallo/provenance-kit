@@ -1,0 +1,488 @@
+"""Signer protocol, signature encodings and an in-process key signer."""
+
+from __future__ import annotations
+
+import enum
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Protocol
+
+from provenance_kit._optional import import_optional
+from provenance_kit._typing import BytesLike
+from provenance_kit.errors import ProvenanceKitError
+
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
+
+__all__ = [
+    "C2paSigner",
+    "LocalKeySigner",
+    "SignatureFormat",
+    "SigningAlgorithm",
+    "SigningError",
+    "ecdsa_der_to_raw",
+]
+
+_PEM_CERTIFICATE = "-----BEGIN CERTIFICATE-----"
+# RSA moduli from 2048 bits (the C2PA minimum) to 8192 bits.
+_RSA_SIGNATURE_BYTES = (256, 1024)
+
+
+class SigningError(ProvenanceKitError):
+    """A C2PA manifest could not be signed.
+
+    Raised when the signer raises or returns an unusable signature, when the
+    time-stamp authority fails, or when the C2PA library refuses the manifest
+    (it validates every manifest right after signing it). The message names
+    the failure only; the original exception, if any, is chained as
+    ``__cause__``. Exceptions raised by a signer are never put into the
+    message, because a KMS error can name keys or accounts.
+    """
+
+
+class SigningAlgorithm(enum.StrEnum):
+    """A C2PA claim signature algorithm (COSE names, C2PA 2.3, section 13.2.1)."""
+
+    ES256 = "es256"
+    """ECDSA with P-256 and SHA-256."""
+    ES384 = "es384"
+    """ECDSA with P-384 and SHA-384."""
+    ES512 = "es512"
+    """ECDSA with P-521 and SHA-512."""
+    PS256 = "ps256"
+    """RSASSA-PSS with SHA-256, MGF1 with SHA-256, salt length 32."""
+    PS384 = "ps384"
+    """RSASSA-PSS with SHA-384, MGF1 with SHA-384, salt length 48."""
+    PS512 = "ps512"
+    """RSASSA-PSS with SHA-512, MGF1 with SHA-512, salt length 64."""
+    ED25519 = "ed25519"
+    """EdDSA with Ed25519 (pure, no pre-hash)."""
+
+    @property
+    def is_ecdsa(self) -> bool:
+        """Whether this is one of the ECDSA algorithms."""
+        return self in _ECDSA_COMPONENT_BYTES
+
+    @property
+    def ecdsa_component_bytes(self) -> int | None:
+        """Bytes per ECDSA component (``r`` or ``s``), or ``None`` for non-ECDSA."""
+        return _ECDSA_COMPONENT_BYTES.get(self)
+
+    @property
+    def hash_name(self) -> str | None:
+        """The hash the signer applies to the data, or ``None`` for Ed25519."""
+        return _HASH_NAMES.get(self)
+
+
+_ECDSA_COMPONENT_BYTES = {
+    SigningAlgorithm.ES256: 32,
+    SigningAlgorithm.ES384: 48,
+    SigningAlgorithm.ES512: 66,
+}
+_HASH_NAMES = {
+    SigningAlgorithm.ES256: "sha256",
+    SigningAlgorithm.ES384: "sha384",
+    SigningAlgorithm.ES512: "sha512",
+    SigningAlgorithm.PS256: "sha256",
+    SigningAlgorithm.PS384: "sha384",
+    SigningAlgorithm.PS512: "sha512",
+}
+
+
+class SignatureFormat(enum.StrEnum):
+    """The encoding of the signature bytes a :class:`C2paSigner` returns.
+
+    COSE (RFC 9053, section 2.1), and therefore C2PA, stores ECDSA signatures
+    as the fixed-width concatenation ``r || s`` (IEEE P1363). KMS and HSM
+    APIs usually return the ASN.1 DER ``Ecdsa-Sig-Value`` instead. A signer
+    states which one it returns, and the adapter converts DER to ``r || s``
+    before the signature reaches the C2PA library.
+
+    Ed25519 (64 bytes, RFC 8032) and RSASSA-PSS (the modulus-sized octet
+    string, RFC 8017) have a single encoding: their signers use ``RAW``.
+    """
+
+    RAW = "raw"
+    """``r || s`` for ECDSA; the only encoding for Ed25519 and RSASSA-PSS."""
+    DER = "der"
+    """ASN.1 DER ``SEQUENCE { r INTEGER, s INTEGER }`` (ECDSA only)."""
+
+
+class C2paSigner(Protocol):
+    """What :func:`~provenance_kit.provenance.c2pa.sign_asset` needs from a signer.
+
+    The private key never has to be in this process: :meth:`sign` may call a
+    KMS or an HSM. Implementations must be safe to call from the thread that
+    calls ``sign_asset``.
+
+    What :meth:`sign` receives and must return:
+
+    * ``data`` is the COSE ``Sig_structure`` to be signed (a few hundred bytes
+      to a few kilobytes), **not** a digest. The signer hashes it with the
+      algorithm's hash (:attr:`SigningAlgorithm.hash_name`); with a KMS, use
+      its "sign a message" mode (for example ``MessageType=RAW`` with
+      ``ECDSA_SHA_256``), or hash locally and use its digest mode.
+    * The return value is the signature in :attr:`signature_format`. ECDSA
+      signers may return DER (what KMSs return) or ``r || s``; Ed25519 and
+      RSASSA-PSS signers return the raw signature. RSASSA-PSS must use MGF1
+      with the same hash and a salt as long as the hash (RFC 8230).
+
+    Attributes:
+        algorithm: The signature algorithm; it must match the key.
+        certificate_chain_pem: The signing certificate followed by any
+            intermediate certificates, PEM-encoded, without the root. The
+            leaf must be a C2PA claim-signing certificate (digitalSignature
+            key usage, an allowed extended key usage such as
+            ``id-kp-emailProtection`` or ``id-kp-documentSigning``, not a
+            CA). It is embedded in every manifest and is therefore public.
+        signature_format: The encoding :meth:`sign` returns.
+    """
+
+    @property
+    def algorithm(self) -> SigningAlgorithm:
+        """The signature algorithm."""
+        ...
+
+    @property
+    def certificate_chain_pem(self) -> str:
+        """The certificate chain, leaf first, PEM-encoded."""
+        ...
+
+    @property
+    def signature_format(self) -> SignatureFormat:
+        """The encoding of the signatures :meth:`sign` returns."""
+        ...
+
+    def sign(self, data: bytes) -> bytes:
+        """Signs ``data`` (see the class docstring for the exact contract)."""
+        ...
+
+
+def ecdsa_der_to_raw(signature: BytesLike, algorithm: SigningAlgorithm) -> bytes:
+    """Converts a DER ECDSA signature to the ``r || s`` form that COSE uses.
+
+    KMS and HSM APIs (and most crypto libraries) return ECDSA signatures as
+    ASN.1 DER ``Ecdsa-Sig-Value``; COSE and C2PA store them as the fixed-width
+    big-endian concatenation of ``r`` and ``s`` (IEEE P1363). The DER input is
+    parsed strictly: definite minimal lengths, positive minimal integers and
+    no trailing bytes.
+
+    Args:
+        signature: The DER-encoded signature.
+        algorithm: An ECDSA algorithm; it fixes the component width (32 bytes
+            for ES256, 48 for ES384, 66 for ES512).
+
+    Returns:
+        ``r || s``, each left-padded with zeros to the component width.
+
+    Raises:
+        TypeError: If ``signature`` is not bytes-like or ``algorithm`` is not
+            a :class:`SigningAlgorithm`.
+        ValueError: If ``algorithm`` is not ECDSA, or the input is not a
+            well-formed DER ECDSA signature whose components fit the width.
+    """
+    if not isinstance(signature, (bytes, bytearray, memoryview)):
+        raise TypeError(f"signature must be bytes-like, got {type(signature).__name__}")
+    if not isinstance(algorithm, SigningAlgorithm):
+        raise TypeError("algorithm must be a SigningAlgorithm")
+    width = algorithm.ecdsa_component_bytes
+    if width is None:
+        raise ValueError(f"{algorithm.value} is not an ECDSA algorithm")
+    der = bytes(memoryview(signature).cast("B"))
+    if len(der) < 8 or der[0] != 0x30:
+        raise ValueError("not a DER ECDSA signature: expected a SEQUENCE")
+    length, pos = _der_length(der, 1)
+    if pos + length != len(der):
+        raise ValueError("not a DER ECDSA signature: wrong SEQUENCE length or trailing bytes")
+    r, pos = _der_integer(der, pos)
+    s, pos = _der_integer(der, pos)
+    if pos != len(der):
+        raise ValueError("not a DER ECDSA signature: unexpected data after s")
+    limit = 1 << (8 * width)
+    for value in (r, s):
+        if not 0 < value < limit:
+            raise ValueError(f"ECDSA component out of range for {algorithm.value}")
+    return r.to_bytes(width, "big") + s.to_bytes(width, "big")
+
+
+def _der_length(der: bytes, pos: int) -> tuple[int, int]:
+    if pos >= len(der):
+        raise ValueError("not a DER ECDSA signature: truncated length")
+    first = der[pos]
+    pos += 1
+    if first < 0x80:
+        return first, pos
+    if first != 0x81:  # an ECDSA signature never needs more than one length byte
+        raise ValueError("not a DER ECDSA signature: unsupported length encoding")
+    if pos >= len(der):
+        raise ValueError("not a DER ECDSA signature: truncated length")
+    length = der[pos]
+    if length < 0x80:
+        raise ValueError("not a DER ECDSA signature: non-minimal length")
+    return length, pos + 1
+
+
+def _der_integer(der: bytes, pos: int) -> tuple[int, int]:
+    if pos >= len(der) or der[pos] != 0x02:
+        raise ValueError("not a DER ECDSA signature: expected an INTEGER")
+    length, pos = _der_length(der, pos + 1)
+    end = pos + length
+    if length == 0 or end > len(der):
+        raise ValueError("not a DER ECDSA signature: bad INTEGER length")
+    content = der[pos:end]
+    if content[0] & 0x80:
+        raise ValueError("not a DER ECDSA signature: negative INTEGER")
+    if len(content) > 1 and content[0] == 0 and not content[1] & 0x80:
+        raise ValueError("not a DER ECDSA signature: non-minimal INTEGER")
+    return int.from_bytes(content, "big"), end
+
+
+def check_signer(signer: C2paSigner) -> tuple[SigningAlgorithm, str, SignatureFormat]:
+    """Validates a signer's declared properties (internal).
+
+    Args:
+        signer: The signer.
+
+    Returns:
+        Its algorithm, certificate chain and signature format.
+
+    Raises:
+        TypeError: If a property has the wrong type or ``sign`` is missing.
+        ValueError: If the chain is not PEM certificates, or the format does
+            not apply to the algorithm.
+    """
+    algorithm = signer.algorithm
+    if not isinstance(algorithm, SigningAlgorithm):
+        raise TypeError("signer.algorithm must be a SigningAlgorithm")
+    chain = signer.certificate_chain_pem
+    if not isinstance(chain, str):
+        raise TypeError("signer.certificate_chain_pem must be a str")
+    if _PEM_CERTIFICATE not in chain:
+        raise ValueError("signer.certificate_chain_pem must contain PEM certificates")
+    signature_format = signer.signature_format
+    if not isinstance(signature_format, SignatureFormat):
+        raise TypeError("signer.signature_format must be a SignatureFormat")
+    if signature_format is SignatureFormat.DER and not algorithm.is_ecdsa:
+        raise ValueError(f"DER signatures apply to ECDSA only, not {algorithm.value}")
+    if not callable(getattr(signer, "sign", None)):
+        raise TypeError("signer must have a sign(data) method")
+    return algorithm, chain, signature_format
+
+
+def normalize_signature(
+    signature: object,
+    algorithm: SigningAlgorithm,
+    signature_format: SignatureFormat,
+) -> bytes:
+    """Checks a signer's output and converts it to the COSE encoding (internal).
+
+    Args:
+        signature: What the signer returned.
+        algorithm: The signer's algorithm.
+        signature_format: The signer's declared format.
+
+    Returns:
+        The signature as COSE stores it.
+
+    Raises:
+        SigningError: If the signature has the wrong type, length or encoding.
+    """
+    if not isinstance(signature, (bytes, bytearray, memoryview)):
+        raise SigningError(f"the signer returned {type(signature).__name__}, not bytes")
+    raw = bytes(memoryview(signature).cast("B"))
+    width = algorithm.ecdsa_component_bytes
+    if width is not None:
+        if signature_format is SignatureFormat.DER:
+            try:
+                return ecdsa_der_to_raw(raw, algorithm)
+            except ValueError as exc:
+                raise SigningError(
+                    f"the signer returned an invalid DER {algorithm.value} signature"
+                ) from exc
+        if len(raw) != 2 * width:
+            raise SigningError(
+                f"a raw {algorithm.value} signature must be {2 * width} bytes, got {len(raw)}"
+            )
+        return raw
+    if algorithm is SigningAlgorithm.ED25519:
+        if len(raw) != 64:
+            raise SigningError(f"an Ed25519 signature must be 64 bytes, got {len(raw)}")
+        return raw
+    low, high = _RSA_SIGNATURE_BYTES
+    if not low <= len(raw) <= high:
+        raise SigningError(
+            f"an {algorithm.value} signature must be {low} to {high} bytes, got {len(raw)}"
+        )
+    return raw
+
+
+class LocalKeySigner:
+    """A :class:`C2paSigner` that holds a private key in process memory.
+
+    Meant for development, tests and small deployments. In production, prefer
+    a signer that delegates to a KMS or HSM so that the key never enters the
+    process. Requires the ``cryptography`` package (extra ``c2pa``).
+
+    The algorithm defaults from the key: ES256, ES384 or ES512 for P-256,
+    P-384 or P-521 keys, ED25519 for Ed25519 keys and PS256 for RSA keys (pass
+    PS384 or PS512 to choose another hash). Signatures are returned as
+    :attr:`SignatureFormat.RAW`. The constructor checks that the first
+    certificate of the chain holds the key's public key.
+
+    Thread safety: safe to share between threads.
+
+    Args:
+        private_key_pem: The PEM-encoded private key (PKCS#8 or traditional).
+        certificate_chain_pem: The leaf certificate followed by any
+            intermediates, PEM-encoded (see :class:`C2paSigner`).
+        algorithm: The algorithm, or ``None`` to derive it from the key.
+        password: The password of an encrypted private key.
+
+    Raises:
+        BackendUnavailableError: If ``cryptography`` is not installed.
+        TypeError: If an argument has the wrong type.
+        ValueError: If the key or the chain cannot be loaded, the key type or
+            size does not fit the algorithm, or the leaf certificate does not
+            match the key. Messages never contain key material.
+    """
+
+    __slots__ = ("_algorithm", "_chain", "_sign")
+
+    def __init__(
+        self,
+        private_key_pem: bytes | str,
+        certificate_chain_pem: str,
+        *,
+        algorithm: SigningAlgorithm | None = None,
+        password: bytes | None = None,
+    ) -> None:
+        """Loads the key and the chain."""
+        if isinstance(private_key_pem, str):
+            private_key_pem = private_key_pem.encode("ascii", errors="strict")
+        if not isinstance(private_key_pem, bytes):
+            raise TypeError("private_key_pem must be bytes or str")
+        if not isinstance(certificate_chain_pem, str):
+            raise TypeError("certificate_chain_pem must be a str")
+        if algorithm is not None and not isinstance(algorithm, SigningAlgorithm):
+            raise TypeError("algorithm must be a SigningAlgorithm or None")
+        if password is not None and not isinstance(password, bytes):
+            raise TypeError("password must be bytes or None")
+
+        _require_cryptography()
+        from cryptography import x509  # noqa: PLC0415 - optional dependency
+        from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
+
+        try:
+            key = serialization.load_pem_private_key(private_key_pem, password=password)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("the private key could not be loaded") from exc
+        except Exception as exc:  # cryptography's UnsupportedAlgorithm
+            raise ValueError(f"the private key could not be loaded ({type(exc).__name__})") from exc
+        try:
+            certificates = x509.load_pem_x509_certificates(certificate_chain_pem.encode("ascii"))
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError("the certificate chain could not be loaded") from exc
+        if not certificates:
+            raise ValueError("the certificate chain is empty")
+
+        der = serialization.Encoding.DER
+        spki = serialization.PublicFormat.SubjectPublicKeyInfo
+        leaf_public = certificates[0].public_key().public_bytes(der, spki)
+        if leaf_public != key.public_key().public_bytes(der, spki):
+            raise ValueError("the first certificate of the chain does not match the private key")
+
+        self._algorithm, self._sign = _key_signer(key, algorithm)
+        self._chain = certificate_chain_pem
+
+    @property
+    def algorithm(self) -> SigningAlgorithm:
+        """The signature algorithm."""
+        return self._algorithm
+
+    @property
+    def certificate_chain_pem(self) -> str:
+        """The certificate chain, leaf first, PEM-encoded."""
+        return self._chain
+
+    @property
+    def signature_format(self) -> SignatureFormat:
+        """Always :attr:`SignatureFormat.RAW`."""
+        return SignatureFormat.RAW
+
+    def sign(self, data: bytes) -> bytes:
+        """Signs ``data`` with the in-process key.
+
+        Args:
+            data: The bytes to sign.
+
+        Returns:
+            The signature in the COSE encoding (``r || s`` for ECDSA).
+        """
+        return self._sign(bytes(data))
+
+    def __repr__(self) -> str:
+        """Returns a representation without key material."""
+        return f"LocalKeySigner(algorithm={self._algorithm.value!r})"
+
+
+def _require_cryptography() -> None:
+    import_optional("cryptography.hazmat.primitives", extra="c2pa", feature="LocalKeySigner")
+
+
+def _key_signer(
+    key: PrivateKeyTypes,
+    algorithm: SigningAlgorithm | None,
+) -> tuple[SigningAlgorithm, Callable[[bytes], bytes]]:
+    from cryptography.hazmat.primitives import hashes  # noqa: PLC0415 - optional dependency
+    from cryptography.hazmat.primitives.asymmetric import (  # noqa: PLC0415
+        ec,
+        ed25519,
+        padding,
+        rsa,
+    )
+
+    hash_classes: dict[str, type[hashes.SHA256 | hashes.SHA384 | hashes.SHA512]] = {
+        "sha256": hashes.SHA256,
+        "sha384": hashes.SHA384,
+        "sha512": hashes.SHA512,
+    }
+
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        by_curve = {
+            "secp256r1": SigningAlgorithm.ES256,
+            "secp384r1": SigningAlgorithm.ES384,
+            "secp521r1": SigningAlgorithm.ES512,
+        }
+        expected = by_curve.get(key.curve.name)
+        if expected is None:
+            raise ValueError("C2PA supports the P-256, P-384 and P-521 curves only")
+        if algorithm is not None and algorithm is not expected:
+            raise ValueError(f"a {key.curve.name} key signs with {expected.value} only")
+        ecdsa = ec.ECDSA(hash_classes[str(expected.hash_name)]())
+        ec_key = key
+
+        def sign_ecdsa(data: bytes) -> bytes:
+            return ecdsa_der_to_raw(ec_key.sign(data, ecdsa), expected)
+
+        return expected, sign_ecdsa
+
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        if algorithm not in (None, SigningAlgorithm.ED25519):
+            raise ValueError("an Ed25519 key signs with ed25519 only")
+        return SigningAlgorithm.ED25519, key.sign
+
+    if isinstance(key, rsa.RSAPrivateKey):
+        chosen = algorithm or SigningAlgorithm.PS256
+        if chosen not in (SigningAlgorithm.PS256, SigningAlgorithm.PS384, SigningAlgorithm.PS512):
+            raise ValueError("an RSA key signs with ps256, ps384 or ps512 only")
+        if key.key_size < 2048:
+            raise ValueError("C2PA requires RSA keys of at least 2048 bits")
+        hash_class = hash_classes[str(chosen.hash_name)]
+        pss = padding.PSS(mgf=padding.MGF1(hash_class()), salt_length=hash_class.digest_size)
+        rsa_key = key
+
+        def sign_pss(data: bytes) -> bytes:
+            return rsa_key.sign(data, pss, hash_class())
+
+        return chosen, sign_pss
+
+    raise ValueError(f"unsupported private key type {type(key).__name__}")
