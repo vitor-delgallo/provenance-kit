@@ -15,6 +15,7 @@ def test_defaults_are_valid_and_documented_values():
     assert limits.max_width == limits.max_height == 16_384
     assert limits.max_duration_seconds == 10_800.0
     assert limits.max_frames == 648_000
+    assert limits.max_image_frames == 5_000
     assert limits.max_audio_channels == 8
     assert limits.max_sample_rate == 192_000
     assert limits.subprocess_timeout_seconds == 600.0

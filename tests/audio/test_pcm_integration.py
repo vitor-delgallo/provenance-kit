@@ -7,7 +7,7 @@ import dataclasses
 import numpy as np
 import pytest
 
-from provenance_kit.audio._ffmpeg import needs_seekable_input
+from provenance_kit._ffmpeg import needs_seekable_input
 from provenance_kit.audio.pcm import decode_pcm, probe_audio
 from provenance_kit.errors import (
     MediaDecodeError,
@@ -75,6 +75,20 @@ def test_decodes_every_container(media, tools, name):
     assert audio.samples.dtype == np.float32
     assert np.abs(audio.samples).max() <= 1.0
     assert np.abs(audio.samples).max() > 0.1
+
+
+def test_flac_behind_an_id3v2_tag_decodes_as_flac(media, tools):
+    # The layout of a C2PA-signed FLAC (c2pa-rs puts the manifest in an ID3v2
+    # tag in front of the stream); here the tag holds 8 KiB of padding.
+    padding = 8192
+    size = bytes((padding >> shift) & 0x7F for shift in (21, 14, 7, 0))
+    tagged = b"ID3\x04\x00\x00" + size + b"\x00" * padding + media["flac"]
+    info = probe_audio(tagged, tools=tools)
+    assert info.container is MediaType.FLAC
+    assert info.codec == "flac"
+    audio = decode_pcm(tagged, tools=tools)
+    plain = decode_pcm(media["flac"], tools=tools)
+    assert np.array_equal(audio.samples, plain.samples)
 
 
 def test_m4a_with_trailing_moov_uses_a_temporary_file(media, tools, tmp_path):

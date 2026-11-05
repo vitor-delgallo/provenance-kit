@@ -15,7 +15,7 @@ Both the media and ffprobe's report are treated as untrusted:
   URLs or other files;
 * the media goes through a pipe, except ISO base media files whose ``moov``
   box follows the media data, which need a seekable private temporary file
-  (see :mod:`provenance_kit.video._ffmpeg`);
+  (see :mod:`provenance_kit._ffmpeg`);
 * ffprobe is asked for the few fields used here, its output is capped at
   1 MiB, and the JSON is parsed defensively: wrong types, missing fields,
   ``NaN``/``Infinity``, absurd values and too many streams are refused or
@@ -34,27 +34,28 @@ process.
 
 from __future__ import annotations
 
-import json
 import math
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-from provenance_kit._logging import get_logger
-from provenance_kit._typing import BytesLike, StrPath
-from provenance_kit.errors import ExternalToolError, MediaDecodeError, UnsupportedMediaError
-from provenance_kit.limits import MediaLimits
-from provenance_kit.mediatype import MediaType
-from provenance_kit.tools import ExternalTools, Tool
-from provenance_kit.video._ffmpeg import (
-    FFPROBE_COMMON,
-    VIDEO_CONTAINERS,
+from provenance_kit._ffmpeg import (
     StagedInput,
-    as_media_error,
-    check_video_input,
+    check_media_input,
+    json_float,
+    json_int,
+    json_name,
+    json_rate,
+    load_json_object,
+    run_ffprobe_json,
     staged_input,
 )
+from provenance_kit._logging import get_logger
+from provenance_kit._typing import BytesLike, StrPath
+from provenance_kit.errors import MediaDecodeError, UnsupportedMediaError
+from provenance_kit.limits import MediaLimits
+from provenance_kit.mediatype import MediaType
+from provenance_kit.tools import ExternalTools
 
 __all__ = ["MAX_STREAMS", "VideoInfo", "probe_video"]
 
@@ -63,12 +64,20 @@ _log = get_logger(__name__)
 #: Containers declaring more streams than this are refused.
 MAX_STREAMS = 64
 
+#: The containers the video modules accept (detected from the bytes).
+VIDEO_CONTAINERS: frozenset[MediaType] = frozenset(
+    {
+        MediaType.MP4,
+        MediaType.QUICKTIME,
+        MediaType.WEBM,
+        MediaType.MATROSKA,
+        MediaType.AVI,
+        MediaType.MPEG_TS,
+    }
+)
+
 _MAX_PROBE_OUTPUT = 1024 * 1024
-_MAX_NAME_CHARS = 64
-_MAX_NUMBER_CHARS = 32
 _MAX_FRAME_RATE = 10_000.0
-_NAME_RE = re.compile(r"^[A-Za-z0-9_.,+-]+$")
-_RATIONAL_RE = re.compile(r"^(-?\d{1,12})[/:](-?\d{1,12})$")
 
 _N = TypeVar("_N", int, float)
 
@@ -189,9 +198,8 @@ def probe_video(
     """
     limits = MediaLimits() if limits is None else limits
     tools = ExternalTools.from_env() if tools is None else tools
-    media_type = check_video_input(data, limits)
-    demuxer = VIDEO_CONTAINERS[media_type]
-    with staged_input(data, media_type, demuxer, temp_dir=temp_dir) as staged:
+    media_type = check_media_input(data, limits, VIDEO_CONTAINERS)
+    with staged_input(data, media_type, temp_dir=temp_dir) as staged:
         return probe_staged(
             staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout_seconds
         )
@@ -217,26 +225,16 @@ def probe_staged(
     Returns:
         The validated stream information.
     """
-    args = [
-        *FFPROBE_COMMON,
-        *staged.input_args(),
-        "-print_format",
-        "json",
-        "-show_entries",
-        _PROBE_ENTRIES,
-    ]
     timeout = limits.subprocess_timeout_seconds if timeout_seconds is None else timeout_seconds
-    try:
-        result = tools.run(
-            Tool.FFPROBE,
-            args,
-            stdin=staged.stdin,
-            timeout_seconds=timeout,
-            max_stdout_bytes=_MAX_PROBE_OUTPUT,
-        )
-    except ExternalToolError as exc:
-        raise as_media_error(exc, "video probe") from exc
-    return parse_probe_output(result.stdout, media_type, limits)
+    document = run_ffprobe_json(
+        staged,
+        ["-print_format", "json", "-show_entries", _PROBE_ENTRIES],
+        tools=tools,
+        what="video probe",
+        timeout_seconds=timeout,
+        max_output_bytes=_MAX_PROBE_OUTPUT,
+    )
+    return validate_probe_report(document, media_type, limits)
 
 
 def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -> VideoInfo:
@@ -256,29 +254,51 @@ def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -
         UnsupportedMediaError: If there is no video stream or too many streams.
         MediaLimitExceededError: If a declared value exceeds ``limits``.
     """
-    document = load_json_object(raw, "video probe")
+    return validate_probe_report(load_json_object(raw, "video probe"), media_type, limits)
+
+
+def validate_probe_report(
+    document: Mapping[str, Any], media_type: MediaType, limits: MediaLimits
+) -> VideoInfo:
+    """Validates ffprobe's decoded report (internal; untrusted input).
+
+    Args:
+        document: The decoded JSON object.
+        media_type: The sniffed container.
+        limits: The limits to enforce.
+
+    Returns:
+        The validated stream information.
+
+    Raises:
+        MediaDecodeError: If the report lacks required fields.
+        UnsupportedMediaError: If there is no video stream or too many streams.
+        MediaLimitExceededError: If a declared value exceeds ``limits``.
+    """
     summary = _summarize_streams(document.get("streams"))
     selected = summary.selected
     fmt = document.get("format")
     fmt = fmt if isinstance(fmt, dict) else {}
 
-    index = _int(selected.get("index"))
+    index = json_int(selected.get("index"))
     if index is None or not 0 <= index < MAX_STREAMS:
         raise MediaDecodeError("video probe: the video stream has no valid index")
-    width = _int(selected.get("width"))
-    height = _int(selected.get("height"))
+    width = json_int(selected.get("width"))
+    height = json_int(selected.get("height"))
     if width is None or height is None or width < 1 or height < 1:
         raise MediaDecodeError("video probe: the video stream declares no frame size")
     limits.check_dimensions(width, height)
 
-    duration = _non_negative(_float(fmt.get("duration")))
+    duration = _non_negative(json_float(fmt.get("duration")))
     if duration is None:
-        duration = _non_negative(_float(selected.get("duration")))
+        duration = _non_negative(json_float(selected.get("duration")))
     if duration is not None:
         limits.check_duration(duration)
 
-    frame_rate = _rate(selected.get("avg_frame_rate")) or _rate(selected.get("r_frame_rate"))
-    frame_count = _non_negative(_int(selected.get("nb_frames")))
+    frame_rate = json_rate(selected.get("avg_frame_rate"), maximum=_MAX_FRAME_RATE) or json_rate(
+        selected.get("r_frame_rate"), maximum=_MAX_FRAME_RATE
+    )
+    frame_count = _non_negative(json_int(selected.get("nb_frames")))
     if frame_count is not None:
         limits.check_frames(frame_count)
     if frame_rate is not None and duration is not None:
@@ -286,27 +306,27 @@ def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -
         if estimate > limits.max_frames:
             limits.check_frames(math.ceil(estimate))
 
-    start_time = _non_negative(_float(selected.get("start_time")))
+    start_time = _non_negative(json_float(selected.get("start_time")))
     if start_time is None or start_time > limits.max_duration_seconds:
         start_time = 0.0
 
     return VideoInfo(
         container=media_type,
-        format_name=_name(fmt.get("format_name")) or "unknown",
+        format_name=json_name(fmt.get("format_name")) or "unknown",
         duration_seconds=duration,
         width=width,
         height=height,
         rotation=_rotation(selected),
         frame_rate=frame_rate,
         frame_count=frame_count,
-        video_codec=_name(selected.get("codec_name")) or "unknown",
-        pixel_format=_name(selected.get("pix_fmt")),
+        video_codec=json_name(selected.get("codec_name")) or "unknown",
+        pixel_format=json_name(selected.get("pix_fmt")),
         audio_codec=summary.audio_codec,
         video_streams=summary.video,
         audio_streams=summary.audio,
         subtitle_streams=summary.subtitle,
         other_streams=summary.other,
-        bit_rate=_non_negative(_int(fmt.get("bit_rate"))),
+        bit_rate=_non_negative(json_int(fmt.get("bit_rate"))),
         stream_index=index,
         start_time=start_time,
     )
@@ -339,7 +359,7 @@ def _summarize_streams(streams_raw: object) -> _StreamSummary:
         kind = stream.get("codec_type")
         counts[kind if kind in ("video", "audio", "subtitle") else "other"] += 1
         if kind == "audio" and audio_codec is None:
-            audio_codec = _name(stream.get("codec_name"))
+            audio_codec = json_name(stream.get("codec_name"))
         if kind == "video" and selected is None and not _is_attached_picture(stream):
             selected = stream
     if selected is None:
@@ -354,92 +374,13 @@ def _summarize_streams(streams_raw: object) -> _StreamSummary:
     )
 
 
-# --------------------------------------------------------------------------
-# Defensive JSON helpers (also used by frames for keyframe timestamps)
-# --------------------------------------------------------------------------
-
-
-def _refuse_constant(name: str) -> Any:
-    raise ValueError(f"non-finite number {name} in the report")
-
-
-def load_json_object(raw: bytes, what: str) -> dict[str, Any]:
-    """Decodes a JSON object from untrusted tool output (internal).
-
-    Args:
-        raw: The tool's standard output.
-        what: A short, safe description for error messages.
-
-    Returns:
-        The decoded object.
-
-    Raises:
-        MediaDecodeError: If the output is not a UTF-8 JSON object.
-    """
-    try:
-        document = json.loads(raw.decode("utf-8"), parse_constant=_refuse_constant)
-    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-        raise MediaDecodeError(f"{what}: the tool report is not valid JSON") from exc
-    if not isinstance(document, dict):
-        raise MediaDecodeError(f"{what}: the tool report is not a JSON object")
-    return document
-
-
 def _is_attached_picture(stream: Mapping[str, Any]) -> bool:
     disposition = stream.get("disposition")
-    return isinstance(disposition, dict) and _int(disposition.get("attached_pic")) == 1
+    return isinstance(disposition, dict) and json_int(disposition.get("attached_pic")) == 1
 
 
 def _non_negative(value: _N | None) -> _N | None:
     return value if value is not None and value >= 0 else None
-
-
-def _int(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and 0 < len(value) <= _MAX_NUMBER_CHARS:
-        try:
-            return int(value.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _float(value: object) -> float | None:
-    if isinstance(value, bool):
-        return None
-    number: float
-    if isinstance(value, (int, float)):
-        number = float(value)
-    elif isinstance(value, str) and 0 < len(value) <= _MAX_NUMBER_CHARS:
-        try:
-            number = float(value.strip())
-        except ValueError:
-            return None
-    else:
-        return None
-    return number if math.isfinite(number) else None
-
-
-def _rate(value: object) -> float | None:
-    if not isinstance(value, str):
-        return None
-    match = _RATIONAL_RE.match(value.strip())
-    if match is None:
-        return None
-    num, den = int(match.group(1)), int(match.group(2))
-    if num <= 0 or den <= 0:
-        return None
-    rate = num / den
-    return rate if 0.0 < rate <= _MAX_FRAME_RATE else None
-
-
-def _name(value: object) -> str | None:
-    if not isinstance(value, str) or not value or len(value) > _MAX_NAME_CHARS:
-        return None
-    return value if _NAME_RE.match(value) else None
 
 
 def _rotation(stream: Mapping[str, Any]) -> int:
@@ -449,7 +390,7 @@ def _rotation(stream: Mapping[str, Any]) -> int:
     if isinstance(side_data, list):
         for entry in side_data[:16]:
             if isinstance(entry, dict):
-                value = _float(entry.get("rotation"))
+                value = json_float(entry.get("rotation"))
                 if value is not None:
                     # ffprobe reports the display matrix rotation
                     # counterclockwise; ffmpeg's autorotate turns the frame by
@@ -459,7 +400,7 @@ def _rotation(stream: Mapping[str, Any]) -> int:
     if degrees is None:
         tags = stream.get("tags")
         if isinstance(tags, dict):
-            degrees = _float(tags.get("rotate"))  # legacy tag: clockwise
+            degrees = json_float(tags.get("rotate"))  # legacy tag: clockwise
     if degrees is None or abs(degrees) > 3600:
         return 0
     quarter = round(degrees / 90.0)

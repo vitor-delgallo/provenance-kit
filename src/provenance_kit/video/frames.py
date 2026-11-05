@@ -54,6 +54,16 @@ from dataclasses import dataclass, field
 import numpy as np
 import numpy.typing as npt
 
+from provenance_kit._checks import check_int, check_number
+from provenance_kit._ffmpeg import (
+    FFMPEG_COMMON,
+    StagedInput,
+    as_media_error,
+    check_media_input,
+    json_float,
+    run_ffprobe_json,
+    staged_input,
+)
 from provenance_kit._logging import get_logger
 from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.errors import (
@@ -66,17 +76,7 @@ from provenance_kit.errors import (
 from provenance_kit.limits import MediaLimits
 from provenance_kit.mediatype import MediaType
 from provenance_kit.tools import ExternalTools, Tool
-from provenance_kit.video._checks import check_int, check_number
-from provenance_kit.video._ffmpeg import (
-    FFMPEG_COMMON,
-    FFPROBE_COMMON,
-    VIDEO_CONTAINERS,
-    StagedInput,
-    as_media_error,
-    check_video_input,
-    staged_input,
-)
-from provenance_kit.video.probe import VideoInfo, load_json_object, probe_staged
+from provenance_kit.video.probe import VIDEO_CONTAINERS, VideoInfo, probe_staged
 
 __all__ = [
     "MAX_SAMPLING_FPS",
@@ -233,7 +233,7 @@ def iter_frames(
         check_int("max_side", max_side, minimum=1)
     limits = MediaLimits() if limits is None else limits
     tools = ExternalTools.from_env() if tools is None else tools
-    media_type = check_video_input(data, limits)
+    media_type = check_media_input(data, limits, VIDEO_CONTAINERS)
     return _generate(
         data,
         media_type=media_type,
@@ -326,8 +326,7 @@ def _generate(
     temp_dir: StrPath | None,
     timeout_seconds: float | None,
 ) -> Iterator[VideoFrame]:
-    demuxer = VIDEO_CONTAINERS[media_type]
-    with staged_input(data, media_type, demuxer, temp_dir=temp_dir) as staged:
+    with staged_input(data, media_type, temp_dir=temp_dir) as staged:
         info = probe_staged(
             staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout_seconds
         )
@@ -463,25 +462,23 @@ def _keyframe_times(
     timeout_seconds: float | None,
 ) -> list[float]:
     """Lists the key frame timestamps with ffprobe (decodes key frames only)."""
-    args = [
-        *FFPROBE_COMMON,
-        *staged.input_args("-skip_frame", "nokey"),
-        "-select_streams",
-        str(info.stream_index),
-        "-show_entries",
-        "frame=best_effort_timestamp_time",
-        "-print_format",
-        "json",
-    ]
     timeout = limits.subprocess_timeout_seconds if timeout_seconds is None else timeout_seconds
-    cap = (limits.max_frames + 1) * _KEYFRAME_ENTRY_BYTES + 4096
-    try:
-        result = tools.run(
-            Tool.FFPROBE, args, stdin=staged.stdin, timeout_seconds=timeout, max_stdout_bytes=cap
-        )
-    except ExternalToolError as exc:
-        raise as_media_error(exc, "key frame listing") from exc
-    document = load_json_object(result.stdout, "key frame listing")
+    document = run_ffprobe_json(
+        staged,
+        [
+            "-select_streams",
+            str(info.stream_index),
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-print_format",
+            "json",
+        ],
+        tools=tools,
+        what="key frame listing",
+        timeout_seconds=timeout,
+        max_output_bytes=(limits.max_frames + 1) * _KEYFRAME_ENTRY_BYTES + 4096,
+        before_input=("-skip_frame", "nokey"),
+    )
     frames = document.get("frames")
     if not isinstance(frames, list):
         raise MediaDecodeError("key frame listing: the report lists no frames")
@@ -491,7 +488,7 @@ def _keyframe_times(
     previous = info.start_time
     for entry in frames:
         value = entry.get("best_effort_timestamp_time") if isinstance(entry, dict) else None
-        seconds = _parse_seconds(value)
+        seconds = json_float(value)
         if seconds is None:
             # A key frame without a timestamp: keep the sequence aligned with
             # the decoded frames by repeating the previous time.
@@ -499,16 +496,6 @@ def _keyframe_times(
         previous = seconds
         times.append(max(seconds - info.start_time, 0.0))
     return times
-
-
-def _parse_seconds(value: object) -> float | None:
-    if not isinstance(value, str) or not 0 < len(value) <= 32:
-        return None
-    try:
-        seconds = float(value)
-    except ValueError:
-        return None
-    return seconds if math.isfinite(seconds) else None
 
 
 def _timestamp(

@@ -32,7 +32,10 @@ Example::
 Alignment matters: the models are sensitive to sample-level time shifts, so
 publish in containers that record the encoder delay (AAC in MP4/M4A, MP3
 files with the LAME/Info tag, Ogg Opus, FLAC) and check the real pipeline
-with :func:`embed_verified`. Robustness numbers measured with real codecs are
+with :func:`embed_verified`. For audio that went through a pipeline that
+does not record the delay (raw ADTS AAC, MP3 written to a pipe), pass
+``alignment=AlignmentSearch()`` to :func:`detect_watermark`: an opt-in,
+bounded and slower search over sample offsets. Robustness numbers measured with real codecs are
 in ``docs/audio.md``.
 
 Thread safety: :class:`AudioSealBackend` can be shared between threads
@@ -44,6 +47,8 @@ from __future__ import annotations
 
 from provenance_kit.audio.watermark._api import (
     DEFAULT_DETECTION_THRESHOLD,
+    MAX_ALIGNMENT_CANDIDATES,
+    AlignmentSearch,
     AudioEncoder,
     VerifiedAudioEmbedding,
     detect_watermark,
@@ -59,13 +64,13 @@ from provenance_kit.audio.watermark._audioseal import (
     AudioSealBackend,
     download_audioseal_models,
 )
-from provenance_kit.audio.watermark._weights import MODEL_DIR_ENV, ModelFile
 from provenance_kit.audio.watermark.base import (
     AudioScores,
     AudioWatermarkBackend,
     AudioWatermarkDetection,
     Samples,
 )
+from provenance_kit.modelfiles import MODEL_DIR_ENV, ModelFile
 
 __all__ = [
     "AUDIOSEAL_DETECTOR",
@@ -74,7 +79,9 @@ __all__ = [
     "AUDIOSEAL_REVISION",
     "AUDIOSEAL_SAMPLE_RATE",
     "DEFAULT_DETECTION_THRESHOLD",
+    "MAX_ALIGNMENT_CANDIDATES",
     "MODEL_DIR_ENV",
+    "AlignmentSearch",
     "AudioEncoder",
     "AudioScores",
     "AudioSealBackend",

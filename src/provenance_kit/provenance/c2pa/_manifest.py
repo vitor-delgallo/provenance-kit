@@ -14,8 +14,12 @@ specifications:
   ``c2pa.metadata``;
 * ``c2pa.soft-binding`` (C2PA 2.3, section 18.10).
 
-Every assertion built here is listed in the claim's ``created_assertions``:
-the signer attests to it (C2PA 2.3, section 10.2.2).
+Each assertion is listed either in the claim's ``created_assertions`` (the
+signer attests to it) or in its ``gathered_assertions`` (the claim
+generator received it from another part of the workflow, such as a person,
+and it is not attributed to the signer), as :class:`AssertionPlacements`
+says (C2PA 2.3, section 10.2.2). The library always lists the hard binding
+(``c2pa.hash.*``) as created.
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ from provenance_kit.provenance.c2pa._json import JsonObject, JsonValue
 
 __all__ = [
     "ActionType",
+    "AssertionPlacement",
+    "AssertionPlacements",
     "DigitalSourceType",
     "GeneratorInfo",
     "Ingredient",
@@ -141,6 +147,52 @@ class TrainingMiningKey(enum.StrEnum):
     """Training non-generative AI/ML models (for example classifiers)."""
     AI_GENERATIVE_TRAINING = "cawg.ai_generative_training"
     """Training AI/ML models that generate new assets."""
+
+
+class AssertionPlacement(enum.StrEnum):
+    """Where the claim lists an assertion (C2PA 2.3, section 10.2.2)."""
+
+    CREATED = "created"
+    """In ``created_assertions``: made by the claim generator and attributed
+    to the signer ("All created_assertions are attributed to the signer")."""
+    GATHERED = "gathered"
+    """In ``gathered_assertions``: provided to the claim generator by another
+    component of the workflow, for example information entered by a person;
+    part of the claim, but "not attributed to the signer"."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AssertionPlacements:
+    """The placement of each assertion that :class:`ManifestSpec` writes.
+
+    The defaults follow who vouches for the content: the actions, the
+    training and data mining policy and the soft binding describe what the
+    signing application did or decided, so the signer attests to them
+    (created); author names are supplied by people, so they are listed as
+    gathered. Move an assertion to the other list when your workflow differs,
+    for example ``authors=AssertionPlacement.CREATED`` when the signer has
+    verified the authorship.
+
+    Attributes:
+        actions: ``c2pa.actions`` (default: created).
+        authors: ``cawg.metadata`` with the authors (default: gathered).
+        training_mining: ``cawg.training-mining`` (default: created).
+        soft_binding: ``c2pa.soft-binding`` (default: created).
+
+    Raises:
+        TypeError: If a field is not an :class:`AssertionPlacement`.
+    """
+
+    actions: AssertionPlacement = AssertionPlacement.CREATED
+    authors: AssertionPlacement = AssertionPlacement.GATHERED
+    training_mining: AssertionPlacement = AssertionPlacement.CREATED
+    soft_binding: AssertionPlacement = AssertionPlacement.CREATED
+
+    def __post_init__(self) -> None:
+        """Validates the fields."""
+        for name in ("actions", "authors", "training_mining", "soft_binding"):
+            if not isinstance(getattr(self, name), AssertionPlacement):
+                raise TypeError(f"{name} must be an AssertionPlacement")
 
 
 class IngredientRelationship(enum.StrEnum):
@@ -479,14 +531,18 @@ class ManifestSpec:
         actions: The actions, in order.
         title: The asset's title (``dc:title``), if any.
         authors: Author or creator names, written as ``dc:creator`` in a
-            ``cawg.metadata`` assertion. These are statements by the signer,
-            not identity proofs: a CAWG identity assertion, signed by the
-            named actor, is out of scope.
+            ``cawg.metadata`` assertion. By default the assertion is gathered
+            (see :attr:`placements`): the names are human-supplied
+            statements, not identity proofs (a CAWG identity assertion,
+            signed by the named actor, is out of scope).
         training_mining: A ``cawg.training-mining`` policy, for example
             :meth:`TrainingMiningPolicy.not_allowed`; ``None`` adds none.
         soft_binding: A ``c2pa.soft-binding`` assertion linking an invisible
             watermark to this manifest.
         ingredients: The assets this one was made from.
+        placements: Whether each assertion is created (attested by the
+            signer) or gathered; see :class:`AssertionPlacements` for the
+            defaults.
 
     Raises:
         TypeError: If a field has the wrong type.
@@ -500,9 +556,12 @@ class ManifestSpec:
     training_mining: TrainingMiningPolicy | None = None
     soft_binding: SoftBinding | None = None
     ingredients: tuple[Ingredient, ...] = ()
+    placements: AssertionPlacements = field(default_factory=AssertionPlacements)
 
     def __post_init__(self) -> None:
         """Validates the specification."""
+        if not isinstance(self.placements, AssertionPlacements):
+            raise TypeError("placements must be an AssertionPlacements")
         if not isinstance(self.claim_generator, GeneratorInfo):
             raise TypeError("claim_generator must be a GeneratorInfo")
         object.__setattr__(self, "actions", _typed_tuple("actions", self.actions, ManifestAction))
@@ -609,12 +668,16 @@ def build_definition(
             linked = parent_ids
         actions.append(action.to_json(linked))
 
-    assertions: list[JsonValue] = [_assertion(ACTIONS_LABEL, {"actions": actions})]
+    placements = spec.placements
+    assertions: list[JsonValue] = [
+        _assertion(ACTIONS_LABEL, {"actions": actions}, placements.actions)
+    ]
     if spec.authors:
         assertions.append(
             _assertion(
                 CAWG_METADATA_LABEL,
                 {"@context": {"dc": DUBLIN_CORE_NAMESPACE}, "dc:creator": list(spec.authors)},
+                placements.authors,
                 kind="Json",
             )
         )
@@ -625,9 +688,13 @@ def build_definition(
             if entry.constraint_info is not None:
                 value["constraint_info"] = entry.constraint_info
             entries[str(entry.key)] = value
-        assertions.append(_assertion(TRAINING_MINING_LABEL, {"entries": entries}))
+        assertions.append(
+            _assertion(TRAINING_MINING_LABEL, {"entries": entries}, placements.training_mining)
+        )
     if spec.soft_binding is not None:
-        assertions.append(_assertion(SOFT_BINDING_LABEL, spec.soft_binding.to_json()))
+        assertions.append(
+            _assertion(SOFT_BINDING_LABEL, spec.soft_binding.to_json(), placements.soft_binding)
+        )
 
     definition: JsonObject = {
         "claim_generator_info": [spec.claim_generator.to_json()],
@@ -653,8 +720,18 @@ def build_definition(
     return definition, sources
 
 
-def _assertion(label: str, data: JsonObject, *, kind: str | None = None) -> JsonObject:
-    assertion: JsonObject = {"label": label, "created": True, "data": data}
+def _assertion(
+    label: str,
+    data: JsonObject,
+    placement: AssertionPlacement,
+    *,
+    kind: str | None = None,
+) -> JsonObject:
+    # c2pa-rs (0.91) lists an assertion defined with "created": false in the
+    # claim's gathered_assertions, and one with "created": true in
+    # created_assertions (checked by the integration tests).
+    created = placement is AssertionPlacement.CREATED
+    assertion: JsonObject = {"label": label, "created": created, "data": data}
     if kind is not None:
         assertion["kind"] = kind
     return assertion

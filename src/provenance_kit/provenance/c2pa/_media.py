@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from provenance_kit._logging import get_logger
 from provenance_kit.errors import UnsupportedMediaError
-from provenance_kit.mediatype import SNIFF_BYTES, MediaType, sniff_media_type
+from provenance_kit.mediatype import MediaType, sniff_media_type
 
 __all__ = ["SUPPORTED_MEDIA_TYPES", "parse_media_type", "resolve_media_type"]
 
@@ -108,7 +108,8 @@ def resolve_media_type(data: bytes, declared: str | MediaType | None) -> MediaTy
     The bytes decide: the declared type is accepted only when it names the
     detected container (or another ISO BMFF brand, which c2pa-rs handles
     alike). A FLAC stream behind an ID3v2 tag, which is how c2pa-rs embeds
-    manifests in FLAC, is detected as FLAC rather than MP3.
+    manifests in FLAC, is detected as FLAC rather than MP3
+    (:func:`provenance_kit.mediatype.sniff_media_type` looks past the tag).
 
     Args:
         data: The media.
@@ -125,8 +126,6 @@ def resolve_media_type(data: bytes, declared: str | MediaType | None) -> MediaTy
     sniffed = sniff_media_type(data)
     if sniffed is None:
         raise UnsupportedMediaError("unrecognized media type")
-    if sniffed is MediaType.MP3 and _id3_wrapped_type(data) is MediaType.FLAC:
-        sniffed = MediaType.FLAC
     if sniffed not in SUPPORTED_MEDIA_TYPES:
         raise UnsupportedMediaError(f"media type {sniffed.mime} is not supported for C2PA")
     if declared is None:
@@ -138,20 +137,3 @@ def resolve_media_type(data: bytes, declared: str | MediaType | None) -> MediaTy
             f"the declared media type {media_type.mime} does not match the content ({sniffed.mime})"
         )
     return media_type
-
-
-def _id3_wrapped_type(data: bytes) -> MediaType | None:
-    """Sniffs what follows a leading ID3v2 tag, if there is one."""
-    if len(data) < 10 or data[:3] != b"ID3":
-        return None
-    size_bytes = data[6:10]
-    if any(byte & 0x80 for byte in size_bytes):  # synchsafe integers have bit 7 clear
-        return None
-    size = 0
-    for byte in size_bytes:
-        size = (size << 7) | byte
-    footer = 10 if data[5] & 0x10 else 0
-    start = 10 + size + footer
-    if start >= len(data):
-        return None
-    return sniff_media_type(data[start : start + SNIFF_BYTES])

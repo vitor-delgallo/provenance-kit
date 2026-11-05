@@ -6,13 +6,12 @@ import hashlib
 import io
 import math
 import sysconfig
-import urllib.error
-import urllib.request
 
 import numpy as np
 import pytest
 from PIL import Image
 
+from provenance_kit import modelfiles
 from provenance_kit.detection import WatermarkDetection
 from provenance_kit.errors import (
     BackendUnavailableError,
@@ -279,50 +278,58 @@ def test_model_dir_inside_site_packages_is_refused(tmp_path):
         TrustMarkBackend(model_dir=inside)
 
 
-def test_missing_and_tampered_model_files(tmp_path):
-    spec = ModelFile("model.bin", 4, hashlib.sha256(b"good").hexdigest())
-    with pytest.raises(ModelLoadError, match=r"model\.bin") as missing:
-        _trustmark._read_verified(tmp_path, spec)
-    assert str(tmp_path) not in str(missing.value)
-    (tmp_path / "model.bin").write_bytes(b"evil")
-    with pytest.raises(ModelLoadError, match="SHA-256") as tampered:
-        _trustmark._read_verified(tmp_path, spec)
-    assert str(tmp_path) not in str(tampered.value)
-    (tmp_path / "model.bin").write_bytes(b"good-and-longer")
-    with pytest.raises(ModelLoadError):
-        _trustmark._read_verified(tmp_path, spec)
-    (tmp_path / "model.bin").write_bytes(b"good")
-    assert _trustmark._read_verified(tmp_path, spec) == b"good"
+def test_model_files_come_from_the_cdn():
+    for files in MODEL_FILES.values():
+        for spec in files:
+            assert isinstance(spec, ModelFile)
+            assert spec.url == watermark.MODEL_BASE_URL + spec.name
+
+
+class FakeCdn:
+    """Stands in for the model CDN: serves bytes by URL and records requests."""
+
+    def __init__(self, content: dict[str, bytes]) -> None:
+        self.content = content
+        self.fetched: list[str] = []
+
+    def open(self, request, timeout):
+        name = request.full_url.rsplit("/", 1)[1]
+        self.fetched.append(name)
+        return io.BytesIO(self.content[name])
 
 
 @pytest.fixture
 def fake_files(monkeypatch):
     content = {"cfg.yaml": b"config", "enc.ckpt": b"encoder", "dec.ckpt": b"decoder"}
-    specs = tuple(ModelFile(n, len(d), hashlib.sha256(d).hexdigest()) for n, d in content.items())
+    specs = tuple(
+        ModelFile(
+            name=name,
+            url=watermark.MODEL_BASE_URL + name,
+            sha256=hashlib.sha256(data).hexdigest(),
+            size=len(data),
+        )
+        for name, data in content.items()
+    )
     monkeypatch.setattr(_trustmark, "MODEL_FILES", {TrustMarkVariant.Q: specs})
-    fetched = []
-
-    def fetch(url, size, timeout):
-        name = url.rsplit("/", 1)[1]
-        fetched.append(name)
-        return content[name]
-
-    monkeypatch.setattr(_trustmark, "_fetch", fetch)
-    return content, fetched
+    cdn = FakeCdn(content)
+    monkeypatch.setattr(modelfiles.urllib.request, "build_opener", lambda *handlers: cdn)
+    return content, cdn
 
 
 def test_download_writes_verified_files_once(tmp_path, fake_files):
-    content, fetched = fake_files
+    content, cdn = fake_files
     directory = download_trustmark_models(model_dir=tmp_path / "models")
+    assert directory == (tmp_path / "models").resolve()
     assert sorted(p.name for p in directory.iterdir()) == sorted(content)
     assert (directory / "enc.ckpt").read_bytes() == b"encoder"
     download_trustmark_models(model_dir=tmp_path / "models")
-    assert sorted(fetched) == sorted(content)  # nothing fetched the second time
+    assert sorted(cdn.fetched) == sorted(content)  # nothing fetched the second time
 
 
-def test_download_refuses_bad_content(tmp_path, fake_files, monkeypatch):
-    monkeypatch.setattr(_trustmark, "_fetch", lambda url, size, timeout: b"tampered")
-    with pytest.raises(ModelLoadError, match="failed its check"):
+def test_download_refuses_bad_content(tmp_path, fake_files):
+    _, cdn = fake_files
+    cdn.content = {name: b"x" * len(data) for name, data in cdn.content.items()}
+    with pytest.raises(ModelLoadError, match="failed its SHA-256 check"):
         download_trustmark_models(model_dir=tmp_path)
     assert list(tmp_path.iterdir()) == []
 
@@ -336,11 +343,20 @@ def test_download_argument_validation(tmp_path):
         download_trustmark_models(model_dir=tmp_path, timeout_seconds="5")  # type: ignore[arg-type]
 
 
-def test_redirects_away_from_https_are_refused():
-    handler = _trustmark._HttpsOnlyRedirects()
-    request = urllib.request.Request("https://example.invalid/model")
-    with pytest.raises(urllib.error.URLError):
-        handler.redirect_request(request, None, 302, "Found", {}, "http://example.invalid/model")
+def test_print_is_silenced_in_trustmark_modules_only(monkeypatch):
+    import builtins
+    import sys
+    import types
+
+    original = builtins.print
+    fake = {name: types.ModuleType(name) for name in ("trustmark", "trustmark.model")}
+    unrelated = types.ModuleType("trustmarkish")
+    for name, module in {**fake, "trustmarkish": unrelated}.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    _trustmark._silence_trustmark()
+    assert all(module.print is _trustmark._quiet_print for module in fake.values())
+    assert not hasattr(unrelated, "print")
+    assert builtins.print is original
 
 
 def test_configuration_targets_are_restricted():

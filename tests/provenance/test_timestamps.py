@@ -18,6 +18,7 @@ import pytest
 from provenance_kit.errors import BackendUnavailableError, UnsupportedMediaError
 from provenance_kit.provenance.timestamps import (
     DEFAULT_CALENDARS,
+    DEFAULT_MIN_CALENDARS,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_UPGRADE_ALLOWLIST,
     AttestationCheck,
@@ -84,7 +85,13 @@ def test_defaults_are_the_official_clients():
     assert DEFAULT_TIMEOUT_SECONDS == 5.0
     timestamper = OpenTimestamper()
     assert timestamper.calendars == DEFAULT_CALENDARS
-    assert timestamper.min_calendars == 1
+    assert timestamper.min_calendars == DEFAULT_MIN_CALENDARS == 2
+
+
+def test_a_single_calendar_needs_an_explicit_minimum():
+    with pytest.raises(ValueError, match="min_calendars=1"):
+        OpenTimestamper(("https://my-calendar.example",))
+    assert OpenTimestamper(("https://my-calendar.example",), min_calendars=1).min_calendars == 1
 
 
 @pytest.mark.parametrize(
@@ -117,7 +124,7 @@ def test_configuration_is_validated(kwargs, error):
 
 
 def test_upgrade_allow_list_matching():
-    timestamper = OpenTimestamper(("https://my-calendar.example:8443",))
+    timestamper = OpenTimestamper(("https://my-calendar.example:8443",), min_calendars=1)
     allowed = timestamper._upgrade_allowed
     assert allowed("https://alice.btc.calendar.opentimestamps.org")
     assert allowed("https://finney.calendar.eternitywall.com")
@@ -142,7 +149,9 @@ def block_module(monkeypatch, name: str) -> None:
 def test_stamp_validates_the_digest_before_loading_the_library(monkeypatch):
     block_module(monkeypatch, "opentimestamps")
     # A closed local port: nothing can leave the machine even if the guard failed.
-    timestamper = OpenTimestamper(("http://127.0.0.1:9",), allow_insecure_http=True)
+    timestamper = OpenTimestamper(
+        ("http://127.0.0.1:9",), min_calendars=1, allow_insecure_http=True
+    )
     with pytest.raises(TypeError):
         timestamper.stamp("00" * 32)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="32 bytes"):

@@ -8,12 +8,12 @@ from dataclasses import dataclass, field
 import numpy as np
 import numpy.typing as npt
 
+from provenance_kit._checks import check_number
 from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.bits import hamming_distance, normalize_bits
 from provenance_kit.limits import MediaLimits
 from provenance_kit.payload import DecodedPayload, PayloadCodec
 from provenance_kit.tools import ExternalTools
-from provenance_kit.video._checks import check_number
 from provenance_kit.video.frames import FrameSampling, iter_frames
 from provenance_kit.video.watermark.base import (
     Frame,

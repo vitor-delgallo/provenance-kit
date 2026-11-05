@@ -37,16 +37,23 @@ def probe_json(**stream_overrides: Any) -> bytes:
 
 
 class FakeProcess:
-    """Mimics ToolProcess for canned standard output."""
+    """Mimics ToolProcess for canned standard output (with its output cap)."""
 
-    def __init__(self, output: bytes) -> None:
+    def __init__(self, output: bytes, max_stdout_bytes: int | None = None) -> None:
         self._output = output
         self._pos = 0
+        self._cap = max_stdout_bytes
         self.tool = "ffmpeg"
+        self.bytes_read = 0
+        self.output_limit_exceeded = False
 
     def read(self, size: int = 65536) -> bytes:
         chunk = self._output[self._pos : self._pos + size]
         self._pos += len(chunk)
+        self.bytes_read += len(chunk)
+        if self._cap is not None and self.bytes_read > self._cap:
+            self.output_limit_exceeded = True
+            raise ExternalToolError(self.tool, "output exceeded the limit")
         return chunk
 
     def iter_chunks(self, size: int = 65536) -> Iterator[bytes]:
@@ -105,7 +112,7 @@ class FakeTools:
     def stream(self, tool: Tool | str, args: list[str], **kwargs: Any) -> Iterator[FakeProcess]:
         name = Tool(tool).value
         self.calls.append((name, list(args), kwargs))
-        yield FakeProcess(self._ffmpeg)
+        yield FakeProcess(self._ffmpeg, kwargs.get("max_stdout_bytes"))
         if self._ffmpeg_returncode:
             raise ExternalToolError(name, "failed", returncode=self._ffmpeg_returncode)
 

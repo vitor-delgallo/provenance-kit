@@ -30,6 +30,8 @@ CORE_MODULES = [
     *(
         f"provenance_kit.{name}"
         for name in (
+            "_checks",
+            "_ffmpeg",
             "bits",
             "detection",
             "device",
@@ -37,6 +39,7 @@ CORE_MODULES = [
             "limits",
             "matching",
             "mediatype",
+            "modelfiles",
             "payload",
             "tempfiles",
             "tools",

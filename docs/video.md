@@ -8,7 +8,7 @@ embeds or detects Meta's VideoSeal invisible watermark on decoded frames.
 |---|---|---|
 | `provenance_kit.video.probe` | `probe_video` → `VideoInfo` (duration, size, rotation, frame rate, codecs, stream counts) | `ffprobe` |
 | `provenance_kit.video.frames` | `iter_frames` / `extract_frames`: RGB frames with timestamps, at a fixed rate, at key frames or all | `ffmpeg`, `ffprobe` |
-| `provenance_kit.video.fingerprint` | `VideoFingerprint` (PDQ per sampled frame), `fingerprint_video`, `match_fingerprints` | extra `video` + binaries |
+| `provenance_kit.video.fingerprint` | `VideoFingerprint` (PDQ per sampled frame), `fingerprint_video`, `match_fingerprints` | binaries (PDQ is in the core install; extra `pdq-native` for the C++ backend) |
 | `provenance_kit.video.watermark` | `VideoSealBackend`, `RepetitionCode`, `embed_watermark`, `detect_watermark`, `embed_verified` | extra `video-watermark` |
 
 Binaries are located with `ExternalTools` (`PROVENANCE_KIT_FFMPEG`,
@@ -20,15 +20,17 @@ Binaries are located with `ExternalTools` (`PROVENANCE_KIT_FFMPEG`,
 from provenance_kit.video.frames import FrameSampling, iter_frames
 from provenance_kit.video.probe import probe_video
 
-info = probe_video(data)                        # data: bytes of an upload
+info = probe_video(data)  # data: bytes of an upload
 for frame in iter_frames(data, fps=1.0, max_side=512):
-    frame.index, frame.timestamp, frame.image   # image: uint8 (h, w, 3), RGB, read-only
+    frame.index, frame.timestamp, frame.image  # image: uint8 (h, w, 3), RGB, read-only
 ```
 
 **Untrusted input.** The container is detected from the bytes (MP4,
 QuickTime, WebM, Matroska, AVI, MPEG-TS) and passed to the tools explicitly
 (`-f mov`, ...), with `-protocol_whitelist pipe` so the media cannot make
-ffmpeg open URLs or files. ffprobe's JSON report is parsed defensively: wrong
+ffmpeg open URLs or files. This plumbing (input staging, the mandatory
+arguments, the defensive report parsing) is shared with the audio modules in
+the core's private `provenance_kit._ffmpeg` module. ffprobe's JSON report is parsed defensively: wrong
 types, `NaN`/`Infinity`, out-of-range values, cover-art streams and more than
 64 streams are ignored or refused. Failures of the tools on bad media become
 `MediaDecodeError`; timeouts kill the whole process tree.
@@ -68,11 +70,13 @@ output size, so a stream that changes resolution cannot inflate the records.
 
 ```python
 from provenance_kit.video.fingerprint import (
-    VideoFingerprint, fingerprint_video, match_fingerprints,
+    VideoFingerprint,
+    fingerprint_video,
+    match_fingerprints,
 )
 
-reference = fingerprint_video(original_bytes)   # 1 frame per second, PDQ
-stored = reference.to_bytes()                   # 33 bytes per second + 20-byte header
+reference = fingerprint_video(original_bytes)  # 1 frame per second, PDQ
+stored = reference.to_bytes()  # 33 bytes per second + 20-byte header
 query = fingerprint_video(clip_bytes)
 match = match_fingerprints(query, VideoFingerprint.from_bytes(stored))
 match.is_match, match.offset_seconds, match.matched_frames, match.similarity
@@ -132,15 +136,19 @@ restricts the search.
 ```python
 from provenance_kit import PayloadCodec
 from provenance_kit.video.watermark import (
-    RepetitionCode, VideoSealBackend, detect_watermark, embed_verified,
+    RepetitionCode,
+    VideoSealBackend,
+    detect_watermark,
+    embed_verified,
 )
 
-backend = VideoSealBackend(model_dir="/srv/models/videoseal", strength=0.5)
-code = RepetitionCode(copies=4)                                   # 64 data bits
+backend = VideoSealBackend(model_dir="/srv/models/videoseal")  # strength 0.5
+code = RepetitionCode(copies=4)  # 64 data bits
 codec = PayloadCodec(code.data_bits, version_bits=4, check_bits=12)
-result = embed_verified(frames, codec.encode(42), encoder=my_encoder,
-                        backend=backend, repetition=code, codec=codec)
-result.verified, result.bit_errors, result.encoded                 # bytes from my_encoder
+result = embed_verified(
+    frames, codec.encode(42), encoder=my_encoder, backend=backend, repetition=code, codec=codec
+)
+result.verified, result.bit_errors, result.encoded  # bytes from my_encoder
 ```
 
 **Model.** The official VideoSeal v1.0 TorchScript model, 256 bits
@@ -155,10 +163,13 @@ The URL is the one documented in the repository's
 upstream publishes no checksum, so the SHA-256 was computed on 2026-11-05
 from the file served there (`Last-Modified: Wed, 02 Apr 2025`). The backend
 verifies it before loading and raises `ModelLoadError` on a mismatch.
-`model_dir` defaults to `$PROVENANCE_KIT_MODEL_DIR/videoseal` or
-`~/.cache/provenance-kit/videoseal`; nothing is downloaded unless
-`download=True` is passed or `download_videoseal_model()` is called.
-Pre-provisioned directories work offline.
+`model_dir` defaults to `$PROVENANCE_KIT_MODEL_DIR/videoseal` or, without
+the variable, `provenance-kit/models/videoseal` in the per-user cache
+directory (`provenance_kit.modelfiles.default_model_dir`), and is refused
+inside `site-packages`; nothing is downloaded unless `download=True` is
+passed or `download_videoseal_model()` is called (which keeps a valid file
+and replaces a missing or invalid one). Pre-provisioned directories work
+offline.
 
 **Decoded media only** (decision 2): frames in, frames out; the application
 encodes. `embed_verified` streams the watermarked frames into the caller's
@@ -188,18 +199,30 @@ decides; failing that, a weak heuristic on the score magnitude does.
 `36 * width * height * batch_frames` bytes (about 1.2 GB for 16 frames of
 1080p on CPU). Both `embed_frames` and `score_frames` stream.
 
-**Measured robustness** (320x240, 24 frames at 24 fps, 64-bit payload with 4
-copies, LGPL ffmpeg 8.1 encoders: `libopenh264` and `libvpx-vp9`;
-`tests/video/test_watermark_integration.py`). Each cell: channel bit accuracy,
-payload bit errors out of 64, detection.
+**Strength.** `strength` is the model's blending factor (`scaling_w`). The
+default is **0.5** (`VIDEOSEAL_DEFAULT_STRENGTH`); the model's built-in value
+is 0.2 (`strength=None` keeps it). The default was chosen by measurement, on
+the rule "0.5 if it keeps the PSNR at or above 40 dB on the textured test
+content": it does (41.5 dB), and it is the setting that survives the codecs
+below.
 
-| Content | Encoding | Strength 0.2 (upstream default) | Strength 0.5 |
+**Measured robustness** (measured on 2026-11-05: 320x240, 24 frames at 24
+fps, 64-bit payload with 4 copies, LGPL ffmpeg 8.1 encoders `libopenh264` and
+`libvpx-vp9`; `tests/video/test_watermark_integration.py`, run with `-s`).
+PSNR is between the watermarked and the original frames, before encoding.
+Each other cell: channel bit accuracy (256 bits), payload bit errors out of
+64, outcome (`verified` = payload exact and check bits valid; `found` =
+detected with `p_value <= 1e-4`).
+
+| Content | Encoding | Strength 0.2 (model built-in) | Strength 0.5 (default) |
 |---|---|---|---|
-| Mandelbrot (textured) | none | 1.000, 0, found (PSNR 49.2 dB) | n/a |
+| Mandelbrot (textured) | PSNR | 49.2 dB | **41.5 dB** |
+| Mandelbrot | none | 1.000, 0, verified | 1.000, 0, verified |
 | Mandelbrot | H.264 1 Mb/s | 0.781, 4, found | **0.941, 0, verified** |
 | Mandelbrot | H.264 400 kb/s | 0.609, 20, not found | 0.777, 4, found |
 | Mandelbrot | VP9 CRF 35 | 0.727, 9, found | **0.902, 0, verified** |
-| testsrc2 (flat areas) | none | 1.000, 0, found (PSNR 52.5 dB) | n/a |
+| testsrc2 (flat areas) | PSNR | 52.5 dB | 44.7 dB |
+| testsrc2 | none | 0.906, 0, verified | 0.992, 0, verified |
 | testsrc2 | H.264 1 Mb/s | 0.613, 14, not found | 0.801, 5, found |
 | testsrc2 | H.264 400 kb/s | 0.516, 32, not found | 0.566, 22, not found |
 | testsrc2 | VP9 CRF 35 | 0.543, 23, not found | 0.730, 7, found |
@@ -209,8 +232,8 @@ synthetic areas hurt), on the strength and on the bit rate per pixel; small
 frames such as 320x240 are a hard case because the model works at 256 x 256.
 `openh264` is a weaker encoder than x264 at the same bit rate. Use
 `embed_verified` with the real publishing pipeline, a repetition code and
-check bits, and raise the strength (0.5 kept PSNR around 42 dB in the
-prototypes) when verification fails.
+check bits; lower the strength (0.2) only where the PSNR budget matters more
+than robustness, and raise it when verification fails.
 
 **Thread safety.** `VideoSealBackend` can be shared between threads (model
 calls are serialized); strength and step size are fixed at construction.

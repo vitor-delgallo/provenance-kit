@@ -38,6 +38,7 @@ from provenance_kit.provenance.timestamps._proof import (
 __all__ = [
     "DEFAULT_CALENDARS",
     "DEFAULT_MAX_RESPONSE_BYTES",
+    "DEFAULT_MIN_CALENDARS",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_UPGRADE_ALLOWLIST",
     "CalendarError",
@@ -68,6 +69,11 @@ DEFAULT_UPGRADE_ALLOWLIST: tuple[str, ...] = (
 
 #: The per-calendar time limit of the official client (``--timeout``, 5 s).
 DEFAULT_TIMEOUT_SECONDS = 5.0
+
+#: How many calendars must answer a stamp request: the official client's
+#: ``-m`` default (``otsclient/args.py``). Two attestations survive the loss of
+#: one calendar.
+DEFAULT_MIN_CALENDARS = 2
 
 #: The largest calendar response accepted (python-opentimestamps 0.5.0
 #: ``MAX_RESPONSE_LENGTH``).
@@ -153,9 +159,10 @@ class OpenTimestamper:
             :data:`DEFAULT_CALENDARS` by default). They are also allowed for
             :meth:`upgrade`.
         min_calendars: How many calendars must answer for :meth:`stamp` to
-            succeed. The default, 1, gives a proof as soon as one calendar
-            answers; the official client requires 2 (``-m``), which survives
-            the loss of one calendar. Use 2 or more in production.
+            succeed. The default, 2, is the official client's (``-m``): a
+            proof attested by two calendars survives the loss of one. It
+            must not exceed the number of calendars, so a single custom
+            calendar needs ``min_calendars=1``.
         timeout_seconds: The deadline for one operation; calendars are
             contacted in parallel. 5 s is the official client's default.
         upgrade_allowlist: URL patterns (``*`` matches within the host) that
@@ -176,7 +183,7 @@ class OpenTimestamper:
         self,
         calendars: Sequence[str] = DEFAULT_CALENDARS,
         *,
-        min_calendars: int = 1,
+        min_calendars: int = DEFAULT_MIN_CALENDARS,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         upgrade_allowlist: Sequence[str] = DEFAULT_UPGRADE_ALLOWLIST,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
@@ -202,7 +209,10 @@ class OpenTimestamper:
         if isinstance(required, bool) or not isinstance(required, int):
             raise TypeError("min_calendars must be an int")
         if not 1 <= min_calendars <= len(urls):
-            raise ValueError("min_calendars must be between 1 and the number of calendars")
+            raise ValueError(
+                f"min_calendars ({min_calendars}) must be between 1 and the number of "
+                f"calendars ({len(urls)}); pass min_calendars=1 to use a single calendar"
+            )
         _check_positive("timeout_seconds", timeout_seconds)
         _check_positive_int("max_response_bytes", max_response_bytes)
         _check_positive_int("max_proof_bytes", max_proof_bytes)

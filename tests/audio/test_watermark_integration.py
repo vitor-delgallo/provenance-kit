@@ -1,10 +1,12 @@
 """AudioSeal with the real checkpoints and real codecs.
 
-The checkpoints (59 MB and 35 MB) are read from ``model-cache/audioseal/``
-(git-ignored). If they are missing the tests skip, unless ``--run-network`` is
-given, in which case they are downloaded there from the pinned Hugging Face
-revision and verified against the pinned SHA-256. Run with ``-s`` to print
-the measured numbers; they are recorded in ``docs/audio.md``.
+The checkpoints (59 MB and 35 MB) are read from ``tests.support.model_dir``
+(the git-ignored ``.cache/models/audioseal/``, or
+``$PROVENANCE_KIT_MODEL_DIR/audioseal``). If they are missing the tests skip,
+unless ``--run-network`` is given, in which case they are downloaded there
+from the pinned Hugging Face revision and verified against the pinned
+SHA-256. Run with ``-s`` to print the measured numbers; they are recorded in
+``docs/audio.md``.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import pickle
+import time
 
 import numpy as np
 import pytest
@@ -21,6 +24,7 @@ from provenance_kit.audio.pcm import decode_pcm
 from provenance_kit.audio.watermark import (
     AUDIOSEAL_DETECTOR,
     AUDIOSEAL_GENERATOR,
+    AlignmentSearch,
     AudioSealBackend,
     _audioseal,
     detect_watermark,
@@ -31,11 +35,11 @@ from provenance_kit.audio.watermark import (
 from provenance_kit.errors import ModelLoadError
 from provenance_kit.tools import ExternalTools, Tool
 from tests.audio.media import BROADBAND, TONES, encode_pcm, ffmpeg, lavfi
-from tests.support import REPO_ROOT, find_tools, require_module, require_tool
+from tests.support import find_tools, model_dir, require_module, require_tool
 
 pytestmark = pytest.mark.integration
 
-MODEL_DIR = REPO_ROOT / "model-cache" / "audioseal"
+MODEL_DIR = model_dir("audioseal")
 CODEC = PayloadCodec(16, version_bits=0, check_bits=4)
 PAYLOADS = [CODEC.encode(identifier) for identifier in (1, 777, 2024, 4095)]
 # (ffmpeg arguments, output file suffix or None for a pipe, delay signaled?).
@@ -75,7 +79,7 @@ def ensure_models(request: pytest.FixtureRequest) -> None:
         return
     if not request.config.getoption("--run-network"):
         pytest.skip(
-            "the AudioSeal checkpoints are not in model-cache/audioseal/: run with --run-network "
+            f"the AudioSeal checkpoints are not in {MODEL_DIR}: run with --run-network "
             "to download them"
         )
     download_audioseal_models(MODEL_DIR)
@@ -182,6 +186,69 @@ def test_accuracy_after_real_codecs(  # noqa: PLR0917 - pytest passes fixtures p
         assert min(probabilities) >= 0.9  # detected after every delay-signaling codec
         if source == "broadband":
             assert accuracy >= 0.9
+
+
+@pytest.mark.parametrize(
+    ("codec_name", "delay"), [("adts-aac-128k-pipe", 1024), ("mp3-128k-pipe", 1106)]
+)
+def test_alignment_search_recovers_unsignaled_delays(backend, sources, tools, codec_name, delay):
+    """The opt-in search finds the encoder delay that these pipelines do not record.
+
+    ffmpeg's AAC encoder primes 1024 samples; LAME's 576 + 529 samples, plus
+    one from the decoder, give 1106. Without the search the bits are lost
+    (bit accuracy 0.5 to 0.75); with it they come back. Two payloads per
+    codec, to bound the run time (each search takes about 20 s on a CPU).
+    """
+    args, suffix, aligned = CODECS[codec_name]
+    assert suffix is None
+    assert not aligned
+    search = AlignmentSearch()  # the defaults: offsets 0 to 2048, step 2, 0.5 s excerpts
+    for bits in PAYLOADS[:2]:
+        marked = embed_watermark(sources["broadband"], 44100, bits, backend=backend)
+        decoded = decode_pcm(encode_pcm(tools, marked, 44100, args), tools=tools)
+        plain = detect_watermark(decoded.samples, decoded.sample_rate, backend=backend, codec=CODEC)
+        started = time.perf_counter()
+        found = detect_watermark(
+            decoded.samples, decoded.sample_rate, backend=backend, codec=CODEC, alignment=search
+        )
+        elapsed = time.perf_counter() - started
+        print(
+            f"\nbroadband {codec_name}: without search p={plain.confidence:.3f} bits "
+            f"{_matching(plain.decoded_bits, bits)}/16; with search offset {found.offset_samples}, "
+            f"p={found.confidence:.3f} bits {_matching(found.decoded_bits, bits)}/16, "
+            f"{search.candidates} candidates in {elapsed:.1f} s"
+        )
+        # Near the encoder delay: the bit confidence peaks within a few samples
+        # of it (measured: 1024 for ADTS, 1106 or 1116 for the MP3 pipe), and
+        # all 16 bits come back.
+        assert found.offset_samples is not None
+        assert abs(found.offset_samples - delay) <= 16
+        assert found.found
+        assert found.bits == bits
+        assert found.payload is not None
+        assert found.payload.valid
+        assert plain.decoded_bits != bits
+
+
+def test_alignment_search_on_unmarked_audio(backend, sources):
+    """No offset of unmarked audio reaches the bit-confidence floor (measured best: 0.04 to 0.05).
+
+    Without the floor, the near-random best offset of the sparse tones moved
+    the detection probability from 0.25 to 0.62, a false positive.
+    """
+    search = AlignmentSearch()
+    for name, samples in sources.items():
+        detection = detect_watermark(samples, 44100, backend=backend, alignment=search)
+        print(
+            f"\n{name} unmarked with search: offset {detection.offset_samples}, "
+            f"detection probability {detection.confidence:.3f}"
+        )
+        assert not detection.found
+        assert detection.offset_samples == 0
+
+
+def _matching(read: str | None, bits: str) -> int:
+    return sum(a == b for a, b in zip(read or "", bits, strict=False))
 
 
 def test_mono_downmix_keeps_the_mark(backend, sources):

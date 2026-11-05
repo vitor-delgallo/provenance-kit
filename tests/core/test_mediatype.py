@@ -9,6 +9,7 @@ from PIL import Image
 
 from provenance_kit.errors import UnsupportedMediaError
 from provenance_kit.mediatype import (
+    SNIFF_BYTES,
     MediaKind,
     MediaType,
     require_media_type,
@@ -64,6 +65,34 @@ def test_sniff_recognizes_each_container(expected, head):
 
 def test_mp3_frame_sync_without_id3():
     assert sniff_media_type(b"\xff\xfb\x90\x64\x00\x00") is MediaType.MP3
+
+
+def id3_tag(payload_size: int, *, footer: bool = False) -> bytes:
+    """An ID3v2.4 tag header (synchsafe size) followed by a zero payload."""
+    synchsafe = bytes((payload_size >> shift) & 0x7F for shift in (21, 14, 7, 0))
+    flags = 0x10 if footer else 0x00
+    tag = b"ID3\x04\x00" + bytes([flags]) + synchsafe + b"\x00" * payload_size
+    return tag + (b"3DI\x04\x00" + bytes([flags]) + synchsafe if footer else b"")
+
+
+def test_flac_behind_an_id3v2_tag_is_flac():
+    # c2pa-rs embeds C2PA manifests in FLAC behind an ID3v2 tag.
+    assert sniff_media_type(id3_tag(20) + b"fLaC" + b"\x00" * 40) is MediaType.FLAC
+    assert sniff_media_type(id3_tag(20, footer=True) + b"fLaC\x00\x00") is MediaType.FLAC
+    # A manifest-sized tag: the marker lies far beyond SNIFF_BYTES.
+    big = id3_tag(200_000) + b"fLaC" + b"\x00" * 40
+    assert sniff_media_type(big) is MediaType.FLAC
+    assert require_media_type(memoryview(big), allowed={MediaType.FLAC}) is MediaType.FLAC
+    # Only the head was passed: the marker is unknown, so the tag says MP3.
+    assert sniff_media_type(big[:SNIFF_BYTES]) is MediaType.MP3
+
+
+def test_mp3_behind_an_id3v2_tag_stays_mp3():
+    assert sniff_media_type(id3_tag(20) + b"\xff\xfb\x90\x00" + b"\x00" * 40) is MediaType.MP3
+    assert sniff_media_type(id3_tag(20)) is MediaType.MP3  # nothing after the tag
+    # A size that is not synchsafe is not trusted.
+    broken = b"ID3\x04\x00\x00\x00\x00\x00\x94" + b"\x00" * 20 + b"fLaC"
+    assert sniff_media_type(broken) is MediaType.MP3
 
 
 def test_rf64_and_aifc():

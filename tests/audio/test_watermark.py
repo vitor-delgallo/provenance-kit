@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sysconfig
 import types
 
 import numpy as np
@@ -12,12 +13,15 @@ from provenance_kit.audio.pcm import PcmAudio
 from provenance_kit.audio.watermark import (
     AUDIOSEAL_DETECTOR,
     AUDIOSEAL_GENERATOR,
+    MAX_ALIGNMENT_CANDIDATES,
+    AlignmentSearch,
     AudioScores,
     AudioSealBackend,
     AudioWatermarkDetection,
     _api,
     _audioseal,
     detect_watermark,
+    download_audioseal_models,
     embed_verified,
     embed_watermark,
 )
@@ -106,6 +110,116 @@ def test_argument_validation():
         detect_watermark(silence(), 16000, backend=backend, threshold=1.5)
     with pytest.raises(TypeError):
         detect_watermark(silence(), 16000, backend=backend, codec="codec")  # type: ignore[arg-type]
+
+
+# ------------------------------------------------------------ alignment search
+
+
+class DelaySensitiveBackend(FakeBackend):
+    """Confident only when the excerpt starts exactly on the marked samples.
+
+    Mimics AudioSeal's sensitivity to sample offsets: one sample off and the
+    bit probabilities are coin flips.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.windows: list[int] = []
+
+    def score(self, samples, sample_rate):
+        self.windows.append(samples.shape[1])
+        head = samples[0, :16]
+        if head.size == 16 and np.all(np.abs(head) == 0.5):
+            probabilities = tuple(0.9 if v > 0 else 0.1 for v in head)
+        else:
+            probabilities = (0.5,) * 16
+        return AudioScores(detection_probability=1.0, bit_probabilities=probabilities)
+
+
+def delayed(samples: np.ndarray, delay: int) -> np.ndarray:
+    return np.concatenate([np.zeros((samples.shape[0], delay), np.float32), samples], axis=1)
+
+
+BITS = "1011001110001101"
+
+
+def test_alignment_search_recovers_a_delayed_mark():
+    backend = DelaySensitiveBackend()
+    marked = embed_watermark(silence(frames=4000), 16000, BITS, backend=backend)
+    shifted = delayed(marked, 37)
+    plain = detect_watermark(shifted, 16000, backend=backend)
+    assert plain.decoded_bits != BITS
+    assert plain.bit_confidence == 0.0
+    assert plain.offset_samples is None
+    search = AlignmentSearch(max_offset_samples=100, step_samples=1, window_seconds=0.1)
+    found = detect_watermark(shifted, 16000, backend=backend, alignment=search)
+    assert found.offset_samples == 37
+    assert found.bits == BITS
+    assert found.bit_confidence == pytest.approx(0.8)
+
+
+def test_alignment_search_cost_is_bounded():
+    backend = DelaySensitiveBackend()
+    marked = embed_watermark(silence(frames=4000), 16000, BITS, backend=backend)
+    search = AlignmentSearch(max_offset_samples=40, step_samples=4, window_seconds=0.1)
+    assert search.candidates == 11
+    assert list(search.offsets()) == list(range(0, 41, 4))
+    backend.windows.clear()
+    detection = detect_watermark(delayed(marked, 24), 16000, backend=backend, alignment=search)
+    assert detection.offset_samples == 24
+    # One call per candidate on a 0.1 s excerpt, then one on the whole signal.
+    assert backend.windows == [1600] * 11 + [4000]
+    # An offset off the step grid is not found (the step bounds the precision).
+    off_grid = detect_watermark(delayed(marked, 25), 16000, backend=backend, alignment=search)
+    assert off_grid.bit_confidence == 0.0
+
+
+def test_alignment_search_keeps_the_signal_when_no_offset_stands_out():
+    class Lukewarm(FakeBackend):
+        """Weakly confident bits everywhere, a little more at offset 6."""
+
+        def score(self, samples, sample_rate):
+            level = 0.58 if samples.shape[1] == 994 else 0.55
+            return AudioScores(detection_probability=0.3, bit_probabilities=(level,) * 16)
+
+    samples = silence(frames=1000)
+    floor = AlignmentSearch(max_offset_samples=10, step_samples=1, window_seconds=1.0)
+    assert floor.min_bit_confidence == 0.2
+    assert detect_watermark(samples, 1000, backend=Lukewarm(), alignment=floor).offset_samples == 0
+    eager = AlignmentSearch(
+        max_offset_samples=10, step_samples=1, window_seconds=1.0, min_bit_confidence=0.15
+    )
+    assert detect_watermark(samples, 1000, backend=Lukewarm(), alignment=eager).offset_samples == 6
+
+
+def test_alignment_search_stops_at_the_end_of_the_signal():
+    backend = DelaySensitiveBackend()
+    search = AlignmentSearch(max_offset_samples=2048, step_samples=1, window_seconds=0.1)
+    detection = detect_watermark(silence(frames=10), 16000, backend=backend, alignment=search)
+    assert detection.offset_samples == 0  # ties go to the smallest offset
+    assert len(backend.windows) == 10 + 1
+
+
+def test_alignment_search_validation():
+    defaults = AlignmentSearch()
+    assert (defaults.max_offset_samples, defaults.step_samples) == (2048, 2)
+    assert defaults.candidates == 1025
+    for kwargs in (
+        {"step_samples": 0},
+        {"max_offset_samples": -1},
+        {"max_offset_samples": 200_000, "step_samples": 100},
+        {"max_offset_samples": MAX_ALIGNMENT_CANDIDATES, "step_samples": 1},
+        {"window_seconds": 0.05},
+        {"window_seconds": float("nan")},
+        {"min_bit_confidence": 1.5},
+        {"min_bit_confidence": -0.1},
+    ):
+        with pytest.raises(ValueError):
+            AlignmentSearch(**kwargs)
+    with pytest.raises(TypeError):
+        AlignmentSearch(step_samples=1.5)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        detect_watermark(silence(), 16000, backend=FakeBackend(), alignment=100)  # type: ignore[arg-type]
 
 
 def test_audio_scores_validation():
@@ -235,3 +349,26 @@ def test_chunks_fold_short_tails(monkeypatch):
     assert list(backend._chunks(5)) == [(0, 5)]
     assert list(backend._chunks(16000 * 20 + 8000)) == [(0, 160000), (160000, 328000)]
     assert list(backend._chunks(16000 * 12)) == [(0, 160000), (160000, 192000)]
+
+
+def test_download_audioseal_models_fetches_both_pinned_files(tmp_path, monkeypatch):
+    calls = []
+
+    def ensure(specs, directory, *, timeout_seconds):
+        calls.append((tuple(specs), directory, timeout_seconds))
+        return tuple(directory / spec.name for spec in specs)
+
+    monkeypatch.setattr(_audioseal, "ensure_model_files", ensure)
+    generator, detector = download_audioseal_models(tmp_path, timeout_seconds=9)
+    assert generator == tmp_path.resolve() / AUDIOSEAL_GENERATOR.name
+    assert detector == tmp_path.resolve() / AUDIOSEAL_DETECTOR.name
+    assert calls == [((AUDIOSEAL_GENERATOR, AUDIOSEAL_DETECTOR), tmp_path.resolve(), 9)]
+
+
+def test_model_dir_inside_site_packages_is_refused(monkeypatch):
+    inside = sysconfig.get_paths()["purelib"] + "/audioseal"
+    with pytest.raises(ValueError, match="site-packages"):
+        download_audioseal_models(inside)
+    monkeypatch.setattr(_audioseal, "import_optional", fake_import)
+    with pytest.raises(ValueError, match="site-packages"):
+        AudioSealBackend(model_dir=inside)

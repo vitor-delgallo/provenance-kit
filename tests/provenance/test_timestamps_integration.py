@@ -61,7 +61,13 @@ class BlockSource:
 
 
 def timestamper(*urls: str, **kwargs: object) -> OpenTimestamper:
+    """A client for the mock calendars; one answer suffices unless told otherwise.
+
+    The library default (two calendars must answer) is exercised by
+    ``test_min_calendars_and_failure_reporting``.
+    """
     kwargs.setdefault("timeout_seconds", 2.0)
+    kwargs.setdefault("min_calendars", 1)
     return OpenTimestamper(urls, allow_insecure_http=True, **kwargs)  # type: ignore[arg-type]
 
 
@@ -135,8 +141,10 @@ def test_min_calendars_and_failure_reporting():
     with MockCalendar() as good, MockCalendar(mode="status_500") as bad:
         proof = timestamper(good.url, bad.url).stamp(DIGEST)
         assert proof.failed_calendars == (CalendarFailure(bad.url, "http status 500"),)
-        with pytest.raises(CalendarError) as info:
-            timestamper(good.url, bad.url, min_calendars=2).stamp(DIGEST)
+        with pytest.raises(CalendarError) as info:  # the default: two must answer
+            OpenTimestamper(
+                (good.url, bad.url), allow_insecure_http=True, timeout_seconds=2.0
+            ).stamp(DIGEST)
     assert info.value.succeeded == 1
     assert info.value.required == 2
     assert info.value.failures == (CalendarFailure(bad.url, "http status 500"),)
@@ -180,10 +188,12 @@ def test_https_calendar_with_a_custom_trust_store(tmp_path):
     server_context, client_context = make_tls_contexts(tmp_path)
     with MockCalendar(tls=server_context) as calendar:
         assert calendar.url.startswith("https://")
-        proof = OpenTimestamper((calendar.url,), ssl_context=client_context).stamp(DIGEST)
+        proof = OpenTimestamper((calendar.url,), min_calendars=1, ssl_context=client_context).stamp(
+            DIGEST
+        )
         assert proof.failed_calendars == ()
         with pytest.raises(CalendarError) as info:  # the system store does not know the test CA
-            OpenTimestamper((calendar.url,), timeout_seconds=2.0).stamp(DIGEST)
+            OpenTimestamper((calendar.url,), min_calendars=1, timeout_seconds=2.0).stamp(DIGEST)
     assert info.value.failures[0].reason == "tls error"
 
 

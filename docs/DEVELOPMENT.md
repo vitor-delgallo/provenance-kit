@@ -8,8 +8,10 @@ rules for writing code are in [ARCHITECTURE.md](ARCHITECTURE.md).
 * Python 3.11 or later (the development environment uses 3.11; CI also tests 3.13).
 * [uv](https://docs.astral.sh/uv/) to create the environment (pip works too).
 * For integration tests: the `ffmpeg`, `ffprobe` and `fpcalc` binaries.
-* On Linux, a C++11 compiler (`build-essential` or equivalent) to build
-  `pdqhash` from source: it publishes wheels for Windows and macOS only.
+* On Linux, only for the optional `pdq-native` extra: a C++11 compiler
+  (`build-essential` or equivalent) to build `pdqhash` from source, which
+  publishes wheels for Windows and macOS only. Without it, PDQ runs on the
+  built-in NumPy port and the `pdqhash` tests skip.
 
 ## Set up the environment
 
@@ -33,8 +35,9 @@ uv pip install --python .venv --index-url https://download.pytorch.org/whl/cpu t
 # The project in editable mode with every extra and the dev tools.
 # PYTHONUTF8=1 is needed on Windows only: the trustmark 0.9.2 source
 # distribution reads its README with the locale encoding and fails to build
-# under cp1252 otherwise.
-PYTHONUTF8=1 uv pip install --python .venv -e ".[all,dev]"
+# under cp1252 otherwise. "all" leaves out pdq-native (pdqhash needs a C++
+# compiler on Linux); add it where it installs.
+PYTHONUTF8=1 uv pip install --python .venv -e ".[all,pdq-native,dev]"
 ```
 
 **`PYTHONUTF8=1` (Windows).** `trustmark` 0.9.2 is published as a source
@@ -79,15 +82,38 @@ license (see [THIRD_PARTY.md](THIRD_PARTY.md)).
 On Linux, install the distribution packages (`ffmpeg`, `libchromaprint-tools`)
 or the static builds from the same projects.
 
+## Model files and other downloaded test data
+
+The integration tests of the watermark backends need the model weights. They
+use the library's own convention (`provenance_kit.modelfiles`): one
+subdirectory per backend under a model root. The root is
+`$PROVENANCE_KIT_MODEL_DIR` when that variable is set, otherwise the
+repository's git-ignored `.cache/models/` (`tests.support.model_dir`):
+
+```
+.cache/
+  models/
+    trustmark/   trustmark_Q.yaml, encoder_Q.ckpt, decoder_Q.ckpt (65 MB; P, B, C optional)
+    videoseal/   y_256b_img.jit (228 MB)
+    audioseal/   generator_base.pth, detector_base.pth (94 MB)
+  threatexchange-pdq/<commit>/   ThreatExchange PDQ test images
+```
+
+Missing files make the tests skip with the reason; `pytest --run-network`
+downloads them once from the pinned URLs and verifies their size and
+SHA-256. To provision them by hand, call `download_trustmark_models`,
+`download_videoseal_model` and `download_audioseal_models` with
+`model_dir=".cache/models/<backend>"`. Never commit anything under `.cache/`.
+
 ## Checks
 
 Run from the repository root with the environment's executables (on Windows
 they are under `.venv\Scripts\`):
 
 ```sh
-ruff check src tests          # lint
-ruff format --check src tests # formatting (use "ruff format src tests" to fix)
-mypy                          # strict type check of src/ (configured in pyproject.toml)
+ruff check src tests     # lint
+ruff format --check .    # formatting, including Python blocks in Markdown ("ruff format ." fixes)
+mypy                     # strict type check of src/ (configured in pyproject.toml)
 ```
 
 ## Tests
@@ -122,4 +148,5 @@ pytest                                         # everything available offline
   resolvers fall back to 0.38.0 on Windows.
 * `opentimestamps` 0.5.0 (the release that hardens proof parsing) requires
   Python 3.11, which is also this project's minimum.
-* `ffmpeg -nostdin` still reads media from `-i pipe:0`.
+* `ffmpeg -nostdin` still reads media from `-i pipe:0`. ffprobe has no
+  `-nostdin` option and refuses it; it does not read the terminal anyway.

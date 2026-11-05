@@ -16,9 +16,19 @@ The runner's guarantees, which every module relies on:
   their arguments.
 * The ``PATH`` lookup ignores the current directory and relative entries, so
   a binary planted next to the media cannot be picked up.
-* Media goes through pipes: ``stdin`` accepts bytes or a binary file object,
-  fed by a background thread; standard output can be captured
-  (:func:`run_tool`) or read incrementally (:func:`stream_tool`).
+* Media goes through pipes: ``stdin`` accepts bytes, a binary file object or
+  the :class:`ToolProcess` of another running tool, fed by a background
+  thread; standard output can be captured (:func:`run_tool`) or read
+  incrementally (:func:`stream_tool`).
+* Tools can be chained without the data passing through the caller: pass
+  the :class:`ToolProcess` of one tool as the ``stdin`` of the next. The
+  upstream tool's output cap still applies (and is reported by
+  :attr:`ToolProcess.output_limit_exceeded`), and
+  :attr:`ToolProcess.bytes_read` tells how much went through::
+
+      with stream_tool(ffmpeg, decode_args, stdin=media, max_stdout_bytes=cap) as decoder:
+          result = run_tool(fpcalc, fpcalc_args, stdin=decoder)
+      decoded = decoder.bytes_read
 * Every run has a timeout (default:
   :attr:`MediaLimits.subprocess_timeout_seconds
   <provenance_kit.limits.MediaLimits.subprocess_timeout_seconds>`). On timeout
@@ -479,6 +489,15 @@ class ToolProcess:
     Reads raise :class:`~provenance_kit.errors.ExternalToolError` as soon as
     standard output exceeds ``max_stdout_bytes``.
 
+    Piping: pass the instance as the ``stdin`` of :func:`run_tool` or
+    :func:`stream_tool` (inside this instance's ``with`` block) to feed its
+    output to another tool. The other tool's feeder thread then does the
+    reading; do not read from this instance at the same time. If a read
+    fails (for example because the output exceeded ``max_stdout_bytes``), the
+    downstream tool is killed and the read error is raised when the
+    downstream run ends; :attr:`output_limit_exceeded` says whether the cap
+    was the cause.
+
     Instances are not thread-safe: read from one thread.
     """
 
@@ -487,7 +506,7 @@ class ToolProcess:
         proc: subprocess.Popen[bytes],
         *,
         tool: str,
-        stdin: BytesLike | BinaryIO | None,
+        stdin: BytesLike | BinaryIO | ToolProcess | None,
         timeout_seconds: float,
         max_stdout_bytes: int | None,
         max_stderr_bytes: int,
@@ -540,6 +559,27 @@ class ToolProcess:
         Complete only after the ``with`` block has exited.
         """
         return bytes(self._stderr_buf)
+
+    @property
+    def bytes_read(self) -> int:
+        """How many bytes of standard output have been read so far.
+
+        Counts every read, including those made by a downstream tool's feeder
+        thread when the instance is piped into it (and the chunk that
+        exceeded ``max_stdout_bytes``, if one did).
+        """
+        return self._stdout_total
+
+    @property
+    def output_limit_exceeded(self) -> bool:
+        """True once standard output exceeded ``max_stdout_bytes``.
+
+        The process was then killed and the read raised
+        :class:`~provenance_kit.errors.ExternalToolError`. This lets a caller
+        that piped the tool into another one tell the cap from other
+        failures.
+        """
+        return self._overflowed
 
     def read(self, size: int = _CHUNK) -> bytes:
         """Reads up to ``size`` bytes; returns ``b""`` at end of output.
@@ -656,7 +696,7 @@ class ToolProcess:
                 if len(self._stderr_buf) > cap:
                     del self._stderr_buf[: len(self._stderr_buf) - cap]
 
-    def _feed_stdin(self, pair: tuple[IO[bytes], BytesLike | BinaryIO]) -> None:
+    def _feed_stdin(self, pair: tuple[IO[bytes], BytesLike | BinaryIO | ToolProcess]) -> None:
         pipe, source = pair
         try:
             if isinstance(source, (bytes, bytearray, memoryview)):
@@ -671,8 +711,9 @@ class ToolProcess:
                         if not isinstance(chunk, (bytes, bytearray, memoryview)):
                             raise TypeError("the stdin file object must return bytes")
                     except Exception as exc:
-                        # The caller's stream failed: stop the tool and report
-                        # the original error from the main thread.
+                        # The caller's stream (or the upstream tool) failed:
+                        # stop this tool and report the original error from
+                        # the main thread.
                         self._stdin_error = exc
                         self._tree.kill()
                         return
@@ -802,7 +843,7 @@ def stream_tool(
     args: Sequence[StrPath],
     *,
     tool: str | None = None,
-    stdin: BytesLike | BinaryIO | None = None,
+    stdin: BytesLike | BinaryIO | ToolProcess | None = None,
     timeout_seconds: float | None = None,
     max_stdout_bytes: int | None = None,
     max_stderr_bytes: int = DEFAULT_MAX_STDERR_BYTES,
@@ -828,9 +869,11 @@ def stream_tool(
         executable: The absolute path of the executable.
         args: The arguments, without the executable.
         tool: The name used in messages. Defaults to the executable's stem.
-        stdin: Bytes or a readable binary file object to feed to the tool's
-            standard input from a background thread. ``None`` connects
-            standard input to the null device.
+        stdin: Bytes, a readable binary file object, or the
+            :class:`ToolProcess` of another tool (its output is piped in;
+            see :class:`ToolProcess`), fed to the tool's standard input from a
+            background thread. ``None`` connects standard input to the null
+            device.
         timeout_seconds: The wall-clock limit for the whole run. Defaults to
             ``MediaLimits().subprocess_timeout_seconds``.
         max_stdout_bytes: The total standard output allowed, or ``None`` for no
@@ -852,8 +895,9 @@ def stream_tool(
         ExternalToolError: If the process cannot be started; on exit, if it
             failed; on read, if it exceeded the output cap.
         ExternalToolTimeoutError: On exit, if it timed out.
-        Exception: On exit, whatever the ``stdin`` file object raised while
-            being read (the tool is killed first).
+        Exception: On exit, whatever the ``stdin`` file object (or the
+            upstream :class:`ToolProcess`) raised while being read (the tool
+            is killed first).
     """
     exe = _check_executable(executable)
     argv = [str(exe), *_normalize_args(args)]
@@ -907,7 +951,7 @@ def run_tool(
     args: Sequence[StrPath],
     *,
     tool: str | None = None,
-    stdin: BytesLike | BinaryIO | None = None,
+    stdin: BytesLike | BinaryIO | ToolProcess | None = None,
     timeout_seconds: float | None = None,
     max_stdout_bytes: int = DEFAULT_MAX_STDOUT_BYTES,
     max_stderr_bytes: int = DEFAULT_MAX_STDERR_BYTES,
@@ -921,7 +965,8 @@ def run_tool(
         executable: The absolute path of the executable.
         args: The arguments, without the executable.
         tool: The name used in messages. Defaults to the executable's stem.
-        stdin: Bytes or a readable binary file object for standard input.
+        stdin: Bytes, a readable binary file object, or the
+            :class:`ToolProcess` of another tool whose output is piped in.
         timeout_seconds: The wall-clock limit. Defaults to
             ``MediaLimits().subprocess_timeout_seconds``.
         max_stdout_bytes: The cap on captured standard output; exceeding it
@@ -943,6 +988,8 @@ def run_tool(
         ExternalToolError: If the process cannot be started, fails (with
             ``check``), or exceeds the output cap.
         ExternalToolTimeoutError: If it times out.
+        Exception: Whatever the ``stdin`` file object (or the upstream
+            :class:`ToolProcess`) raised while being read.
     """
     with stream_tool(
         executable,

@@ -28,26 +28,29 @@ Thread safety: the functions are thread-safe; each call runs its own tools.
 
 from __future__ import annotations
 
-import json
 import math
-import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
-from provenance_kit._logging import get_logger
-from provenance_kit._typing import BytesLike, StrPath
-from provenance_kit.audio._checks import check_int, check_number
-from provenance_kit.audio._ffmpeg import (
+from provenance_kit._checks import check_int, check_number
+from provenance_kit._ffmpeg import (
     FFMPEG_COMMON,
-    FFPROBE_COMMON,
     StagedInput,
     as_media_error,
-    check_audio_input,
+    check_media_input,
+    json_float,
+    json_int,
+    json_name,
+    load_json_object,
+    run_ffprobe_json,
     staged_input,
 )
+from provenance_kit._logging import get_logger
+from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.errors import (
     ExternalToolError,
     MediaDecodeError,
@@ -75,10 +78,27 @@ MAX_STREAMS = 64
 #: The lowest output sample rate :func:`decode_pcm` accepts.
 MIN_SAMPLE_RATE = 1000
 
+#: The containers the audio modules accept (detected from the bytes): audio
+#: files, and video containers for their audio track.
+AUDIO_CONTAINERS: frozenset[MediaType] = frozenset(
+    {
+        MediaType.WAV,
+        MediaType.MP3,
+        MediaType.AAC,
+        MediaType.FLAC,
+        MediaType.OGG,
+        MediaType.M4A,
+        MediaType.AIFF,
+        MediaType.MP4,
+        MediaType.QUICKTIME,
+        MediaType.WEBM,
+        MediaType.MATROSKA,
+        MediaType.AVI,
+        MediaType.MPEG_TS,
+    }
+)
+
 _MAX_PROBE_OUTPUT = 1024 * 1024
-_MAX_NAME_CHARS = 64
-_MAX_NUMBER_CHARS = 32
-_NAME_RE = re.compile(r"^[A-Za-z0-9_.,+-]+$")
 _DURATION_SLACK_SECONDS = 1.0
 _READ_CHUNK = 1024 * 1024
 _PROBE_ENTRIES = (
@@ -202,7 +222,7 @@ def probe_audio(
     """
     limits = MediaLimits() if limits is None else limits
     tools = ExternalTools.from_env() if tools is None else tools
-    media_type = check_audio_input(data, limits)
+    media_type = check_media_input(data, limits, AUDIO_CONTAINERS)
     with staged_input(data, media_type, temp_dir=temp_dir) as staged:
         return probe_staged(
             staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout_seconds
@@ -262,7 +282,7 @@ def decode_pcm(
         check_number(
             "max_duration_seconds", max_duration_seconds, minimum=0.0, exclusive_minimum=True
         )
-    media_type = check_audio_input(data, limits)
+    media_type = check_media_input(data, limits, AUDIO_CONTAINERS)
     with staged_input(data, media_type, temp_dir=temp_dir) as staged:
         info = probe_staged(
             staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout_seconds
@@ -447,26 +467,16 @@ def probe_staged(
     Returns:
         The validated audio stream information.
     """
-    args = [
-        *FFPROBE_COMMON,
-        *staged.input_args(),
-        "-print_format",
-        "json",
-        "-show_entries",
-        _PROBE_ENTRIES,
-    ]
     timeout = limits.subprocess_timeout_seconds if timeout_seconds is None else timeout_seconds
-    try:
-        result = tools.run(
-            Tool.FFPROBE,
-            args,
-            stdin=staged.stdin,
-            timeout_seconds=timeout,
-            max_stdout_bytes=_MAX_PROBE_OUTPUT,
-        )
-    except ExternalToolError as exc:
-        raise as_media_error(exc, "audio probe") from exc
-    return parse_probe_output(result.stdout, media_type, limits)
+    document = run_ffprobe_json(
+        staged,
+        ["-print_format", "json", "-show_entries", _PROBE_ENTRIES],
+        tools=tools,
+        what="audio probe",
+        timeout_seconds=timeout,
+        max_output_bytes=_MAX_PROBE_OUTPUT,
+    )
+    return validate_probe_report(document, media_type, limits)
 
 
 def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -> AudioInfo:
@@ -485,7 +495,27 @@ def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -
         UnsupportedMediaError: If there is no audio stream or too many streams.
         MediaLimitExceededError: If a declared value exceeds ``limits``.
     """
-    document = load_json_object(raw, "audio probe")
+    return validate_probe_report(load_json_object(raw, "audio probe"), media_type, limits)
+
+
+def validate_probe_report(
+    document: Mapping[str, Any], media_type: MediaType, limits: MediaLimits
+) -> AudioInfo:
+    """Validates ffprobe's decoded report (internal; untrusted input).
+
+    Args:
+        document: The decoded JSON object.
+        media_type: The sniffed container.
+        limits: The limits to enforce.
+
+    Returns:
+        The validated audio stream information.
+
+    Raises:
+        MediaDecodeError: If the report lacks required fields.
+        UnsupportedMediaError: If there is no audio stream or too many streams.
+        MediaLimitExceededError: If a declared value exceeds ``limits``.
+    """
     streams = document.get("streams")
     if not isinstance(streams, list):
         raise MediaDecodeError("audio probe: the report lists no streams")
@@ -502,92 +532,32 @@ def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -
     fmt = document.get("format")
     fmt = fmt if isinstance(fmt, dict) else {}
 
-    index = _int(selected.get("index"))
+    index = json_int(selected.get("index"))
     if index is None or not 0 <= index < MAX_STREAMS:
         raise MediaDecodeError("audio probe: the audio stream has no valid index")
-    sample_rate = _int(selected.get("sample_rate"))
-    channel_count = _int(selected.get("channels"))
+    sample_rate = json_int(selected.get("sample_rate"))
+    channel_count = json_int(selected.get("channels"))
     if sample_rate is None or sample_rate < 1 or channel_count is None or channel_count < 1:
         raise MediaDecodeError("audio probe: the audio stream declares no sample rate or layout")
     limits.check_audio(channel_count, sample_rate)
 
-    duration = _float(fmt.get("duration"))
+    duration = json_float(fmt.get("duration"))
     if duration is None or duration < 0:
-        duration = _float(selected.get("duration"))
+        duration = json_float(selected.get("duration"))
     if duration is not None and duration < 0:
         duration = None
     if duration is not None:
         limits.check_duration(duration)
-    bit_rate = _int(fmt.get("bit_rate"))
+    bit_rate = json_int(fmt.get("bit_rate"))
     return AudioInfo(
         container=media_type,
-        format_name=_name(fmt.get("format_name")) or "unknown",
+        format_name=json_name(fmt.get("format_name")) or "unknown",
         duration_seconds=duration,
         sample_rate=sample_rate,
         channels=channel_count,
-        codec=_name(selected.get("codec_name")) or "unknown",
+        codec=json_name(selected.get("codec_name")) or "unknown",
         audio_streams=len(audio),
         video_streams=video_count,
         stream_index=index,
         bit_rate=bit_rate if bit_rate is not None and bit_rate >= 0 else None,
     )
-
-
-def _refuse_constant(name: str) -> Any:
-    raise ValueError(f"non-finite number {name} in the report")
-
-
-def load_json_object(raw: bytes, what: str) -> dict[str, Any]:
-    """Decodes a JSON object from untrusted tool output (internal).
-
-    Args:
-        raw: The tool's standard output.
-        what: A short, safe description for error messages.
-
-    Returns:
-        The decoded object.
-
-    Raises:
-        MediaDecodeError: If the output is not a UTF-8 JSON object.
-    """
-    try:
-        document = json.loads(raw.decode("utf-8"), parse_constant=_refuse_constant)
-    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-        raise MediaDecodeError(f"{what}: the tool report is not valid JSON") from exc
-    if not isinstance(document, dict):
-        raise MediaDecodeError(f"{what}: the tool report is not a JSON object")
-    return document
-
-
-def _int(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and 0 < len(value) <= _MAX_NUMBER_CHARS:
-        try:
-            return int(value.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _float(value: object) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-    elif isinstance(value, str) and 0 < len(value) <= _MAX_NUMBER_CHARS:
-        try:
-            number = float(value.strip())
-        except ValueError:
-            return None
-    else:
-        return None
-    return number if math.isfinite(number) else None
-
-
-def _name(value: object) -> str | None:
-    if not isinstance(value, str) or not value or len(value) > _MAX_NAME_CHARS:
-        return None
-    return value if _NAME_RE.match(value) else None

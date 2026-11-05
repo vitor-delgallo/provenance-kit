@@ -111,3 +111,22 @@ def assertion_cbor(png: bytes, label: str) -> object:
     """Decodes a CBOR assertion of a signed PNG by its JUMBF label."""
     value, _ = cbor_decode(jumbf_cbor_boxes(png_manifest_store(png))[label])
     return value
+
+
+def claim_assertion_lists(png: bytes) -> tuple[list[str], list[str]]:
+    """Returns the labels in the active claim's created and gathered assertion lists.
+
+    Claim version 2 (C2PA 2.3, section 10.2.2) references each assertion by a
+    hashed URI such as ``self#jumbf=c2pa.assertions/cawg.metadata``.
+    """
+    boxes = jumbf_cbor_boxes(png_manifest_store(png))
+    (label,) = [name for name in boxes if name.startswith("c2pa.claim")]
+    claim, _ = cbor_decode(boxes[label])
+    assert isinstance(claim, dict)
+
+    def labels(key: str) -> list[str]:
+        entries = claim.get(key, [])
+        assert isinstance(entries, list)
+        return [str(entry["url"]).rsplit("/", 1)[-1] for entry in entries]
+
+    return labels("created_assertions"), labels("gathered_assertions")

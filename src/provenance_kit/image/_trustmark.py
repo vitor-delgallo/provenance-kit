@@ -12,16 +12,11 @@ and prints progress.
 from __future__ import annotations
 
 import enum
-import hashlib
 import io
 import math
-import os
-import site
 import sys
-import sysconfig
 import threading
-import urllib.error
-import urllib.request
+import types
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +32,14 @@ from provenance_kit.detection import WatermarkDetection
 from provenance_kit.device import parse_device, resolve_device
 from provenance_kit.errors import ModelLoadError, ProvenanceKitError
 from provenance_kit.image import _modes
-from provenance_kit.tempfiles import private_temp_file
+from provenance_kit.modelfiles import (
+    MODEL_DIR_ENV,
+    ModelFile,
+    ensure_model_files,
+    model_directory,
+    read_model_file,
+)
+from provenance_kit.modelfiles import default_model_dir as _default_model_dir
 
 __all__ = [
     "MODEL_BASE_URL",
@@ -62,9 +64,9 @@ _FEATURE = "TrustMark watermarking"
 #: the Content Authenticity Initiative, the same host ``trustmark`` uses).
 MODEL_BASE_URL = "https://cai-watermark.adobe.net/watermarking/trustmark-models/"
 
-#: Environment variable naming the root directory for provenance-kit models;
-#: TrustMark files go in its ``trustmark`` subdirectory.
-MODEL_DIR_ENV = "PROVENANCE_KIT_MODEL_DIR"
+#: The subdirectory of the model root that holds the TrustMark files
+#: (:func:`provenance_kit.modelfiles.default_model_dir`).
+_BACKEND = "trustmark"
 
 _SECRET_LEN = 100  # bits the TrustMark models carry: data + BCH + 4 schema bits
 _ECC_BITS = 96  # data + BCH; the last 4 bits name the schema
@@ -145,19 +147,8 @@ _ENCODINGS: dict[TrustMarkEncoding, tuple[int, int, int]] = {
 _BY_SCHEMA = {schema: encoding for encoding, (schema, _, _) in _ENCODINGS.items()}
 
 
-@dataclass(frozen=True, slots=True)
-class ModelFile:
-    """A pinned model file.
-
-    Attributes:
-        name: The file name in the model directory and on the CDN.
-        size: Its size in bytes.
-        sha256: Its SHA-256, lowercase hex.
-    """
-
-    name: str
-    size: int
-    sha256: str
+def _pinned(name: str, size: int, sha256: str) -> ModelFile:
+    return ModelFile(name=name, url=MODEL_BASE_URL + name, sha256=sha256, size=size)
 
 
 _CONFIG_QPB = "43f37103f92efa8bd6b1c5902bb537cc12a981dc699fca19d9bb7de8c62d03d9"
@@ -168,56 +159,56 @@ _CONFIG_QPB = "43f37103f92efa8bd6b1c5902bb537cc12a981dc699fca19d9bb7de8c62d03d9"
 #: used and not listed.
 MODEL_FILES: Mapping[TrustMarkVariant, tuple[ModelFile, ModelFile, ModelFile]] = {
     TrustMarkVariant.Q: (
-        ModelFile("trustmark_Q.yaml", 2009, _CONFIG_QPB),
-        ModelFile(
+        _pinned("trustmark_Q.yaml", 2009, _CONFIG_QPB),
+        _pinned(
             "encoder_Q.ckpt",
             17302074,
             "dc382c3f6b4fd568b27d6fbb763d6ffc2d2587126d84afe9d5ee95b4c5d99826",
         ),
-        ModelFile(
+        _pinned(
             "decoder_Q.ckpt",
             47652460,
             "e3d9cea5406a26590735719f8f15cb10802b11852ae69047eaf4cf17214df781",
         ),
     ),
     TrustMarkVariant.P: (
-        ModelFile("trustmark_P.yaml", 2009, _CONFIG_QPB),
-        ModelFile(
+        _pinned("trustmark_P.yaml", 2009, _CONFIG_QPB),
+        _pinned(
             "encoder_P.ckpt",
             17301306,
             "659d427f72d16eea4e8fbda175ae72e3a78830dc6cf44b63642a5a4b28a2b4e2",
         ),
-        ModelFile(
+        _pinned(
             "decoder_P.ckpt",
             47647180,
             "f5f1d570c889c5908c6e4a28c07dc90cf33990ebaf24037254ebe0b8849b1bdc",
         ),
     ),
     TrustMarkVariant.B: (
-        ModelFile("trustmark_B.yaml", 2009, _CONFIG_QPB),
-        ModelFile(
+        _pinned("trustmark_B.yaml", 2009, _CONFIG_QPB),
+        _pinned(
             "encoder_B.ckpt",
             17301658,
             "0bbdff257500879803ed0b931cfa3ba9819af971cb3384c2a369e20c57f92b49",
         ),
-        ModelFile(
+        _pinned(
             "decoder_B.ckpt",
             47649788,
             "e3cab2862b7eeff22ddba0a25a230d6da79d9ecf8775e76340ac9ee0931152ed",
         ),
     ),
     TrustMarkVariant.C: (
-        ModelFile(
+        _pinned(
             "trustmark_C.yaml",
             2047,
             "cf38887be05093c23c874ba999d38a70e1fbd2c67b18d388a64bc6446be661d2",
         ),
-        ModelFile(
+        _pinned(
             "encoder_C.ckpt",
             17301658,
             "2eeeaf02178976f04d0996280466a22e53418fee8d7c063990b1a039aec0a50b",
         ),
-        ModelFile(
+        _pinned(
             "decoder_C.ckpt",
             22520762,
             "ede8305d71b569a3a1c11cf51a76a7729a7ec2bc00e74b9a5d617458763b3a42",
@@ -230,14 +221,7 @@ MODEL_FILES: Mapping[TrustMarkVariant, tuple[ModelFile, ModelFile, ModelFile]] =
 # pretrained weights from the internet.
 _ALLOWED_TARGET_PREFIX = "trustmark."
 _ALLOWED_DECODER_ARCHS = frozenset({"resnet50", "resnet18"})
-_QUIET_MODULES = (
-    "trustmark.trustmark",
-    "trustmark.model",
-    "trustmark.unet",
-    "trustmark.datalayer",
-    "trustmark.denoise",
-    "trustmark.bchecc",
-)
+_TRUSTMARK_PACKAGE = "trustmark"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -266,104 +250,14 @@ def default_model_dir() -> Path:
     """Returns the default TrustMark model directory.
 
     ``$PROVENANCE_KIT_MODEL_DIR/trustmark`` when the variable is set; else
-    ``provenance-kit/models/trustmark`` in a per-user cache directory:
-    ``%LOCALAPPDATA%`` on Windows, ``~/Library/Caches`` on macOS,
-    ``$XDG_CACHE_HOME`` (default ``~/.cache``) elsewhere. Never inside
+    ``provenance-kit/models/trustmark`` in the per-user cache directory (see
+    :func:`provenance_kit.modelfiles.default_model_dir`). Never inside
     ``site-packages``.
 
     Returns:
         The directory (it may not exist yet).
     """
-    configured = os.environ.get(MODEL_DIR_ENV, "").strip()
-    if configured:
-        return Path(configured) / "trustmark"
-    if sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Caches"
-    else:
-        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    return base / "provenance-kit" / "models" / "trustmark"
-
-
-def _site_roots() -> set[Path]:
-    candidates: list[str] = []
-    paths = sysconfig.get_paths()
-    candidates += [paths.get("purelib", ""), paths.get("platlib", "")]
-    getsitepackages = getattr(site, "getsitepackages", None)
-    if getsitepackages is not None:
-        candidates += list(getsitepackages())
-    user_site = getattr(site, "getusersitepackages", None)
-    if user_site is not None:
-        candidates.append(user_site())
-    return {Path(c).resolve() for c in candidates if c}
-
-
-def _model_dir(model_dir: StrPath | None) -> Path:
-    directory = Path(model_dir) if model_dir is not None else default_model_dir()
-    resolved = directory.resolve()
-    for root in _site_roots():
-        if resolved == root or root in resolved.parents:
-            raise ValueError("the model directory must not be inside site-packages")
-    return resolved
-
-
-def _read_verified(directory: Path, spec: ModelFile) -> bytes:
-    path = directory / spec.name
-    try:
-        with path.open("rb") as handle:
-            data = handle.read(spec.size + 1)
-    except FileNotFoundError:
-        raise ModelLoadError(
-            f"TrustMark model file {spec.name} is not in the model directory: provision it "
-            "or call download_trustmark_models()"
-        ) from None
-    except OSError as exc:
-        raise ModelLoadError(f"TrustMark model file {spec.name} could not be read") from exc
-    if len(data) != spec.size or hashlib.sha256(data).hexdigest() != spec.sha256:
-        raise ModelLoadError(f"TrustMark model file {spec.name} failed its SHA-256 check")
-    return data
-
-
-def _is_valid(directory: Path, spec: ModelFile) -> bool:
-    try:
-        _read_verified(directory, spec)
-    except ModelLoadError:
-        return False
-    return True
-
-
-class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(  # noqa: PLR0917 - signature fixed by urllib
-        self,
-        req: urllib.request.Request,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        if not newurl.lower().startswith("https://"):
-            raise urllib.error.URLError("refusing a redirect away from HTTPS")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-def _fetch(url: str, size: int, timeout_seconds: float) -> bytes:
-    opener = urllib.request.build_opener(_HttpsOnlyRedirects())
-    request = urllib.request.Request(url, headers={"User-Agent": "provenance-kit"})  # noqa: S310 - pinned https URL
-    try:
-        with opener.open(request, timeout=timeout_seconds) as response:
-            chunks: list[bytes] = []
-            received = 0
-            while received <= size:
-                chunk = response.read(min(1 << 20, size + 1 - received))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                received += len(chunk)
-    except (OSError, ValueError) as exc:  # URLError, HTTPError and timeouts are OSErrors
-        raise ModelLoadError(f"TrustMark model download failed ({type(exc).__name__})") from exc
-    return b"".join(chunks)
+    return _default_model_dir(_BACKEND)
 
 
 def download_trustmark_models(
@@ -375,9 +269,10 @@ def download_trustmark_models(
     """Downloads a variant's model files into the model directory.
 
     This is the only function in the image module that uses the network.
-    Files already present with the right SHA-256 are kept; others are
-    fetched over HTTPS from :data:`MODEL_BASE_URL`, checked against
-    :data:`MODEL_FILES` (size and SHA-256) and written atomically. Run it at
+    Files already present with the right size and SHA-256 are kept; others
+    are fetched over HTTPS from :data:`MODEL_BASE_URL`, checked against
+    :data:`MODEL_FILES` and written atomically
+    (:func:`provenance_kit.modelfiles.ensure_model_files`). Run it at
     deployment time (or provision the files by hand) and construct
     :class:`TrustMarkBackend` offline.
 
@@ -386,10 +281,10 @@ def download_trustmark_models(
             B, 40 MB for C).
         model_dir: The target directory; ``None`` uses
             :func:`default_model_dir`. Created if needed.
-        timeout_seconds: Socket timeout for each request.
+        timeout_seconds: Socket timeout for each read.
 
     Returns:
-        The model directory.
+        The model directory (absolute).
 
     Raises:
         TypeError: If ``timeout_seconds`` is not a number.
@@ -398,24 +293,8 @@ def download_trustmark_models(
         ModelLoadError: If a download fails or a file fails its check.
     """
     chosen = TrustMarkVariant(variant)
-    timeout: object = timeout_seconds
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-        raise TypeError("timeout_seconds must be a number")
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("timeout_seconds must be positive and finite")
-    directory = _model_dir(model_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    for spec in MODEL_FILES[chosen]:
-        if _is_valid(directory, spec):
-            continue
-        _log.info("downloading TrustMark model file %s (%d bytes)", spec.name, spec.size)
-        data = _fetch(MODEL_BASE_URL + spec.name, spec.size, float(timeout_seconds))
-        if len(data) != spec.size or hashlib.sha256(data).hexdigest() != spec.sha256:
-            raise ModelLoadError(f"downloaded TrustMark model file {spec.name} failed its check")
-        with private_temp_file(
-            directory=directory, prefix=".pk-", suffix=".part", data=data
-        ) as tmp:
-            os.replace(tmp, directory / spec.name)
+    directory = model_directory(model_dir, _BACKEND)
+    ensure_model_files(MODEL_FILES[chosen], directory, timeout_seconds=timeout_seconds)
     return directory
 
 
@@ -424,6 +303,22 @@ def download_trustmark_models(
 
 def _quiet_print(*args: object, **kwargs: object) -> None:
     _log.debug("trustmark: %s", " ".join(str(a) for a in args)[:200])
+
+
+def _silence_trustmark() -> None:
+    """Redirects ``print`` in the loaded ``trustmark`` modules to DEBUG logging.
+
+    Each ``trustmark`` module gets a module-global ``print`` that shadows the
+    built-in one for the code of that module only. ``builtins.print`` is not
+    touched, so every other library (and the application) prints as usual.
+    """
+    prefix = _TRUSTMARK_PACKAGE + "."
+    for name, module in list(sys.modules.items()):
+        entry: object = module  # sys.modules may also hold None (import blockers)
+        if isinstance(entry, types.ModuleType) and (
+            name == _TRUSTMARK_PACKAGE or name.startswith(prefix)
+        ):
+            entry.print = _quiet_print  # type: ignore[attr-defined]
 
 
 def _check_targets(node: Any) -> None:
@@ -459,9 +354,9 @@ class TrustMarkBackend:
     :func:`download_trustmark_models` is called).
 
     Output: ``trustmark`` prints progress with ``print()``; the backend
-    replaces ``print`` in the ``trustmark`` modules with a DEBUG-level log
-    call (a process-wide change to those modules only), so nothing reaches
-    stdout or stderr.
+    gives every loaded ``trustmark`` module its own module-global ``print``
+    that logs at DEBUG level, so nothing reaches stdout or stderr. The
+    built-in ``print`` is not patched: other libraries' output is untouched.
 
     Cost (measured on a CPU): the first construction in a process takes
     about 5 s, mostly importing PyTorch, TorchVision and Lightning; another
@@ -512,16 +407,13 @@ class TrustMarkBackend:
         self._variant = TrustMarkVariant(variant)
         self._encoding = TrustMarkEncoding(encoding)
         requested_device = parse_device(device)
-        directory = _model_dir(model_dir)
+        directory = model_directory(model_dir, _BACKEND)
         torch = import_optional("torch", extra=_EXTRA, feature=_FEATURE)
         tm_module = import_optional("trustmark.trustmark", extra=_EXTRA, feature=_FEATURE)
         import_optional("trustmark.model", extra=_EXTRA, feature=_FEATURE)
         datalayer = import_optional("trustmark.datalayer", extra=_EXTRA, feature=_FEATURE)
         omegaconf = import_optional("omegaconf", extra=_EXTRA, feature=_FEATURE)
-        for name in _QUIET_MODULES:
-            module = sys.modules.get(name)
-            if module is not None:
-                module.print = _quiet_print  # type: ignore[attr-defined]
+        _silence_trustmark()
         self._device = resolve_device(requested_device, torch)
 
         if download:
@@ -529,7 +421,7 @@ class TrustMarkBackend:
                 self._variant, model_dir=directory, timeout_seconds=download_timeout_seconds
             )
         config_spec, encoder_spec, decoder_spec = MODEL_FILES[self._variant]
-        config_text = _read_verified(directory, config_spec).decode("utf-8")
+        config_text = read_model_file(config_spec, directory).decode("utf-8")
         parts = {}
         for part, spec in (("encoder", encoder_spec), ("decoder", decoder_spec)):
             parts[part] = _build_model(
@@ -537,7 +429,7 @@ class TrustMarkBackend:
                 tm_module=tm_module,
                 omegaconf=omegaconf,
                 config_text=config_text,
-                weights=_read_verified(directory, spec),
+                weights=read_model_file(spec, directory),
                 part=part,
                 device=self._device,
             )

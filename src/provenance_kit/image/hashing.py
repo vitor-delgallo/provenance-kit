@@ -4,10 +4,11 @@ Three hashes, for finding copies of an image after re-encoding, resizing or
 small edits:
 
 * **PDQ** (Meta), 256 bits plus a quality score. :class:`PdqHasher` runs one
-  of two backends behind :class:`PdqBackend`: the ``pdqhash`` package (Meta's
-  C++ code, extra ``image-hash``) when it is installed, else a NumPy port of
-  Meta's pure-Python reference implementation that needs nothing beyond the
-  core install. Both give the same hash for the same pixels on the test
+  of two backends behind :class:`PdqBackend`: a NumPy port of Meta's
+  pure-Python reference implementation that needs nothing beyond the core
+  install (the default backend), and the ``pdqhash`` package (Meta's C++
+  code, extra ``pdq-native``), which ``"auto"`` prefers when it is
+  installed. Both give the same hash for the same pixels on the test
   corpus; see "Backend agreement" below.
 * **pHash** (DCT) and **dHash** (gradient), 64 bits each by default, through
   the ``imagehash`` package (extra ``image-hash``): :func:`phash`,
@@ -353,7 +354,7 @@ class _PdqhashBackend:
     name = PdqBackendName.PDQHASH.value
 
     def __init__(self) -> None:
-        module = import_optional("pdqhash", extra="image-hash", feature="PDQ with pdqhash")
+        module = import_optional("pdqhash", extra="pdq-native", feature="PDQ with pdqhash")
         self._compute = module.compute
 
     def hash_rgb(self, rgb: NDArray[np.uint8]) -> tuple[bytes, int]:

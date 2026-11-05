@@ -1,8 +1,9 @@
 """TrustMark with the real model: round trips, encoders, quietness, model checks.
 
-The model files live in the git-ignored ``.cache/models/trustmark``
-directory. ``pytest --run-network`` downloads the Q variant there once (65 MB,
-verified by SHA-256); later runs are offline. Tests for the P and C variants
+The model files live in ``tests.support.model_dir`` (the git-ignored
+``.cache/models/trustmark/``, or ``$PROVENANCE_KIT_MODEL_DIR/trustmark``).
+``pytest --run-network`` downloads the Q variant there once (65 MB, verified
+by SHA-256); later runs are offline. Tests for the P and C variants
 run when their files are present (``download_trustmark_models("P", ...)``).
 """
 
@@ -16,7 +17,6 @@ import pytest
 from PIL import Image
 
 from provenance_kit.errors import ModelLoadError
-from provenance_kit.image import _trustmark
 from provenance_kit.image.watermark import (
     DEFAULT_STRENGTHS,
     MODEL_FILES,
@@ -28,16 +28,23 @@ from provenance_kit.image.watermark import (
     download_trustmark_models,
     psnr,
 )
+from provenance_kit.modelfiles import verify_model_file
 from tests.image.pdq_corpus import make_image
-from tests.support import REPO_ROOT, require_module
+from tests.support import model_dir as support_model_dir
+from tests.support import require_module
 
 pytestmark = pytest.mark.integration
 
-MODEL_DIR = REPO_ROOT / ".cache" / "models" / "trustmark"
+MODEL_DIR = support_model_dir("trustmark")
 
 
 def _has_files(variant):
-    return all(_trustmark._is_valid(MODEL_DIR, spec) for spec in MODEL_FILES[variant])
+    try:
+        for spec in MODEL_FILES[variant]:
+            verify_model_file(MODEL_DIR / spec.name, spec)
+    except ModelLoadError:
+        return False
+    return True
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +54,7 @@ def model_dir(request):
     if not _has_files(TrustMarkVariant.Q):
         if not request.config.getoption("--run-network"):
             pytest.skip(
-                "TrustMark Q model files are not in .cache/models/trustmark: run "
+                f"TrustMark Q model files are not in {MODEL_DIR}: run "
                 "pytest --run-network once to download them"
             )
         download_trustmark_models("Q", model_dir=MODEL_DIR)
@@ -181,7 +188,7 @@ def test_tampered_model_file_is_refused(model_dir, tmp_path):
 @pytest.mark.parametrize("variant", [TrustMarkVariant.P, TrustMarkVariant.C])
 def test_other_variants_when_provisioned(model_dir, variant):
     if not _has_files(variant):
-        pytest.skip(f"TrustMark {variant.value} model files are not in .cache/models/trustmark")
+        pytest.skip(f"TrustMark {variant.value} model files are not in {MODEL_DIR}")
     marker = ImageWatermarker(TrustMarkBackend(model_dir=model_dir, variant=variant))
     # A textured image: variant P cannot hold a mark on very smooth content
     # (it fails even before encoding on the smooth corpus images).

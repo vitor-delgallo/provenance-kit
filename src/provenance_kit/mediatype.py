@@ -8,6 +8,13 @@ What it detects is the *container*. An MP4 file may hold only audio and an Ogg
 file may hold video: a backend that cares must still probe the streams (for
 example with ffprobe) after sniffing, and must still enforce
 :class:`~provenance_kit.limits.MediaLimits` on what the probe reports.
+
+An ID3v2 tag at the start of the data usually means MP3, but FLAC can be
+tagged that way too: c2pa-rs embeds C2PA manifests in FLAC files behind an
+ID3v2 tag, so every signed FLAC starts with ``ID3``. When the bytes right
+after the tag are a FLAC stream marker (``fLaC``), the type is FLAC. The tag
+can be larger than :data:`SNIFF_BYTES` (it holds the whole manifest), so this
+needs the data up to the end of the tag: pass the whole content.
 """
 
 from __future__ import annotations
@@ -101,7 +108,9 @@ def sniff_media_type(data: BytesLike) -> MediaType | None:
 
     Args:
         data: The start of the media; at least :data:`SNIFF_BYTES` bytes are
-            recommended (the whole content is fine, only the head is read).
+            recommended (the whole content is fine: only the head is read,
+            plus the 4 bytes after a leading ID3v2 tag, see the module
+            docstring).
 
     Returns:
         The detected type, or ``None`` if the bytes match no supported format.
@@ -112,8 +121,9 @@ def sniff_media_type(data: BytesLike) -> MediaType | None:
     """
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError(f"data must be bytes-like, got {type(data).__name__}")
-    head = bytes(memoryview(data).cast("B")[:SNIFF_BYTES])
-    return (
+    view = memoryview(data).cast("B")
+    head = bytes(view[:SNIFF_BYTES])
+    detected = (
         _sniff_image(head)
         or _sniff_riff_family(head)
         or _sniff_iso_bmff(head)
@@ -121,6 +131,9 @@ def sniff_media_type(data: BytesLike) -> MediaType | None:
         or _sniff_audio(head)
         or _sniff_mpeg_ts(head)
     )
+    if detected is MediaType.MP3 and _flac_behind_id3(head, view):
+        return MediaType.FLAC
+    return detected
 
 
 def require_media_type(
@@ -239,6 +252,21 @@ def _sniff_audio(head: bytes) -> MediaType | None:
         if second & 0xE0 == 0xE0 and layer != 0 and bitrate != 0xF and sample_rate != 0b11:
             return MediaType.MP3
     return None
+
+
+def _flac_behind_id3(head: bytes, view: memoryview) -> bool:
+    """Says whether a leading ID3v2 tag is followed by a FLAC stream marker."""
+    if len(head) < 10 or not head.startswith(b"ID3"):
+        return False
+    size_bytes = head[6:10]
+    if any(byte & 0x80 for byte in size_bytes):  # synchsafe integers have bit 7 clear
+        return False
+    size = 0
+    for byte in size_bytes:
+        size = (size << 7) | byte
+    footer = 10 if head[5] & 0x10 else 0  # ID3v2.4 footer flag
+    start = 10 + size + footer
+    return bytes(view[start : start + 4]) == b"fLaC"
 
 
 def _sniff_mpeg_ts(head: bytes) -> MediaType | None:

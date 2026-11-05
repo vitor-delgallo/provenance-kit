@@ -40,8 +40,9 @@ Until 1.0, minor versions may change the API.
   one Pillow parser per type, EXIF orientation, ICC profile kept or applied,
   8-bit RGB/RGBA output, `MediaDecodeError` for every decoder failure; JPEG,
   PNG/APNG, GIF, WebP, AVIF; HEIC/HEIF through caller-supplied openers.
-- `provenance_kit.image.hashing`: `PdqHasher` / `PdqHash` with `pdqhash` or a
-  NumPy port of Meta's reference (bit-exact on the reference vectors, equal to
+- `provenance_kit.image.hashing`: `PdqHasher` / `PdqHash` with a NumPy port
+  of Meta's reference (the default; `pdqhash`, extra `pdq-native`, is
+  preferred when installed) (bit-exact on the reference vectors, equal to
   ThreatExchange's published hashes), pHash/dHash via `imagehash`,
   `ImageFingerprint`, `compare_fingerprints`, `MatchThresholds` (Meta's PDQ
   defaults: distance 31, quality 50) and `HashList`, an exact vectorized
@@ -83,3 +84,46 @@ Until 1.0, minor versions may change the API.
   allowlist unpickling, in-memory resampling to 16 kHz) with
   `embed_watermark`, `detect_watermark` and `embed_verified`. Documentation and
   measured robustness in `docs/audio.md`.
+- `provenance_kit.modelfiles` (consolidation of the three watermark
+  backends): `ModelFile`, `default_model_dir` (`$PROVENANCE_KIT_MODEL_DIR/<backend>`,
+  else `provenance-kit/models/<backend>` in the per-user cache directory),
+  `model_directory`, `verify_model_file`, `read_model_file`,
+  `find_model_file`, `download_model_file` and `ensure_model_files`.
+  TrustMark, VideoSeal and AudioSeal use it.
+- `provenance_kit.tools`: a `ToolProcess` can be the `stdin` of another tool
+  (piping), with `ToolProcess.bytes_read` and
+  `ToolProcess.output_limit_exceeded`.
+- `MediaLimits.max_image_frames` (default 5,000).
+- `provenance_kit.provenance.c2pa`: `AssertionPlacement` and
+  `ManifestSpec.placements` (`AssertionPlacements`): each assertion is
+  written as created or gathered (C2PA 2.3, section 10.2.2).
+- AudioSeal detection: an opt-in alignment search over sample offsets
+  (`AlignmentSearch`, `detect_watermark(..., alignment=...)`).
+
+### Changed
+
+- The ffmpeg/ffprobe plumbing of the video and audio modules (input staging,
+  mandatory arguments, defensive ffprobe JSON parsing) and their argument
+  checks live in one private core module each (`provenance_kit._ffmpeg`,
+  `provenance_kit._checks`).
+- One default model directory for every backend (see `modelfiles` above);
+  VideoSeal and AudioSeal used `~/.cache/provenance-kit/<backend>` before. A
+  `model_dir` inside `site-packages` is refused for every backend, and the
+  download functions keep valid files and replace missing or invalid ones.
+- `provenance_kit.mediatype` detects FLAC behind an ID3v2 tag (as c2pa-rs
+  writes signed FLAC) instead of MP3; the C2PA module's own check is gone.
+- `image.loading` caps animated images with `MediaLimits.max_image_frames`;
+  `DEFAULT_MAX_IMAGE_FRAMES` is removed. The `max_frames` argument still
+  overrides it per call.
+- Packaging: `pdqhash` moved from `image-hash` to its own extra,
+  `pdq-native` (it needs a C++ compiler on Linux); `image-hash` installs
+  `imagehash` only, `video` needs no Python packages, and `all` does not
+  include `pdq-native`.
+- `OpenTimestamper(min_calendars=...)` defaults to 2, the official client's
+  `-m` (was 1); `DEFAULT_MIN_CALENDARS`.
+- C2PA: the authors (`cawg.metadata`) are written as a gathered assertion by
+  default; actions, training-mining and soft binding stay created.
+- VideoSeal: the default strength is 0.5 (`VIDEOSEAL_DEFAULT_STRENGTH`; was
+  the model's 0.2), measured in `docs/video.md`; `strength=None` keeps 0.2.
+- TrustMark: `print` is silenced in every loaded `trustmark` module (still a
+  module-global name only; `builtins.print` is never patched).

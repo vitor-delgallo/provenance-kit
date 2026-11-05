@@ -42,6 +42,7 @@ backend.
 
 from __future__ import annotations
 
+from provenance_kit.modelfiles import MODEL_DIR_ENV, ModelFile
 from provenance_kit.video.watermark._api import (
     DEFAULT_MAX_P_VALUE,
     DEFAULT_MIN_MEAN_ABS_SCORE,
@@ -52,12 +53,12 @@ from provenance_kit.video.watermark._api import (
     embed_watermark,
 )
 from provenance_kit.video.watermark._videoseal import (
+    VIDEOSEAL_DEFAULT_STRENGTH,
     VIDEOSEAL_MODEL,
     VIDEOSEAL_PAYLOAD_BITS,
     VideoSealBackend,
     download_videoseal_model,
 )
-from provenance_kit.video.watermark._weights import MODEL_DIR_ENV, ModelFile
 from provenance_kit.video.watermark.base import (
     Frame,
     VideoWatermarkBackend,
@@ -69,6 +70,7 @@ __all__ = [
     "DEFAULT_MAX_P_VALUE",
     "DEFAULT_MIN_MEAN_ABS_SCORE",
     "MODEL_DIR_ENV",
+    "VIDEOSEAL_DEFAULT_STRENGTH",
     "VIDEOSEAL_MODEL",
     "VIDEOSEAL_PAYLOAD_BITS",
     "Frame",

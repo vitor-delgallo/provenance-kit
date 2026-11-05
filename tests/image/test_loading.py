@@ -19,7 +19,6 @@ from provenance_kit.errors import (
     UnsupportedMediaError,
 )
 from provenance_kit.image.loading import (
-    DEFAULT_MAX_IMAGE_FRAMES,
     ImageMode,
     iter_frames,
     load_image,
@@ -283,16 +282,24 @@ def test_iter_frames_of_a_still_image():
 
 
 def test_huge_gif_frame_count_is_refused_before_decoding():
-    data = _gif_with_frames(DEFAULT_MAX_IMAGE_FRAMES + 1)
+    default = MediaLimits().max_image_frames
+    assert default == 5_000
+    data = _gif_with_frames(default + 1)
     with pytest.raises(MediaLimitExceededError) as info:
         load_image(data)
-    assert info.value.limit == "max_frames"
-    assert info.value.actual == DEFAULT_MAX_IMAGE_FRAMES + 1
+    assert info.value.limit == "max_image_frames"
+    assert info.value.actual == default + 1
     with pytest.raises(MediaLimitExceededError):
         iter_frames(data)
     assert load_image(_gif_with_frames(12), max_frames=12).info.frame_count == 12
-    with pytest.raises(MediaLimitExceededError):
+    with pytest.raises(MediaLimitExceededError) as info:
         load_image(_gif_with_frames(12), max_frames=11)
+    assert info.value.limit == "max_frames"
+    limits = dataclasses.replace(MediaLimits(), max_image_frames=11)
+    with pytest.raises(MediaLimitExceededError) as info:
+        probe_image(_gif_with_frames(12), limits=limits)
+    assert info.value.limit == "max_image_frames"
+    assert probe_image(_gif_with_frames(12), limits=limits, max_frames=12).frame_count == 12
 
 
 def test_declared_apng_frame_count_is_refused_cheaply():
@@ -303,7 +310,7 @@ def test_declared_apng_frame_count_is_refused_cheaply():
     data[index + 12 : index + 16] = struct.pack(">I", zlib.crc32(b"acTL" + body))
     with pytest.raises(MediaLimitExceededError) as info:
         load_image(bytes(data))
-    assert info.value.limit == "max_frames"
+    assert info.value.limit == "max_image_frames"
 
 
 def test_video_frame_limit_also_applies():

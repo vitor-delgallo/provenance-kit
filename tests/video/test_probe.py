@@ -14,7 +14,6 @@ from provenance_kit.errors import (
 )
 from provenance_kit.limits import MediaLimits
 from provenance_kit.mediatype import MediaType
-from provenance_kit.video._ffmpeg import needs_seekable_input, staged_input
 from provenance_kit.video.probe import MAX_STREAMS, VideoInfo, parse_probe_output, probe_video
 from tests.support import assert_imports_lightly
 from tests.video.fakes import MP4_MDAT_FIRST, MP4_MOOV_FIRST, WEBM, FakeTools, probe_json
@@ -186,60 +185,6 @@ def test_video_info_validates_rotation():
         dataclasses.replace(info, rotation=45)
 
 
-# ------------------------------------------------------------ input staging
-
-
-def box(kind: bytes, payload: bytes = b"", size: int | None = None) -> bytes:
-    length = 8 + len(payload) if size is None else size
-    return length.to_bytes(4, "big") + kind + payload
-
-
-FTYP = box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2")
-
-
-@pytest.mark.parametrize(
-    ("data", "expected"),
-    [
-        (FTYP + box(b"moov") + box(b"mdat"), False),
-        (FTYP + box(b"free") + box(b"mdat", b"x" * 10) + box(b"moov"), True),
-        (FTYP + box(b"moof") + box(b"mdat"), False),
-        (FTYP + box(b"mdat", size=0) + b"\x00" * 64, True),
-        (
-            FTYP
-            + (1).to_bytes(4, "big")
-            + b"free"
-            + (24).to_bytes(8, "big")
-            + b"\x00" * 8
-            + box(b"moov"),
-            False,
-        ),
-        (FTYP + box(b"free", size=3), True),
-        (FTYP + b"\x00\x00", True),
-        (FTYP + box(b"free") * 5000, True),
-    ],
-)
-def test_needs_seekable_input(data, expected):
-    assert needs_seekable_input(data, MediaType.MP4) is expected
-
-
-def test_non_bmff_containers_always_stream():
-    assert needs_seekable_input(WEBM, MediaType.WEBM) is False
-
-
-def test_staged_input_uses_a_pipe_or_a_private_temporary_file(tmp_path):
-    with staged_input(MP4_MOOV_FIRST, MediaType.MP4, "mov", temp_dir=tmp_path) as staged:
-        assert staged.target == "pipe:0"
-        assert staged.input_args()[:4] == ["-protocol_whitelist", "pipe", "-f", "mov"]
-    with staged_input(MP4_MDAT_FIRST, MediaType.MP4, "mov", temp_dir=tmp_path) as staged:
-        assert staged.stdin is None
-        assert staged.target.startswith("file:")
-        assert staged.input_args()[1] == "file,pipe"
-        files = list(tmp_path.iterdir())
-        assert len(files) == 1
-        assert files[0].read_bytes() == MP4_MDAT_FIRST
-    assert list(tmp_path.iterdir()) == []
-
-
 # ------------------------------------------------------------ probe_video
 
 
@@ -253,6 +198,16 @@ def test_probe_video_passes_safe_arguments():
     assert args[args.index("-f") + 1] == "mov"
     assert args[args.index("-i") + 1] == "pipe:0"
     assert tools.calls[0][2]["max_stdout_bytes"] <= 1024 * 1024
+
+
+def test_probe_video_reads_a_trailing_moov_mp4_from_a_private_file(tmp_path):
+    tools = FakeTools(ffprobe=probe_json())
+    probe_video(MP4_MDAT_FIRST, tools=tools, temp_dir=tmp_path)  # type: ignore[arg-type]
+    ((_, args, kwargs),) = tools.calls
+    assert args[args.index("-protocol_whitelist") + 1] == "file,pipe"
+    assert args[args.index("-i") + 1].startswith("file:")
+    assert kwargs["stdin"] is None
+    assert list(tmp_path.iterdir()) == []  # deleted after the call
 
 
 def test_probe_video_refuses_non_video_bytes():

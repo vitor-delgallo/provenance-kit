@@ -57,6 +57,8 @@ from provenance_kit.provenance.c2pa._api import read_manifest, sign_asset
 from provenance_kit.provenance.c2pa._json import JsonValue
 from provenance_kit.provenance.c2pa._manifest import (
     ActionType,
+    AssertionPlacement,
+    AssertionPlacements,
     DigitalSourceType,
     GeneratorInfo,
     Ingredient,
@@ -94,6 +96,8 @@ __all__ = [
     "MANIFEST_UNREADABLE",
     "SUPPORTED_MEDIA_TYPES",
     "ActionType",
+    "AssertionPlacement",
+    "AssertionPlacements",
     "C2paSigner",
     "DigitalSourceType",
     "GeneratorInfo",

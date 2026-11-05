@@ -1,9 +1,10 @@
 """VideoSeal with the real model and real codecs (bit accuracy after encoding).
 
-The model (228 MB) is read from ``model-cache/videoseal/`` (git-ignored). If
-it is missing the tests skip, unless ``--run-network`` is given, in which case
-it is downloaded there from the official URL and verified against the pinned
-SHA-256. Run with ``-s`` to print the measured numbers; they are recorded in
+The model (228 MB) is read from ``tests.support.model_dir`` (the git-ignored
+``.cache/models/videoseal/``, or ``$PROVENANCE_KIT_MODEL_DIR/videoseal``). If
+it is missing the tests skip, unless ``--run-network`` is given, in which
+case it is downloaded there from the official URL and verified against the
+pinned SHA-256. Run with ``-s`` to print the measured numbers; they are recorded in
 ``docs/video.md``.
 """
 
@@ -20,6 +21,7 @@ from provenance_kit.errors import ModelLoadError
 from provenance_kit.tools import ExternalTools, Tool
 from provenance_kit.video.frames import iter_frames
 from provenance_kit.video.watermark import (
+    VIDEOSEAL_DEFAULT_STRENGTH,
     VIDEOSEAL_MODEL,
     RepetitionCode,
     VideoSealBackend,
@@ -28,12 +30,12 @@ from provenance_kit.video.watermark import (
     embed_verified,
     embed_watermark,
 )
-from tests.support import REPO_ROOT, SEED, find_tools, require_module, require_tool
+from tests.support import SEED, find_tools, model_dir, require_module, require_tool
 from tests.video.media import H264, MANDELBROT, TESTSRC2, VP9, encode_frames, psnr, raw_frames
 
 pytestmark = pytest.mark.integration
 
-MODEL_DIR = REPO_ROOT / "model-cache" / "videoseal"
+MODEL_DIR = model_dir("videoseal")
 W, H, RATE, COUNT = 320, 240, 24, 24
 CODE = RepetitionCode(copies=4)
 CODEC = PayloadCodec(CODE.data_bits, version_bits=4, check_bits=12)
@@ -51,8 +53,7 @@ def ensure_model(request: pytest.FixtureRequest) -> None:
         return
     if not request.config.getoption("--run-network"):
         pytest.skip(
-            "the VideoSeal model is not in model-cache/videoseal/: run with --run-network "
-            "to download it"
+            f"the VideoSeal model is not in {MODEL_DIR}: run with --run-network to download it"
         )
     download_videoseal_model(MODEL_DIR)
 
@@ -68,8 +69,8 @@ def tools() -> ExternalTools:
 def backends(request) -> dict[float, VideoSealBackend]:
     ensure_model(request)
     return {
-        0.2: VideoSealBackend(model_dir=MODEL_DIR),
-        0.5: VideoSealBackend(model_dir=MODEL_DIR, strength=0.5),
+        0.2: VideoSealBackend(model_dir=MODEL_DIR, strength=None),  # the model's built-in value
+        0.5: VideoSealBackend(model_dir=MODEL_DIR),  # the default
     }
 
 
@@ -92,9 +93,10 @@ def test_download_verifies_the_pinned_model():
     assert path.stat().st_size == VIDEOSEAL_MODEL.size
 
 
-def test_the_default_strength_is_the_upstream_one(backends):
-    assert backends[0.2].strength == pytest.approx(0.2)
-    assert backends[0.2].step_size == 4
+def test_the_default_strength_and_the_upstream_one(backends):
+    assert backends[0.5].strength == pytest.approx(VIDEOSEAL_DEFAULT_STRENGTH) == 0.5
+    assert backends[0.2].strength == pytest.approx(0.2)  # strength=None: the model's own
+    assert backends[0.2].step_size == backends[0.5].step_size == 4
 
 
 def test_tampered_models_are_refused(tmp_path, request):
@@ -105,18 +107,21 @@ def test_tampered_models_are_refused(tmp_path, request):
         VideoSealBackend(model_dir=tmp_path)
 
 
+@pytest.mark.parametrize("strength", [0.2, 0.5])
 @pytest.mark.parametrize("source", sorted(SOURCES))
-def test_raw_round_trip(backends, sources, source):
-    backend = backends[0.2]
+def test_raw_round_trip(backends, sources, source, strength):
+    backend = backends[strength]
     frames = sources[source]
     marked = list(embed_watermark(frames, payload(), backend=backend, repetition=CODE))
     quality = psnr(np.stack(marked), np.stack(frames))
     detection = detect_watermark(marked, backend=backend, codec=CODEC, repetition=CODE)
     clean = detect_watermark(frames, backend=backend, codec=CODEC, repetition=CODE)
     print(
-        f"\n{source} raw: PSNR {quality:.1f} dB, p={detection.p_value:.2g}, "
-        f"clean p={clean.p_value:.2g}"
+        f"\n{source} raw, strength {strength}: PSNR {quality:.1f} dB, "
+        f"p={detection.p_value:.2g}, clean p={clean.p_value:.2g}"
     )
+    # The default (0.5) was chosen because it keeps the PSNR above 40 dB on
+    # the textured content (measured 41.5 dB; 44.7 dB on testsrc2).
     assert quality > 40
     assert detection.found
     assert detection.bits == payload()

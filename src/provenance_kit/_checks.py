@@ -1,4 +1,4 @@
-"""Argument validation helpers for the video modules (internal)."""
+"""Argument validation helpers shared by the modules (internal)."""
 
 from __future__ import annotations
 

@@ -39,25 +39,28 @@ import math
 import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import BinaryIO, cast
 
 import numpy as np
 import numpy.typing as npt
 
+from provenance_kit._checks import check_int, check_number
+from provenance_kit._ffmpeg import (
+    as_media_error,
+    check_media_input,
+    load_json_object,
+    staged_input,
+)
 from provenance_kit._logging import get_logger
 from provenance_kit._typing import BytesLike, StrPath
-from provenance_kit.audio._checks import check_int, check_number
-from provenance_kit.audio._ffmpeg import as_media_error, check_audio_input, staged_input
 from provenance_kit.audio.pcm import (
+    AUDIO_CONTAINERS,
     PcmAudio,
-    load_json_object,
     pcm_args,
     probe_staged,
     sample_cap_bytes,
 )
 from provenance_kit.errors import (
     ExternalToolError,
-    ExternalToolTimeoutError,
     MediaDecodeError,
     MediaLimitExceededError,
 )
@@ -286,7 +289,7 @@ def fingerprint_audio(
         check_number(
             "max_duration_seconds", max_duration_seconds, minimum=0.0, exclusive_minimum=True
         )
-    media_type = check_audio_input(data, limits)
+    media_type = check_media_input(data, limits, AUDIO_CONTAINERS)
     timeout = limits.subprocess_timeout_seconds if timeout_seconds is None else timeout_seconds
     with staged_input(data, media_type, temp_dir=temp_dir) as staged:
         info = probe_staged(staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout)
@@ -305,18 +308,27 @@ def fingerprint_audio(
             sample_rate=CHROMAPRINT_SAMPLE_RATE,
             max_duration_seconds=max_duration_seconds,
         )
+        decoder: ToolProcess | None = None
         try:
+            # ffmpeg's PCM output is piped straight into fpcalc; the output cap
+            # on ffmpeg bounds what fpcalc can be fed.
             with tools.stream(
-                Tool.FFMPEG, args, stdin=staged.stdin, timeout_seconds=timeout
+                Tool.FFMPEG, args, stdin=staged.stdin, timeout_seconds=timeout, max_stdout_bytes=cap
             ) as decoder:
-                reader = _CountingReader(decoder, cap, limits)
-                values = _run_fpcalc(tools, reader, timeout, limits)
+                values = _run_fpcalc(tools, decoder, timeout, limits)
         except ExternalToolError as exc:
+            if decoder is not None and decoder.output_limit_exceeded:
+                raise MediaLimitExceededError(
+                    "max_duration_seconds",
+                    limits.max_duration_seconds,
+                    decoder.bytes_read / (2 * CHROMAPRINT_SAMPLE_RATE),
+                ) from exc
             if exc.tool == Tool.FPCALC.value:
                 raise
             raise as_media_error(exc, "audio decoding") from exc
-    samples = reader.total // 2
-    if max_duration_seconds is None and reader.total > cap - 2:
+    decoded = decoder.bytes_read
+    samples = decoded // 2
+    if max_duration_seconds is None and decoded > cap - 2:
         raise MediaLimitExceededError(
             "max_duration_seconds",
             limits.max_duration_seconds,
@@ -463,48 +475,24 @@ def compare_fingerprints(
 # --------------------------------------------------------------------------
 
 
-class _CountingReader:
-    """Feeds ffmpeg's PCM output to fpcalc and counts it against the cap."""
-
-    def __init__(self, process: ToolProcess, cap: int, limits: MediaLimits) -> None:
-        self._process = process
-        self._cap = cap
-        self._limits = limits
-        self.total = 0
-
-    def read(self, size: int = -1) -> bytes:
-        chunk = self._process.read(size if size > 0 else 64 * 1024)
-        self.total += len(chunk)
-        if self.total > self._cap:
-            raise MediaLimitExceededError(
-                "max_duration_seconds",
-                self._limits.max_duration_seconds,
-                self.total / (2 * CHROMAPRINT_SAMPLE_RATE),
-            )
-        return chunk
-
-
 def _run_fpcalc(
     tools: ExternalTools,
-    reader: _CountingReader,
+    decoder: ToolProcess,
     timeout: float,
     limits: MediaLimits,
 ) -> tuple[int, ...]:
+    """Runs fpcalc on the decoder's output, piped in (see :class:`ToolProcess`)."""
     max_items = math.ceil(limits.max_duration_seconds / ITEM_SECONDS) + 64
-    stream = cast(BinaryIO, reader)  # duck-typed: the runner only calls read()
-    try:
-        result = tools.run(
-            Tool.FPCALC,
-            list(_FPCALC_ARGS),
-            stdin=stream,
-            timeout_seconds=timeout,
-            max_stdout_bytes=max_items * _MAX_FPCALC_OUTPUT_PER_ITEM + 4096,
-            check=False,
-        )
-    except ExternalToolTimeoutError:
-        raise
+    result = tools.run(
+        Tool.FPCALC,
+        list(_FPCALC_ARGS),
+        stdin=decoder,
+        timeout_seconds=timeout,
+        max_stdout_bytes=max_items * _MAX_FPCALC_OUTPUT_PER_ITEM + 4096,
+        check=False,
+    )
     if result.returncode != 0:
-        if reader.total // 2 < _MIN_SAMPLES:
+        if decoder.bytes_read // 2 < _MIN_SAMPLES:
             return ()  # too short for a single sub-fingerprint
         raise MediaDecodeError(f"fpcalc failed (exit status {result.returncode})")
     return _parse_fpcalc(result.stdout, max_items)

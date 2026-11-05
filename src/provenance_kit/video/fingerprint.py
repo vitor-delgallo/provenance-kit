@@ -35,7 +35,8 @@ Robustness (measured in ``tests/video/test_fingerprint_integration.py``, see
 
 Frame hashing goes through the :class:`FrameHasher` Protocol. The default
 implementation is the PDQ hasher of :mod:`provenance_kit.image.hashing`
-(extra ``video``), loaded lazily; tests and applications can pass any object
+(the core install's NumPy port, or ``pdqhash`` with extra ``pdq-native``),
+loaded lazily; tests and applications can pass any object
 with a ``hash_image(PIL.Image.Image)`` method returning ``value`` (bytes) and
 ``quality`` (0 to 100).
 
@@ -55,12 +56,12 @@ from typing import TYPE_CHECKING, Protocol, cast
 import numpy as np
 import numpy.typing as npt
 
+from provenance_kit._checks import check_int, check_number
 from provenance_kit._logging import get_logger
 from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.errors import BackendUnavailableError
 from provenance_kit.limits import MediaLimits
 from provenance_kit.tools import ExternalTools
-from provenance_kit.video._checks import check_int, check_number
 from provenance_kit.video.frames import MAX_SAMPLING_FPS, FrameSampling, VideoFrame, iter_frames
 
 if TYPE_CHECKING:

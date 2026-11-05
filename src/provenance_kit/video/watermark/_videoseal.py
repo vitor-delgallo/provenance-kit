@@ -16,18 +16,18 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
+from provenance_kit._checks import check_int, check_number
 from provenance_kit._logging import get_logger
 from provenance_kit._optional import import_optional
 from provenance_kit._typing import StrPath
 from provenance_kit.bits import normalize_bits
 from provenance_kit.device import parse_device, resolve_device
 from provenance_kit.errors import ModelLoadError, UnsupportedMediaError
-from provenance_kit.video._checks import check_int, check_number
-from provenance_kit.video.watermark._weights import (
+from provenance_kit.modelfiles import (
     ModelFile,
-    default_model_dir,
-    download_model_file,
-    resolve_model_file,
+    ensure_model_files,
+    find_model_file,
+    model_directory,
 )
 from provenance_kit.video.watermark.base import Frame
 
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from provenance_kit.video.watermark.repetition import RepetitionCode
 
 __all__ = [
+    "VIDEOSEAL_DEFAULT_STRENGTH",
     "VIDEOSEAL_MODEL",
     "VIDEOSEAL_PAYLOAD_BITS",
     "VideoSealBackend",
@@ -61,7 +62,15 @@ VIDEOSEAL_MODEL = ModelFile(
 #: Channel bits carried by the VideoSeal v1.0 model.
 VIDEOSEAL_PAYLOAD_BITS = 256
 
-_SUBDIR = "videoseal"
+#: The default watermark strength (the model's ``scaling_w``). The model's
+#: built-in value is 0.2; on the test suite's synthetic 320x240 content, 0.5
+#: keeps the PSNR at 41.5 dB (textured) and 44.7 dB (flat areas), against
+#: 49.2 and 52.5 dB at 0.2, and raises the channel bit accuracy after H.264
+#: at 1 Mb/s from 0.78 to 0.94 (textured) and from 0.61 to 0.80 (flat); see
+#: ``docs/video.md``.
+VIDEOSEAL_DEFAULT_STRENGTH = 0.5
+
+_BACKEND = "videoseal"
 _JIT_WARNING = r".*torch\.jit\.load.* is deprecated"
 
 
@@ -72,34 +81,28 @@ def download_videoseal_model(
 ) -> Path:
     """Downloads and verifies the VideoSeal model (explicit, opt-in).
 
-    Does nothing but verify when the file is already present.
+    Does nothing but verify when a valid file is already present; a missing
+    or invalid file is fetched from the official URL
+    (:func:`provenance_kit.modelfiles.ensure_model_files`).
 
     Args:
         model_dir: Target directory. Defaults to
-            ``$PROVENANCE_KIT_MODEL_DIR/videoseal`` or
-            ``~/.cache/provenance-kit/videoseal``.
+            :func:`provenance_kit.modelfiles.default_model_dir` for
+            ``"videoseal"`` (``$PROVENANCE_KIT_MODEL_DIR/videoseal`` or the
+            per-user cache).
         timeout_seconds: The network timeout of each read.
 
     Returns:
         The path of the verified model file.
 
     Raises:
+        ValueError: If the directory is inside ``site-packages`` or the
+            timeout is not positive.
         ModelLoadError: If the download fails or the file fails its SHA-256
             check.
     """
-    from pathlib import Path  # noqa: PLC0415
-
-    directory = Path(model_dir) if model_dir is not None else default_model_dir(_SUBDIR)
-    if (directory / VIDEOSEAL_MODEL.name).is_file():
-        return resolve_model_file(
-            VIDEOSEAL_MODEL,
-            model_path=None,
-            model_dir=directory,
-            default_subdir=_SUBDIR,
-            sha256=None,
-            download=False,
-        )
-    return download_model_file(VIDEOSEAL_MODEL, directory, timeout_seconds=timeout_seconds)
+    directory = model_directory(model_dir, _BACKEND)
+    return ensure_model_files([VIDEOSEAL_MODEL], directory, timeout_seconds=timeout_seconds)[0]
 
 
 class VideoSealBackend:
@@ -124,16 +127,20 @@ class VideoSealBackend:
     Args:
         model_path: An explicit model file, verified against ``sha256``.
         model_dir: The directory holding ``y_256b_img.jit``. Defaults to
-            ``$PROVENANCE_KIT_MODEL_DIR/videoseal`` or
-            ``~/.cache/provenance-kit/videoseal``.
+            ``$PROVENANCE_KIT_MODEL_DIR/videoseal`` or the per-user cache
+            (:func:`provenance_kit.modelfiles.default_model_dir`); never
+            inside ``site-packages``.
         download: Download the model from the official URL if it is missing.
             Off by default: the backend never touches the network unless
             asked.
         sha256: The expected model digest; defaults to the pinned one.
         device: ``"cpu"`` (default), ``"cuda"``, ``"cuda:<n>"`` or ``"auto"``.
         strength: The blending factor of the watermark (the model's
-            ``scaling_w``; 0.2 by default upstream). Higher is more robust and
-            more visible. ``None`` keeps the model's default.
+            ``scaling_w``), at most 4. The default,
+            :data:`VIDEOSEAL_DEFAULT_STRENGTH` (0.5), was chosen on measured
+            PSNR and robustness (``docs/video.md``); higher is more robust
+            and more visible. ``None`` keeps the model's built-in value
+            (0.2, the upstream default).
         step_size: Embed every ``step_size``-th frame and repeat its
             watermark on the next ones (upstream default 4). ``None`` keeps
             the model's default.
@@ -157,7 +164,7 @@ class VideoSealBackend:
         download: bool = False,
         sha256: str | None = None,
         device: str = "cpu",
-        strength: float | None = None,
+        strength: float | None = VIDEOSEAL_DEFAULT_STRENGTH,
         step_size: int | None = None,
         batch_frames: int = 16,
     ) -> None:
@@ -173,11 +180,11 @@ class VideoSealBackend:
         torch = import_optional("torch", extra="video-watermark", feature="VideoSeal watermarking")
         self._torch = torch
         self._device = resolve_device(device, torch)
-        path = resolve_model_file(
+        path = find_model_file(
             VIDEOSEAL_MODEL,
-            model_path=model_path,
+            backend=_BACKEND,
             model_dir=model_dir,
-            default_subdir=_SUBDIR,
+            model_path=model_path,
             sha256=sha256,
             download=download,
         )

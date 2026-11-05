@@ -48,6 +48,11 @@ class MediaLimits:
     * ``max_frames`` = 648,000 (3 hours at 60 frames per second). Bounds the
       number of frames one operation decodes or extracts, which matters when a
       container declares an absurd frame rate for a short duration.
+    * ``max_image_frames`` = 5,000. Bounds the frames of one animated image
+      (GIF, APNG, animated WebP, AVIF sequences): about 3 minutes at 25 frames
+      per second, far above ordinary animated GIFs and stickers. Each frame is
+      a full canvas once composited, so the video-sized ``max_frames`` would
+      let a small file demand hours of decoding.
     * ``max_audio_channels`` = 8. Covers 7.1 surround; refuses channel-count
       bombs that multiply memory use.
     * ``max_sample_rate`` = 192,000 Hz. The highest rate in common studio use;
@@ -68,6 +73,7 @@ class MediaLimits:
     max_height: int = 16_384
     max_duration_seconds: float = 3 * 3600.0
     max_frames: int = 648_000
+    max_image_frames: int = 5_000
     max_audio_channels: int = 8
     max_sample_rate: int = 192_000
     subprocess_timeout_seconds: float = 600.0

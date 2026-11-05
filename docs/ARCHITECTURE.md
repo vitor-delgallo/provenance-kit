@@ -24,8 +24,11 @@ src/provenance_kit/
   __init__.py      version, re-exports of errors / MediaLimits / PayloadCodec
   errors.py        exception hierarchy
   limits.py        MediaLimits (resource limits for untrusted media)
-  tools.py         ExternalTools, run_tool, stream_tool (ffmpeg, ffprobe, fpcalc)
+  tools.py         ExternalTools, run_tool, stream_tool (ffmpeg, ffprobe, fpcalc),
+                   piping one tool's ToolProcess into another's stdin
   tempfiles.py     private_temp_file, private_temp_dir
+  modelfiles.py    ModelFile, default_model_dir, verification and opt-in download
+                   of pinned model weights (TrustMark, VideoSeal, AudioSeal)
   payload.py       PayloadCodec, DecodedPayload (watermark payload layout)
   detection.py     WatermarkDetection (common detection result)
   bits.py          bit-string helpers, hamming_distance, bit_error_rate
@@ -35,17 +38,21 @@ src/provenance_kit/
   _logging.py      library logger, get_logger
   _optional.py     import_optional (lazy import of optional dependencies)
   _typing.py       StrPath, BytesLike
+  _ffmpeg.py       ffmpeg/ffprobe plumbing shared by video and audio: input
+                   staging (pipe or temporary file), mandatory arguments,
+                   defensive parsing of ffprobe's JSON
+  _checks.py       check_int, check_number (argument validation)
 
   image/           owner: image agents
     watermark      TrustMark invisible watermark, read-back verification,
                    strength escalation                      extra: image-watermark
     visible        tiled visible text watermark (Pillow)    core install
-    hashing        pHash (imagehash), PDQ (pdqhash), hash-list matching
-                                                            extra: image-hash
+    hashing        PDQ (NumPy port, or pdqhash when installed), pHash and
+                   dHash, hash-list matching  extras: image-hash, pdq-native
   video/           owner: video agents
     frames         ffprobe probing, frame extraction via ffmpeg pipes
                                                             binaries: ffmpeg, ffprobe
-    fingerprint    frame-hash sequences, temporal alignment extra: video
+    fingerprint    frame-hash sequences, temporal alignment extra: video (no packages)
     watermark      Meta VideoSeal invisible watermark       extra: video-watermark
   audio/           owner: audio agents
     fingerprint    Chromaprint via fpcalc, comparison       extra: audio (binary: fpcalc)
@@ -122,10 +129,16 @@ class ImageWatermarkBackend(Protocol):
 
 
 class TrustMarkBackend:  # implements ImageWatermarkBackend
-    def __init__(self, *, variant: TrustMarkVariant = TrustMarkVariant.Q,
-                 device: str = "cpu", model_dir: StrPath | None = None) -> None:
-        trustmark = import_optional("trustmark", extra="image-watermark",
-                                    feature="TrustMark watermarking")
+    def __init__(
+        self,
+        *,
+        variant: TrustMarkVariant = TrustMarkVariant.Q,
+        device: str = "cpu",
+        model_dir: StrPath | None = None,
+    ) -> None:
+        trustmark = import_optional(
+            "trustmark", extra="image-watermark", feature="TrustMark watermarking"
+        )
         ...
 ```
 
@@ -172,7 +185,8 @@ ProvenanceKitError
   MediaError
     MediaDecodeError           corrupt, truncated, undecodable media
     UnsupportedMediaError      valid but unsupported type, codec or layout
-    MediaLimitExceededError    exceeds MediaLimits (attributes: limit, maximum, actual)
+    MediaLimitExceededError    exceeds MediaLimits or a component size setting
+                               (attributes: limit, maximum, actual)
   ExternalToolError            a subprocess failed (attributes: tool, returncode, stderr_tail)
     ExternalToolTimeoutError   ... or timed out and was killed
   ModelLoadError               weights could not be downloaded, verified or loaded
@@ -213,8 +227,9 @@ decoding pixels or samples:
 * bytes: `limits.check_bytes(len(data))`; when reading a stream, read at most
   `max_bytes + 1` bytes and fail if you got more;
 * images: `Image.open()` parses only the header; call
-  `limits.check_dimensions(*image.size)` (and check `n_frames` for animated
-  formats) **before** `load()`, `convert()` or any pixel access. Never change
+  `limits.check_dimensions(*image.size)` (and check `n_frames` against
+  `limits.max_image_frames` for animated formats) **before** `load()`,
+  `convert()` or any pixel access. Never change
   the process-global `PIL.Image.MAX_IMAGE_PIXELS`; our default limits are
   below Pillow's own bomb threshold, so ours trigger first;
 * video and audio: probe with ffprobe first and check duration, dimensions,
@@ -223,9 +238,10 @@ decoding pixels or samples:
   headers can lie.
 
 **Type from bytes, not names.** Use `mediatype.require_media_type()` on the
-leading bytes and pick the decoder from the result. Never trust an extension,
-a file name or a client-supplied MIME type. Sniffing identifies the
-container only: probe the streams before relying on their kind.
+leading bytes (the whole content when it may start with an ID3v2 tag: FLAC
+signed by c2pa-rs does) and pick the decoder from the result. Never trust an
+extension, a file name or a client-supplied MIME type. Sniffing identifies
+the container only: probe the streams before relying on their kind.
 
 **No secrets or media in messages or logs.** See the logging rule (section 9).
 
@@ -237,11 +253,15 @@ container only: probe the streams before relying on their kind.
   directory);
 * media in and out through pipes (`pipe:0` / `pipe:1`) whenever the format
   allows;
-* every ffmpeg/ffprobe call passes `-nostdin` (input on `pipe:0` still works),
-  `-hide_banner`, `-loglevel error`, and
-  `-protocol_whitelist pipe` (or `file,pipe` when reading a temporary file).
-  This blocks playlists and container tricks (HLS, concat, `subfile`) that
-  make ffmpeg open URLs or local files named inside the media;
+* every ffmpeg call passes `-nostdin` (input on `pipe:0` still works);
+  ffprobe has no such option and rejects it, and it never reads the
+  terminal: the runner connects its standard input to the media pipe or to
+  the null device. Every ffmpeg and ffprobe call passes `-hide_banner`,
+  `-loglevel error` and `-protocol_whitelist pipe` (or `file,pipe` when
+  reading a temporary file). The whitelist blocks playlists and container
+  tricks (HLS, concat, `subfile`) that make ffmpeg open URLs or local files
+  named inside the media. The video and audio modules get all of this from
+  the core's private `_ffmpeg` module;
 * pass the input demuxer explicitly (`-f mov`, `-f matroska`, ...) when the
   sniffed type determines it, and refuse playlist demuxers;
 * when a path must be given, use an absolute temporary path prefixed with
@@ -250,23 +270,38 @@ container only: probe the streams before relying on their kind.
   runner kills the whole process tree on timeout. The timeout covers the whole
   run, including the time the caller spends between reads;
 * cap captured output (`max_stdout_bytes`); stream large outputs with
-  `stream_tool` and `read_exact` instead of capturing them.
+  `stream_tool` and `read_exact` instead of capturing them. To feed one
+  tool's output to another (ffmpeg's PCM into fpcalc), pass the first tool's
+  `ToolProcess` as the second's `stdin`: its output cap still applies
+  (`ToolProcess.output_limit_exceeded` tells it apart from other failures).
 
 **Temporary files.** Avoid them. When unavoidable, use
 `tempfiles.private_temp_file` / `private_temp_dir`, pass through the caller's
 `temp_dir: StrPath | None = None` argument (an application may point it at a
 RAM disk), and never keep them past the call.
 
-**Model weights.** Load weights only from pinned sources: pin a SHA-256 for
-every file your adapter downloads or accepts, verify before loading, and raise
-`ModelLoadError` on mismatch. Accept a caller `model_dir` so production can
-pre-provision weights and run offline; never download during a request unless
-the caller allowed it. Prefer `torch.load(..., weights_only=True)` or
-TorchScript; never unpickle a file that did not pass the hash check.
+**Model weights.** Load weights only from pinned sources, through
+`provenance_kit.modelfiles`: pin the HTTPS URL, size and SHA-256 of every
+file your adapter downloads or accepts (`ModelFile`), verify before loading,
+and raise `ModelLoadError` on mismatch. Accept a caller `model_dir` so
+production can pre-provision weights and run offline; never download during
+a request unless the caller allowed it (`download=True` or an explicit
+download function; downloads are HTTPS-only, size-capped, time-limited and
+written atomically). The default directory is the same for every backend:
+`$PROVENANCE_KIT_MODEL_DIR/<backend>`, or `provenance-kit/models/<backend>`
+in the per-user cache directory (`%LOCALAPPDATA%` on Windows,
+`~/Library/Caches` on macOS, `$XDG_CACHE_HOME` or `~/.cache` elsewhere)
+when the variable is not set; a directory inside `site-packages` is refused.
+Prefer `torch.load(..., weights_only=True)` or TorchScript; never unpickle a
+file that did not pass the hash check.
 
 **Network.** Only the timestamps module talks to the network, and only to
 send digests (never media) to calendars the caller configured, with timeouts
-and response-size caps.
+and response-size caps. Two explicit exceptions: the model download functions
+above (opt-in, pinned URLs), and `sign_asset(..., tsa_url=...)`, which makes
+the C2PA library contact exactly that time-stamp authority's host (redirects
+disabled) to send it a hash of the claim signature; without `tsa_url`,
+signing is offline.
 
 ## 7. Threading, model loading and devices
 
@@ -376,6 +411,11 @@ specific than the sections above, they win.
      published test vectors. Keep the BSD notice with the ported code.
    * Backend selection `auto` (the default) picks `pdqhash` if it imports,
      else the NumPy port.
+   * Packaging (revised during consolidation): the NumPy port is the
+     default backend and needs only the core install. `pdqhash` is its own
+     extra, `pdq-native`, because it has no Linux wheels and needs a C++
+     compiler there; no other extra (not even `all`) pulls it in. The
+     `image-hash` extra installs `imagehash` only.
    * Tests cross-check the two backends on a generated image corpus and
      assert the hashes agree within a small Hamming distance; the bound is
      measured and documented in the module and in the test.
@@ -390,7 +430,9 @@ specific than the sections above, they win.
    * The SHA-256 of every model file is pinned in the adapter and verified
      before loading; a mismatch raises `ModelLoadError`.
    * No progress output on stdout or stderr: the adapter suppresses the
-     upstream `print()` calls and reports through logging only.
+     upstream `print()` calls and reports through logging only. The
+     suppression is scoped to `trustmark`'s own modules (a module-global
+     `print` in each); `builtins.print` is never patched.
    * Downloading is opt-in and explicit (a separate call or an explicit flag);
      the default never touches the network.
    * Loading from a pre-provisioned directory works fully offline.
@@ -404,7 +446,8 @@ specific than the sections above, they win.
 7. **OpenTimestamps calendars.** The defaults are the same calendars as the
    official `opentimestamps-client`; the module agent verifies the list from
    that project's source and cites it. The calendar list is always
-   configurable by the caller.
+   configurable by the caller. `min_calendars` defaults to 2, the official
+   client's `-m` default (revised during consolidation; it was 1).
 
 8. **Error correction.**
    * AudioSeal (16 bits) has no room for error correction: rely on the

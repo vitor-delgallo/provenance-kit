@@ -9,7 +9,7 @@ Typical use::
 
     from provenance_kit.provenance.timestamps import OpenTimestamper, sha256_file
 
-    ots = OpenTimestamper(min_calendars=2)  # the official client's calendars
+    ots = OpenTimestamper()  # the official client's calendars, 2 must answer
     proof = ots.stamp(sha256_file("master.mov"))  # pending, a few hundred bytes
     store(proof.to_bytes())  # the standard .ots format
 
@@ -19,8 +19,9 @@ Typical use::
         result = ots.verify(proof, digest, block_source=my_bitcoin_node)
         assert result.verified, result.checks
 
-Only the timestamps module talks to the network, and only to calendars: the
-digest is nonced and hashed before it leaves the process, and
+This module talks to the network only to reach calendars (see
+ARCHITECTURE.md, section 6, for the library-wide rule): the digest is nonced
+and hashed before it leaves the process, and
 :meth:`OpenTimestamper.info` and :meth:`OpenTimestamper.verify` are offline.
 Verification needs Bitcoin block headers from a :class:`BitcoinBlockSource`
 that the application provides (its own node or an explorer).
@@ -50,6 +51,7 @@ from provenance_kit.provenance.timestamps._proof import (
 from provenance_kit.provenance.timestamps._timestamper import (
     DEFAULT_CALENDARS,
     DEFAULT_MAX_RESPONSE_BYTES,
+    DEFAULT_MIN_CALENDARS,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_UPGRADE_ALLOWLIST,
     CalendarError,
@@ -61,6 +63,7 @@ __all__ = [
     "DEFAULT_CHUNK_BYTES",
     "DEFAULT_MAX_PROOF_BYTES",
     "DEFAULT_MAX_RESPONSE_BYTES",
+    "DEFAULT_MIN_CALENDARS",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_UPGRADE_ALLOWLIST",
     "AttestationCheck",

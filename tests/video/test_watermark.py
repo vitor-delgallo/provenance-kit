@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
-import io
+import sysconfig
 import types
-import urllib.error
 
 import numpy as np
 import pytest
@@ -14,20 +12,16 @@ from provenance_kit import PayloadCodec
 from provenance_kit.errors import BackendUnavailableError, ModelLoadError
 from provenance_kit.video.frames import VideoFrame
 from provenance_kit.video.watermark import (
+    VIDEOSEAL_MODEL,
     RepetitionCode,
     VideoSealBackend,
     VideoWatermarkDetection,
     _api,
     _videoseal,
-    _weights,
     detect_watermark,
+    download_videoseal_model,
     embed_verified,
     embed_watermark,
-)
-from provenance_kit.video.watermark._weights import (
-    ModelFile,
-    download_model_file,
-    resolve_model_file,
 )
 
 WIDTH = 256
@@ -210,128 +204,6 @@ def test_embed_verified_requires_bytes(monkeypatch):
         embed_verified(blank_frames(1), "0" * 256, encoder=None, backend=FakeBackend())  # type: ignore[arg-type]
 
 
-# ------------------------------------------------------------ model files
-
-
-SPEC_DATA = b"model weights" * 100
-SPEC = ModelFile(
-    name="model.bin",
-    url="https://example.invalid/model.bin",
-    sha256=hashlib.sha256(SPEC_DATA).hexdigest(),
-    size=len(SPEC_DATA),
-)
-
-
-def resolve(**kwargs):
-    options = {
-        "model_path": None,
-        "model_dir": None,
-        "default_subdir": "test",
-        "sha256": None,
-        "download": False,
-    }
-    options.update(kwargs)
-    return resolve_model_file(SPEC, **options)
-
-
-def test_resolve_verifies_pre_provisioned_files(tmp_path):
-    (tmp_path / "model.bin").write_bytes(SPEC_DATA)
-    assert resolve(model_dir=tmp_path) == tmp_path / "model.bin"
-    assert resolve(model_path=tmp_path / "model.bin") == tmp_path / "model.bin"
-
-
-def test_resolve_refuses_tampered_files(tmp_path):
-    (tmp_path / "model.bin").write_bytes(SPEC_DATA + b"!")
-    with pytest.raises(ModelLoadError, match="SHA-256"):
-        resolve(model_dir=tmp_path)
-
-
-def test_resolve_never_downloads_unless_asked(tmp_path, monkeypatch):
-    def no_network(*args, **kwargs):
-        raise AssertionError("network used")
-
-    monkeypatch.setattr(_weights.urllib.request, "build_opener", no_network)
-    with pytest.raises(ModelLoadError, match="download=True"):
-        resolve(model_dir=tmp_path)
-    with pytest.raises(ModelLoadError):
-        resolve(model_path=tmp_path / "missing.bin")
-
-
-def test_resolve_validates_arguments(tmp_path):
-    with pytest.raises(ValueError):
-        resolve(model_dir=tmp_path, sha256="xyz")
-    with pytest.raises(ValueError):
-        resolve(model_path=tmp_path / "model.bin", download=True)
-
-
-def test_default_model_dir_honors_the_environment(monkeypatch, tmp_path):
-    monkeypatch.setenv(_weights.MODEL_DIR_ENV, str(tmp_path))
-    assert _weights.default_model_dir("videoseal") == tmp_path / "videoseal"
-    monkeypatch.delenv(_weights.MODEL_DIR_ENV)
-    assert _weights.default_model_dir("videoseal").parts[-2:] == ("provenance-kit", "videoseal")
-
-
-class FakeOpener:
-    def __init__(self, payload: bytes | Exception) -> None:
-        self.payload = payload
-        self.requests: list[str] = []
-
-    def open(self, request, timeout):
-        self.requests.append(request.full_url)
-        if isinstance(self.payload, Exception):
-            raise self.payload
-        return io.BytesIO(self.payload)
-
-
-def patch_opener(monkeypatch, payload) -> FakeOpener:
-    opener = FakeOpener(payload)
-    monkeypatch.setattr(_weights.urllib.request, "build_opener", lambda *handlers: opener)
-    return opener
-
-
-def test_download_writes_only_verified_files(tmp_path, monkeypatch):
-    opener = patch_opener(monkeypatch, SPEC_DATA)
-    path = resolve(model_dir=tmp_path / "new", download=True)
-    assert path.read_bytes() == SPEC_DATA
-    assert opener.requests == [SPEC.url]
-    assert sorted(p.name for p in path.parent.iterdir()) == ["model.bin"]
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        SPEC_DATA + b"x",
-        SPEC_DATA[:-1],
-        b"y" * len(SPEC_DATA),
-        urllib.error.URLError("down"),
-        OSError(),
-    ],
-)
-def test_failed_downloads_leave_nothing_behind(tmp_path, monkeypatch, payload):
-    patch_opener(monkeypatch, payload)
-    with pytest.raises(ModelLoadError):
-        download_model_file(SPEC, tmp_path)
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_redirects_must_stay_on_https():
-    handler = _weights._HttpsOnlyRedirects()
-    request = _weights.urllib.request.Request("https://example.invalid/a")
-    with pytest.raises(urllib.error.URLError):
-        handler.redirect_request(
-            request, io.BytesIO(), 302, "Found", {}, "http://example.invalid/b"
-        )
-
-
-def test_model_file_validation():
-    with pytest.raises(ValueError):
-        ModelFile(name="a", url="http://example.invalid/a", sha256="0" * 64, size=1)
-    with pytest.raises(ValueError):
-        ModelFile(name="../a", url="https://example.invalid/a", sha256="0" * 64, size=1)
-    with pytest.raises(ValueError):
-        ModelFile(name="a", url="https://example.invalid/a", sha256="0" * 63, size=1)
-
-
 # ------------------------------------------------------------ backend construction
 
 
@@ -377,3 +249,25 @@ def test_videoseal_constants():
         _videoseal.VIDEOSEAL_MODEL.url == "https://dl.fbaipublicfiles.com/videoseal/y_256b_img.jit"
     )
     assert _videoseal.VIDEOSEAL_PAYLOAD_BITS == 256
+
+
+def test_download_videoseal_model_fetches_the_pinned_file(tmp_path, monkeypatch):
+    calls = []
+
+    def ensure(specs, directory, *, timeout_seconds):
+        calls.append((tuple(specs), directory, timeout_seconds))
+        return tuple(directory / spec.name for spec in specs)
+
+    monkeypatch.setattr(_videoseal, "ensure_model_files", ensure)
+    path = download_videoseal_model(tmp_path, timeout_seconds=9)
+    assert path == tmp_path.resolve() / VIDEOSEAL_MODEL.name
+    assert calls == [((VIDEOSEAL_MODEL,), tmp_path.resolve(), 9)]
+
+
+def test_model_dir_inside_site_packages_is_refused(monkeypatch):
+    inside = sysconfig.get_paths()["purelib"] + "/videoseal"
+    with pytest.raises(ValueError, match="site-packages"):
+        download_videoseal_model(inside)
+    monkeypatch.setattr(_videoseal, "import_optional", lambda *a, **k: fake_torch())
+    with pytest.raises(ValueError, match="site-packages"):
+        VideoSealBackend(model_dir=inside)

@@ -24,9 +24,10 @@ htmlcov/
 # Downloaded binaries (ffmpeg, ffprobe, fpcalc, uv): see docs/DEVELOPMENT.md
 /tools/
 
-# Model weights and caches: never commit them
+# Model weights and caches: never commit them. The tests keep model files in
+# .cache/models/<backend>/ (the PROVENANCE_KIT_MODEL_DIR layout) and other
+# downloaded test data under .cache/ (see docs/DEVELOPMENT.md).
 /models/
-/model-cache/
 /.cache/
 *.ckpt
 *.pth

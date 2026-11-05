@@ -94,7 +94,11 @@ class AudioWatermarkDetection(WatermarkDetection):
             (meaningless on unmarked audio).
         bit_confidence: Mean of ``|2p - 1|`` over the bit probabilities: 1.0
             when every bit is certain, 0.0 when all are coin flips.
+        offset_samples: With an alignment search, the number of leading
+            samples dropped before detection (the offset the search chose);
+            ``None`` without a search.
     """
 
     decoded_bits: str | None = None
     bit_confidence: float = 0.0
+    offset_samples: int | None = None

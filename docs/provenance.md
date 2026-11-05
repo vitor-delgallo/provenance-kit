@@ -43,32 +43,46 @@ scope for a media toolkit. It does not support WebM, Matroska, Ogg, AAC
 (ADTS), AIFF or BMP. The type is always detected from the bytes; a declared
 MIME type must agree with it (any ISO BMFF brand is accepted for another,
 because c2pa-rs uses one handler for all of them). c2pa-rs embeds manifests in
-FLAC behind an ID3v2 tag, so a signed FLAC starts with `ID3`; the module looks
-past the tag and still detects FLAC.
+FLAC behind an ID3v2 tag, so a signed FLAC starts with `ID3`;
+`provenance_kit.mediatype` looks past the tag and still detects FLAC (so do
+the audio modules, which decode signed FLAC as FLAC).
 
 ### Signing
 
 ```python
 from provenance_kit.provenance.c2pa import (
-    ActionType, DigitalSourceType, GeneratorInfo, ManifestAction, ManifestSpec,
-    SoftBinding, SoftBindingAlgorithm, TrainingMiningPolicy, sign_asset,
+    ActionType,
+    DigitalSourceType,
+    GeneratorInfo,
+    ManifestAction,
+    ManifestSpec,
+    SoftBinding,
+    SoftBindingAlgorithm,
+    TrainingMiningPolicy,
+    sign_asset,
 )
 
 spec = ManifestSpec(
     claim_generator=GeneratorInfo("my-pipeline", "1.4.0"),
     title="photo.jpg",
     actions=(
-        ManifestAction(action=ActionType.CREATED, when=uploaded_at,
-                       digital_source_type=DigitalSourceType.DIGITAL_CAPTURE),
+        ManifestAction(
+            action=ActionType.CREATED,
+            when=uploaded_at,
+            digital_source_type=DigitalSourceType.DIGITAL_CAPTURE,
+        ),
         ManifestAction(action=ActionType.WATERMARKED_BOUND, when=processed_at),
-        ManifestAction(action=ActionType.PUBLISHED, when=published_at,
-                       software_agent=GeneratorInfo("my-pipeline", "1.4.0")),
+        ManifestAction(
+            action=ActionType.PUBLISHED,
+            when=published_at,
+            software_agent=GeneratorInfo("my-pipeline", "1.4.0"),
+        ),
     ),
     authors=("Jane Doe",),
     training_mining=TrainingMiningPolicy.not_allowed(),
     soft_binding=SoftBinding(algorithm=SoftBindingAlgorithm.TRUSTMARK_Q, value=wm_value),
 )
-signed = sign_asset(jpeg_bytes, "image/jpeg", spec, signer)          # tsa_url=None
+signed = sign_asset(jpeg_bytes, "image/jpeg", spec, signer)  # tsa_url=None
 ```
 
 What `sign_asset` does:
@@ -82,8 +96,9 @@ What `sign_asset` does:
 * lets the library validate the new manifest (c2pa-rs `verify_after_sign`); a
   manifest that breaks a C2PA rule raises `SigningError` with the validation
   codes, for example `assertion.action.malformed`;
-* lists every assertion it writes in `created_assertions`: "All
-  created_assertions are attributed to the signer" (section 10.2.2).
+* lists each assertion it writes in the claim's `created_assertions` or
+  `gathered_assertions`, as `ManifestSpec.placements` says (see "Created and
+  gathered assertions" below).
 
 `format` (`dc:format`) is taken from the asset's media type. Claim version 2
 makes `dc:title` and `dc:format` optional and c2pa-rs does not store
@@ -174,12 +189,59 @@ byte-string value cannot be told apart in `SoftBindingReport.values`.
 named actor), thumbnails, redactions, update manifests, remote or sidecar
 publication when signing (reading sidecars is supported).
 
+### Created and gathered assertions
+
+A version 2 claim lists its assertions in two places (C2PA 2.3, section
+10.2.2, "Fields"):
+
+* `created_assertions`: assertions made by the claim generator. "All
+  created_assertions are attributed to the signer as the Trust Model is
+  rooted in the trust of the signer." The field is mandatory and, in a
+  standard manifest, includes a hard binding (section 10.3.2.1); c2pa-rs adds
+  the hard binding (`c2pa.hash.data`, `c2pa.hash.bmff.v3`, ...) itself, always
+  as created.
+* `gathered_assertions`: assertions "provided to the claim generator by other
+  components in the workflow". "By putting an assertion into this list, the
+  claim generator is declaring that the assertion is part of the claim, but
+  it was not sourced from the claim generator and is not attributed to the
+  signer." The specification's example: "assertions containing information
+  entered by a human actor would be listed in gathered_assertions."
+
+Both lists are covered by the signature: a gathered assertion is tamper-evident
+like a created one; the difference is who vouches for its content.
+`ManifestSpec.placements` (`AssertionPlacements`) sets the list for each
+assertion the module writes. The defaults:
+
+| Assertion | Default | Why |
+|---|---|---|
+| actions (`c2pa.actions`) | `CREATED` | what the signing application did |
+| training and data mining (`cawg.training-mining`) | `CREATED` | the signer's policy decision |
+| soft binding (`c2pa.soft-binding`) | `CREATED` | the watermark the signing application embedded |
+| authors (`cawg.metadata`) | `GATHERED` | names supplied by people, not verified by the signer |
+
+```python
+from provenance_kit.provenance.c2pa import AssertionPlacement, AssertionPlacements
+
+spec = ManifestSpec(
+    ...,
+    authors=("Jane Doe",),
+    placements=AssertionPlacements(authors=AssertionPlacement.CREATED),  # verified authorship
+)
+```
+
+c2pa-python 0.38 supports both lists: an assertion defined with
+`"created": false` is written to `gathered_assertions` (c2pa-rs 0.91). The
+integration tests (`test_created_and_gathered_assertions`) sign with the
+defaults and with every placement inverted, decode the claim to check both
+lists, and validate the result (state `VALID`). `ManifestReport` does not
+say which list an assertion came from.
+
 ### Reading and validation
 
 ```python
 report = read_manifest(upload_bytes, trust_anchors_pem=c2pa_trust_list_pem)
-report.state                        # ValidationState
-report.errors                       # failure codes of the active manifest
+report.state  # ValidationState
+report.errors  # failure codes of the active manifest
 report.training_mining_not_allowed  # all four standard uses are notAllowed
 ```
 
@@ -229,7 +291,7 @@ or your own roots. Legacy assertions are still understood when reading:
 | Calendars | `https://a.pool.opentimestamps.org`, `https://b.pool.opentimestamps.org`, `https://a.pool.eternitywall.com`, `https://ots.btc.catallaxy.com` | the official client adds exactly these when no calendar is given ([`otsclient/cmds.py`](https://github.com/opentimestamps/opentimestamps-client/blob/master/otsclient/cmds.py), `stamp_command`); identical to `DEFAULT_AGGREGATORS` in python-opentimestamps 0.5.0 `opentimestamps/calendar.py` |
 | Upgrade allow-list | `https://*.calendar.opentimestamps.org`, `https://*.calendar.eternitywall.com`, `https://*.calendar.catallaxy.com` | `DEFAULT_CALENDAR_WHITELIST` in python-opentimestamps 0.5.0, which the official client uses for upgrades ([`otsclient/args.py`](https://github.com/opentimestamps/opentimestamps-client/blob/master/otsclient/args.py)) |
 | Timeout | 5 s per operation (calendars in parallel) | the client's `--timeout` default, 5 |
-| `min_calendars` | **1** | the client's `-m` default is **2**; 1 gives a proof as soon as one calendar answers. Use 2 or more in production to survive the loss of a calendar |
+| `min_calendars` | **2** (`DEFAULT_MIN_CALENDARS`) | the client's `-m` default ([`otsclient/args.py`](https://github.com/opentimestamps/opentimestamps-client/blob/master/otsclient/args.py)): the proof survives the loss of one calendar. Like the client (`create_timestamp` in `cmds.py`), more than the number of calendars is refused, so a single custom calendar needs `min_calendars=1` |
 | Response size | 10,000 bytes | python-opentimestamps `MAX_RESPONSE_LENGTH` |
 | Proof size | 64 KiB | this library (see below) |
 
@@ -243,13 +305,13 @@ covered by the default allow-list (the `network` test prints them).
 ```python
 from provenance_kit.provenance.timestamps import OpenTimestamper, TimestampProof, sha256_file
 
-ots = OpenTimestamper(min_calendars=2)
-proof = ots.stamp(sha256_file("master.mov"))   # pending; proof.failed_calendars lists failures
-data = proof.to_bytes()                        # standard .ots, readable by `ots info`
+ots = OpenTimestamper()  # the official client's calendars; 2 must answer
+proof = ots.stamp(sha256_file("master.mov"))  # pending; proof.failed_calendars lists failures
+data = proof.to_bytes()  # standard .ots, readable by `ots info`
 
-proof = ots.upgrade(TimestampProof.from_bytes(data))   # hours later
-info = ots.info(proof)                                  # pending calendars, Bitcoin heights
-result = ots.verify(proof, digest, block_source)        # offline, against your block headers
+proof = ots.upgrade(TimestampProof.from_bytes(data))  # hours later
+info = ots.info(proof)  # pending calendars, Bitcoin heights
+result = ots.verify(proof, digest, block_source)  # offline, against your block headers
 ```
 
 Like the official client, `stamp` appends a random 16-byte nonce to the
@@ -307,6 +369,7 @@ A source backed by your own node (`bitcoind` JSON-RPC):
 import base64, json, urllib.request
 from provenance_kit.provenance.timestamps import BitcoinBlockHeader
 
+
 class NodeBlockSource:
     def __init__(self, url, user, password):
         self._url = url
@@ -314,8 +377,7 @@ class NodeBlockSource:
 
     def _call(self, method, *params):
         body = json.dumps({"jsonrpc": "1.0", "id": 0, "method": method, "params": params})
-        request = urllib.request.Request(self._url, body.encode(),
-                                         {"Authorization": self._auth})
+        request = urllib.request.Request(self._url, body.encode(), {"Authorization": self._auth})
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.load(response)["result"]
 

@@ -19,6 +19,8 @@ from provenance_kit.provenance.c2pa import (
     MANIFEST_UNREADABLE,
     SUPPORTED_MEDIA_TYPES,
     ActionType,
+    AssertionPlacement,
+    AssertionPlacements,
     DigitalSourceType,
     GeneratorInfo,
     Ingredient,
@@ -277,7 +279,14 @@ def test_definition_uses_the_labels_the_library_validates():
     labels = [a["label"] for a in definition["assertions"]]  # type: ignore[index, union-attr]
     assert labels == ["c2pa.actions", "cawg.metadata", "cawg.training-mining", "c2pa.soft-binding"]
     assertions = {a["label"]: a for a in definition["assertions"]}  # type: ignore[index, union-attr]
-    assert all(a["created"] is True for a in assertions.values())
+    # Defaults: the signer attests to what the application did; the authors
+    # are human-supplied and gathered (C2PA 2.3, section 10.2.2).
+    assert {label: a["created"] for label, a in assertions.items()} == {
+        "c2pa.actions": True,
+        "cawg.metadata": False,
+        "cawg.training-mining": True,
+        "c2pa.soft-binding": True,
+    }
     assert assertions["c2pa.actions"]["data"] == {
         "actions": [
             {
@@ -308,6 +317,47 @@ def test_definition_uses_the_labels_the_library_validates():
         "blocks": [{"scope": {}, "value": "1*0101"}],
     }
     json.dumps(definition)  # serializable as is
+
+
+def test_assertion_placements_are_configurable_per_assertion():
+    manifest = spec(
+        authors=("Jane Doe",),
+        training_mining=TrainingMiningPolicy.not_allowed(),
+        soft_binding=SoftBinding(algorithm=SoftBindingAlgorithm.TRUSTMARK_Q, value="1*0101"),
+        actions=(
+            ManifestAction(
+                action=ActionType.CREATED, digital_source_type=DigitalSourceType.DIGITAL_CAPTURE
+            ),
+            ManifestAction(action=ActionType.WATERMARKED_BOUND),
+        ),
+        placements=AssertionPlacements(
+            actions=AssertionPlacement.GATHERED,
+            authors=AssertionPlacement.CREATED,
+            training_mining=AssertionPlacement.GATHERED,
+            soft_binding=AssertionPlacement.GATHERED,
+        ),
+    )
+    definition, _ = build_definition(manifest, MediaType.PNG, ())
+    created = {a["label"]: a["created"] for a in definition["assertions"]}  # type: ignore[index, union-attr]
+    assert created == {
+        "c2pa.actions": False,
+        "cawg.metadata": True,
+        "cawg.training-mining": False,
+        "c2pa.soft-binding": False,
+    }
+
+
+def test_assertion_placements_validation():
+    defaults = AssertionPlacements()
+    assert defaults.actions is AssertionPlacement.CREATED
+    assert defaults.authors is AssertionPlacement.GATHERED
+    assert defaults.training_mining is AssertionPlacement.CREATED
+    assert defaults.soft_binding is AssertionPlacement.CREATED
+    assert spec().placements == defaults
+    with pytest.raises(TypeError):
+        AssertionPlacements(authors="created")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        spec(placements={"authors": AssertionPlacement.CREATED})
 
 
 def test_opened_action_links_the_parent_ingredient():

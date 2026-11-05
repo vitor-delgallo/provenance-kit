@@ -123,7 +123,12 @@ def _polyphase(x: npt.NDArray[np.float64], plan: _Plan) -> npt.NDArray[np.float6
     out = np.empty(blocks * up, dtype=np.float64)
     for start in range(0, blocks, _BLOCK_ROWS):
         stop = min(start + _BLOCK_ROWS, blocks)
-        out[start * up : stop * up] = (windows[start:stop] @ table.T).reshape(-1)
+        # table @ windows.T rather than windows @ table.T: the same products,
+        # but OpenBLAS handles this shape well for short signals too (a few
+        # dozen blocks), where the other one was up to 40 times slower when
+        # PyTorch's threads compete for the cores (the alignment search scores
+        # hundreds of 0.5 s excerpts).
+        out[start * up : stop * up] = (table @ windows[start:stop].T).T.reshape(-1)
     return out[:n_out]
 
 

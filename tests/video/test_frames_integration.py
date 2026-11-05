@@ -7,6 +7,7 @@ import dataclasses
 import numpy as np
 import pytest
 
+from provenance_kit._ffmpeg import needs_seekable_input
 from provenance_kit.errors import (
     MediaDecodeError,
     MediaLimitExceededError,
@@ -15,7 +16,6 @@ from provenance_kit.errors import (
 from provenance_kit.limits import MediaLimits
 from provenance_kit.mediatype import MediaType, sniff_media_type
 from provenance_kit.tools import ExternalTools, Tool
-from provenance_kit.video._ffmpeg import needs_seekable_input
 from provenance_kit.video.frames import FrameSampling, extract_frames, iter_frames
 from provenance_kit.video.probe import probe_video
 from tests.support import find_tools, require_tool

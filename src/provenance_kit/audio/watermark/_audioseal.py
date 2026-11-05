@@ -34,23 +34,24 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
+from provenance_kit._checks import check_int, check_number
 from provenance_kit._logging import get_logger
 from provenance_kit._optional import import_optional
 from provenance_kit._typing import StrPath
-from provenance_kit.audio._checks import check_int, check_number
 from provenance_kit.audio._resample import resample
-from provenance_kit.audio.watermark._weights import (
-    ModelFile,
-    default_model_dir,
-    download_model_file,
-    resolve_model_file,
-)
 from provenance_kit.audio.watermark.base import AudioScores, Samples
 from provenance_kit.bits import normalize_bits
 from provenance_kit.device import parse_device, resolve_device
 from provenance_kit.errors import ModelLoadError, UnsupportedMediaError
+from provenance_kit.modelfiles import (
+    ModelFile,
+    ensure_model_files,
+    find_model_file,
+    model_directory,
+)
 
 if TYPE_CHECKING:
+    from provenance_kit.audio.watermark._api import AlignmentSearch
     from provenance_kit.audio.watermark.base import AudioWatermarkDetection
     from provenance_kit.payload import PayloadCodec
 
@@ -95,7 +96,7 @@ AUDIOSEAL_PAYLOAD_BITS = 16
 #: The sample rate the models work at; other rates are resampled in memory.
 AUDIOSEAL_SAMPLE_RATE = 16_000
 
-_SUBDIR = "audioseal"
+_BACKEND = "audioseal"
 _MIN_TAIL_SECONDS = 1.0
 _PROBABILITY_EPS = 1e-7
 
@@ -148,37 +149,30 @@ def download_audioseal_models(
 ) -> tuple[Path, Path]:
     """Downloads and verifies the AudioSeal generator and detector (opt-in).
 
-    Files already present are only verified.
+    Valid files already present are only verified; missing or invalid ones
+    are fetched from the pinned Hugging Face revision
+    (:func:`provenance_kit.modelfiles.ensure_model_files`).
 
     Args:
         model_dir: Target directory. Defaults to
-            ``$PROVENANCE_KIT_MODEL_DIR/audioseal`` or
-            ``~/.cache/provenance-kit/audioseal``.
+            :func:`provenance_kit.modelfiles.default_model_dir` for
+            ``"audioseal"`` (``$PROVENANCE_KIT_MODEL_DIR/audioseal`` or the
+            per-user cache).
         timeout_seconds: The network timeout of each read.
 
     Returns:
         The paths of the generator and the detector.
 
     Raises:
+        ValueError: If the directory is inside ``site-packages`` or the
+            timeout is not positive.
         ModelLoadError: If a download fails or a file fails its SHA-256 check.
     """
-    directory = Path(model_dir) if model_dir is not None else default_model_dir(_SUBDIR)
-    paths: list[Path] = []
-    for spec in (AUDIOSEAL_GENERATOR, AUDIOSEAL_DETECTOR):
-        if (directory / spec.name).is_file():
-            paths.append(
-                resolve_model_file(
-                    spec,
-                    model_path=None,
-                    model_dir=directory,
-                    default_subdir=_SUBDIR,
-                    sha256=None,
-                    download=False,
-                )
-            )
-        else:
-            paths.append(download_model_file(spec, directory, timeout_seconds=timeout_seconds))
-    return paths[0], paths[1]
+    directory = model_directory(model_dir, _BACKEND)
+    generator, detector = ensure_model_files(
+        (AUDIOSEAL_GENERATOR, AUDIOSEAL_DETECTOR), directory, timeout_seconds=timeout_seconds
+    )
+    return generator, detector
 
 
 class AudioSealBackend:
@@ -217,8 +211,9 @@ class AudioSealBackend:
     Args:
         model_dir: The directory holding ``generator_base.pth`` and
             ``detector_base.pth``. Defaults to
-            ``$PROVENANCE_KIT_MODEL_DIR/audioseal`` or
-            ``~/.cache/provenance-kit/audioseal``.
+            ``$PROVENANCE_KIT_MODEL_DIR/audioseal`` or the per-user cache
+            (:func:`provenance_kit.modelfiles.default_model_dir`); never
+            inside ``site-packages``.
         generator_path: An explicit generator file instead.
         detector_path: An explicit detector file instead.
         download: Download missing files from the pinned Hugging Face
@@ -275,19 +270,19 @@ class AudioSealBackend:
             builder = import_optional("audioseal.builder", extra="audio-watermark", feature=feature)
         self._torch = torch
         self._device = resolve_device(device, torch)
-        generator_file = resolve_model_file(
+        generator_file = find_model_file(
             AUDIOSEAL_GENERATOR,
-            model_path=generator_path,
+            backend=_BACKEND,
             model_dir=model_dir,
-            default_subdir=_SUBDIR,
+            model_path=generator_path,
             sha256=generator_sha256,
             download=download and generator_path is None,
         )
-        detector_file = resolve_model_file(
+        detector_file = find_model_file(
             AUDIOSEAL_DETECTOR,
-            model_path=detector_path,
+            backend=_BACKEND,
             model_dir=model_dir,
-            default_subdir=_SUBDIR,
+            model_path=detector_path,
             sha256=detector_sha256,
             download=download and detector_path is None,
         )
@@ -422,6 +417,7 @@ class AudioSealBackend:
         *,
         codec: PayloadCodec | None = None,
         threshold: float = 0.5,
+        alignment: AlignmentSearch | None = None,
     ) -> AudioWatermarkDetection:
         """Detects the watermark: a shortcut for ``detect_watermark(..., backend=self)``.
 
@@ -430,6 +426,8 @@ class AudioSealBackend:
             sample_rate: The sample rate in hertz.
             codec: Decodes the 16 payload bits, if given.
             threshold: Detection probability required for ``found``.
+            alignment: An optional search over sample offsets (see
+                :class:`~provenance_kit.audio.watermark.AlignmentSearch`).
 
         Returns:
             The detection result.
@@ -437,7 +435,12 @@ class AudioSealBackend:
         from provenance_kit.audio.watermark._api import detect_watermark  # noqa: PLC0415
 
         return detect_watermark(
-            samples, sample_rate, backend=self, codec=codec, threshold=threshold
+            samples,
+            sample_rate,
+            backend=self,
+            codec=codec,
+            threshold=threshold,
+            alignment=alignment,
         )
 
     # ------------------------------------------------------------ internals

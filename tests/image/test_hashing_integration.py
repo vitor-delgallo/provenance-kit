@@ -44,7 +44,7 @@ CACHE = REPO_ROOT / ".cache" / "threatexchange-pdq" / THREATEXCHANGE_COMMIT
 
 @pytest.fixture(scope="module")
 def cpp_hasher():
-    require_module("pdqhash", extra="image-hash")
+    require_module("pdqhash", extra="pdq-native")
     return PdqHasher("pdqhash")
 
 
@@ -130,7 +130,7 @@ def threatexchange_images(request):
 @pytest.mark.parametrize("backend", ["numpy", "pdqhash"])
 def test_threatexchange_published_vectors(threatexchange_images, backend):
     if backend == "pdqhash":
-        require_module("pdqhash", extra="image-hash")
+        require_module("pdqhash", extra="pdq-native")
     hasher = PdqHasher(backend)
     for path, _, _, expected_hex in THREATEXCHANGE_VECTORS:
         loaded = load_image(threatexchange_images[path])

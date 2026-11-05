@@ -221,13 +221,14 @@ def test_backend_names_are_case_insensitive():
 
 
 def test_auto_falls_back_to_numpy_when_pdqhash_is_missing(monkeypatch):
-    def missing(*args, **kwargs):
-        raise BackendUnavailableError.missing_extra("PDQ with pdqhash", "image-hash")
+    def missing(module, *, extra, feature):
+        raise BackendUnavailableError.missing_extra(feature, extra)
 
     monkeypatch.setattr(hashing, "import_optional", missing)
     assert PdqHasher().backend == "numpy"
-    with pytest.raises(BackendUnavailableError, match="image-hash"):
+    with pytest.raises(BackendUnavailableError, match="pdq-native") as info:
         PdqHasher("pdqhash")
+    assert info.value.extra == "pdq-native"
 
 
 def test_low_information_images_get_low_quality():

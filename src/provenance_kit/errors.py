@@ -143,14 +143,19 @@ class UnsupportedMediaError(MediaError):
 
 
 class MediaLimitExceededError(MediaError):
-    """The media exceeds a configured :class:`~provenance_kit.limits.MediaLimits`.
+    """The media exceeds a configured limit.
 
-    Raised before full decoding whenever the size can be known up front, so
-    that decompression bombs are refused cheaply.
+    Usually a :class:`~provenance_kit.limits.MediaLimits` field; some
+    components have their own size settings (for example the proof size cap
+    of the timestamps module) and report them the same way. Raised before
+    full decoding whenever the size can be known up front, so that
+    decompression bombs are refused cheaply.
 
     Attributes:
-        limit: The name of the exceeded ``MediaLimits`` field, for example
-            ``"max_pixels"``.
+        limit: The name of the exceeded setting: a ``MediaLimits`` field such
+            as ``"max_pixels"``, or a component setting or argument such as
+            ``"max_proof_bytes"`` (named in the raising function's
+            documentation).
         maximum: The configured limit.
         actual: The measured or declared value that exceeded it, if known.
     """
@@ -164,7 +169,8 @@ class MediaLimitExceededError(MediaError):
         """Initializes the error.
 
         Args:
-            limit: The name of the exceeded ``MediaLimits`` field.
+            limit: The name of the exceeded setting (a ``MediaLimits`` field
+                or a component setting such as ``"max_proof_bytes"``).
             maximum: The configured limit.
             actual: The measured or declared value, if known.
         """

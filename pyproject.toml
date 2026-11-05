@@ -48,19 +48,22 @@ image-watermark = [
     "torch>=2.3.1",
     "omegaconf>=2.1,<3",
 ]
-# Perceptual image hashes: pHash (imagehash) and PDQ (pdqhash).
-# pdqhash ships wheels for Windows and macOS only; on Linux it builds from the
-# source distribution and needs a C++11 compiler. See docs/THIRD_PARTY.md.
-# Without pdqhash, PDQ falls back to the built-in NumPy port (same hashes).
+# Perceptual image hashes: pHash and dHash (imagehash). PDQ needs no extra:
+# the core install has a NumPy port of Meta's reference implementation.
 image-hash = [
     "imagehash>=4.3.1,<5",
+]
+# Optional native PDQ backend (pdqhash, Meta's C++ code), preferred by
+# PdqHasher("auto") when installed. pdqhash ships wheels for Windows and macOS
+# only; on Linux it builds from the source distribution and needs a C++11
+# compiler, which is why it is not part of any other extra (not even "all").
+# See docs/THIRD_PARTY.md.
+pdq-native = [
     "pdqhash>=0.2.7,<0.3",
 ]
 # Frame extraction runs the external ffmpeg/ffprobe binaries; the frame-hash
-# fingerprint reuses the image hashes.
-video = [
-    "provenance-kit[image-hash]",
-]
+# fingerprint uses PDQ from the core install. No Python packages.
+video = []
 # Meta VideoSeal invisible video watermark. The backend loads the TorchScript
 # release of the model, which needs only PyTorch (see docs/THIRD_PARTY.md for
 # why the heavy `videoseal` PyPI package is not a dependency).
@@ -85,6 +88,8 @@ c2pa = [
 timestamps = [
     "opentimestamps>=0.5.0,<0.6",
 ]
+# Every capability. pdq-native is left out on purpose (it needs a C++
+# compiler on Linux); add it explicitly: "provenance-kit[all,pdq-native]".
 all = [
     "provenance-kit[image-watermark,image-hash,video,video-watermark,audio,audio-watermark,c2pa,timestamps]",
 ]

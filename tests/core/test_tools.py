@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -299,6 +300,79 @@ def test_stream_feeds_stdin_while_the_caller_reads(rng):
     with stream_tool(PY, ECHO, stdin=data, timeout_seconds=60) as proc:
         received = b"".join(proc.iter_chunks())
     assert received == data
+    assert proc.bytes_read == len(data)
+    assert not proc.output_limit_exceeded
+
+
+# ------------------------------------------------------------------ piping
+
+DIGEST = py(
+    "import hashlib, sys; sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())"
+)
+
+
+def test_a_running_tool_feeds_another_one(rng):
+    data = rng.integers(0, 256, size=1_500_000, dtype="uint8").tobytes()
+    with stream_tool(PY, ECHO, tool="producer", stdin=data, timeout_seconds=60) as producer:
+        result = run_tool(PY, DIGEST, tool="consumer", stdin=producer, timeout_seconds=60)
+    assert result.stdout.decode() == hashlib.sha256(data).hexdigest()
+    assert producer.bytes_read == len(data)
+    assert not producer.output_limit_exceeded
+    assert producer.returncode == 0
+
+
+def test_a_piped_tool_can_be_streamed_too(rng):
+    data = rng.integers(0, 256, size=300_000, dtype="uint8").tobytes()
+    with (
+        stream_tool(PY, ECHO, tool="first", stdin=data, timeout_seconds=60) as first,
+        stream_tool(PY, ECHO, tool="second", stdin=first, timeout_seconds=60) as second,
+    ):
+        received = b"".join(second.iter_chunks())
+    assert received == data
+    assert first.bytes_read == second.bytes_read == len(data)
+
+
+def test_the_upstream_output_cap_stops_the_pipeline():
+    code = """
+        import sys
+        for _ in range(100):
+            sys.stdout.buffer.write(b"x" * 65536)
+    """
+    with (
+        pytest.raises(ExternalToolError, match="output exceeded") as info,
+        stream_tool(
+            PY, py(code), tool="producer", max_stdout_bytes=100_000, timeout_seconds=60
+        ) as producer,
+    ):
+        run_tool(PY, DIGEST, tool="consumer", stdin=producer, timeout_seconds=60)
+    assert info.value.tool == "producer"
+    assert producer.output_limit_exceeded
+    assert producer.bytes_read > 100_000
+
+
+def test_an_upstream_failure_is_raised_when_its_block_exits():
+    code = "import sys; sys.stdout.write('partial'); sys.stdout.flush(); sys.exit(3)"
+    with (
+        pytest.raises(ExternalToolError) as info,
+        stream_tool(PY, py(code), tool="producer", timeout_seconds=60) as producer,
+    ):
+        result = run_tool(PY, DIGEST, tool="consumer", stdin=producer, timeout_seconds=60)
+        assert result.stdout.decode() == hashlib.sha256(b"partial").hexdigest()
+    assert info.value.tool == "producer"
+    assert info.value.returncode == 3
+
+
+def test_a_consumer_that_stops_reading_does_not_fail_the_producer():
+    code = """
+        import sys
+        for _ in range(200):
+            sys.stdout.buffer.write(b"y" * 65536)
+    """
+    head = py("import sys; sys.stdout.write(str(len(sys.stdin.buffer.read(1000))))")
+    with stream_tool(PY, py(code), tool="producer", timeout_seconds=60) as producer:
+        result = run_tool(PY, head, tool="consumer", stdin=producer, timeout_seconds=60)
+    assert result.stdout == b"1000"
+    assert producer.bytes_read < 200 * 65536
 
 
 # ------------------------------------------------------------------ validation

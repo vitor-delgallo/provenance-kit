@@ -30,8 +30,8 @@ are off by default to keep the parsers exposed to strangers few.
 **HEIC/HEIF** (common for phone uploads) is not decoded by Pillow. No
 permissively licensed decoder package is available (``pillow-heif``'s
 binary wheels are GPL-2.0 as a whole because they bundle the x265 encoder;
-the LGPL-only ``pi-heif`` is discontinued and ships a libheif with a known
-heap overflow; see ``docs/THIRD_PARTY.md``). Applications that accept a
+the LGPL-only ``pi-heif`` is discontinued, and the pillow-heif README says
+its libheif is affected by a heap overflow; see ``docs/THIRD_PARTY.md``). Applications that accept a
 decoder's license pass it through ``openers``::
 
     import pillow_heif  # installed and license-reviewed by the application
@@ -51,10 +51,11 @@ works); the limits are then checked exactly as for built-in formats.
 **Animated images** (GIF, APNG, animated WebP, AVIF sequences):
 :func:`load_image` returns the first frame; :func:`iter_frames` yields every
 frame as it is displayed (after disposal and blending), one at a time. The
-declared frame count is checked against ``max_frames`` before any frame is
-decoded (default :data:`DEFAULT_MAX_IMAGE_FRAMES`; ``MediaLimits.max_frames``
-is sized for video and is also applied). Counting GIF frames scans the whole
-file, which is linear in its size.
+declared frame count is checked before any frame is decoded, against
+``MediaLimits.max_image_frames`` (default 5,000) or the call's ``max_frames``
+argument when given; ``MediaLimits.max_frames``, sized for video, is also
+applied. Counting GIF frames scans the whole file, which is linear in its
+size.
 
 Thread safety: the functions are thread-safe; they share no state.
 """
@@ -92,7 +93,6 @@ from provenance_kit.mediatype import MediaKind, MediaType, require_media_type
 
 __all__ = [
     "DEFAULT_IMAGE_TYPES",
-    "DEFAULT_MAX_IMAGE_FRAMES",
     "ImageInfo",
     "ImageMode",
     "ImageOpener",
@@ -108,10 +108,6 @@ _log = get_logger(__name__)
 DEFAULT_IMAGE_TYPES: frozenset[MediaType] = frozenset(
     {MediaType.JPEG, MediaType.PNG, MediaType.GIF, MediaType.WEBP, MediaType.AVIF}
 )
-
-#: Default cap on the frames of an animated image: about 3 minutes at
-#: 25 frames per second, far above ordinary animated GIFs and stickers.
-DEFAULT_MAX_IMAGE_FRAMES = 5_000
 
 #: Builds a Pillow image from a binary stream, parsing only the header.
 ImageOpener = Callable[[IO[bytes]], Image.Image]
@@ -227,8 +223,8 @@ def probe_image(
         allowed: Accepted types; ``None`` uses :data:`DEFAULT_IMAGE_TYPES`
             plus the types in ``openers``.
         openers: Extra decoders by type (see the module docstring).
-        max_frames: Frame-count cap; ``None`` uses
-            :data:`DEFAULT_MAX_IMAGE_FRAMES`.
+        max_frames: Frame-count cap for this call; ``None`` uses
+            ``limits.max_image_frames``.
 
     Returns:
         The header information.
@@ -265,8 +261,8 @@ def load_image(
         allowed: Accepted types; ``None`` uses :data:`DEFAULT_IMAGE_TYPES`
             plus the types in ``openers``.
         openers: Extra decoders by type, for example for HEIC.
-        max_frames: Frame-count cap; ``None`` uses
-            :data:`DEFAULT_MAX_IMAGE_FRAMES`.
+        max_frames: Frame-count cap for this call; ``None`` uses
+            ``limits.max_image_frames``.
         to_srgb: Convert to sRGB with the embedded ICC profile (LittleCMS).
             Without a profile, or if the profile cannot be used, the pixels
             are converted without colour management and
@@ -316,8 +312,8 @@ def iter_frames(
         allowed: Accepted types; ``None`` uses :data:`DEFAULT_IMAGE_TYPES`
             plus the types in ``openers``.
         openers: Extra decoders by type.
-        max_frames: Frame-count cap; ``None`` uses
-            :data:`DEFAULT_MAX_IMAGE_FRAMES`.
+        max_frames: Frame-count cap for this call; ``None`` uses
+            ``limits.max_image_frames``.
         to_srgb: Apply the ICC profile (see :func:`load_image`).
 
     Yields:
@@ -339,7 +335,16 @@ def iter_frames(
 
 # ---------------------------------------------------------------- internals
 
-_Checked = tuple[MediaType, MediaLimits, int, Mapping[MediaType, ImageOpener]]
+
+@dataclass(frozen=True, slots=True)
+class _FrameCap:
+    """The frame-count cap in force and the setting it comes from (for errors)."""
+
+    name: str
+    maximum: int
+
+
+_Checked = tuple[MediaType, MediaLimits, _FrameCap, Mapping[MediaType, ImageOpener]]
 
 
 def _frames(
@@ -385,11 +390,15 @@ def _prepare(
     limits = limits if limits is not None else MediaLimits()
     if not isinstance(limits, MediaLimits):
         raise TypeError("limits must be a MediaLimits")
-    frame_cap = DEFAULT_MAX_IMAGE_FRAMES if max_frames is None else max_frames
-    if isinstance(frame_cap, bool) or not isinstance(frame_cap, int):
-        raise TypeError("max_frames must be an int")
-    if frame_cap < 1:
-        raise ValueError("max_frames must be at least 1")
+    if max_frames is None:
+        frame_cap = _FrameCap("max_image_frames", limits.max_image_frames)
+    else:
+        cap: object = max_frames
+        if isinstance(cap, bool) or not isinstance(cap, int):
+            raise TypeError("max_frames must be an int")
+        if cap < 1:
+            raise ValueError("max_frames must be at least 1")
+        frame_cap = _FrameCap("max_frames", cap)
     extra = dict(openers) if openers else {}
     entries: list[tuple[object, object]] = list(extra.items())
     for key, opener in entries:
@@ -426,7 +435,7 @@ def _open_checked(
     raw: bytes,
     media_type: MediaType,
     limits: MediaLimits,
-    frame_cap: int,
+    frame_cap: _FrameCap,
     extra: Mapping[MediaType, ImageOpener],
 ) -> tuple[Image.Image, ImageInfo]:
     opener = extra.get(media_type) or _builtin_opener(media_type)
@@ -465,15 +474,15 @@ def _open_checked(
     return image, info
 
 
-def _frame_count(image: Image.Image, media_type: MediaType, frame_cap: int) -> int:
+def _frame_count(image: Image.Image, media_type: MediaType, frame_cap: _FrameCap) -> int:
     try:
         count = int(getattr(image, "n_frames", 1))
     except (MemoryError, RecursionError):
         raise
     except Exception as exc:
         raise MediaDecodeError(f"{media_type.mime} frames could not be counted") from exc
-    if count > frame_cap:
-        raise MediaLimitExceededError("max_frames", frame_cap, count)
+    if count > frame_cap.maximum:
+        raise MediaLimitExceededError(frame_cap.name, frame_cap.maximum, count)
     return max(count, 1)
 
 

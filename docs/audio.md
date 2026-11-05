@@ -16,16 +16,19 @@ invisible watermark on decoded PCM.
 from provenance_kit.audio.pcm import decode_pcm
 
 audio = decode_pcm(data, sample_rate=16000, channels=1)  # resampled and downmixed by ffmpeg
-audio.samples       # float32, shape (1, n), values in [-1, 1]
-audio.sample_rate   # 16000
+audio.samples  # float32, shape (1, n), values in [-1, 1]
+audio.sample_rate  # 16000
 ```
 
 Any supported container works, including the audio track of a video (MP4,
-Matroska/WebM, AVI, MPEG-TS); the first audio stream is decoded. The same
-input rules as the video modules apply (type sniffed from the bytes, explicit
-demuxer, `-protocol_whitelist pipe`, defensive parsing of ffprobe's report,
-media through a pipe except MP4/M4A files whose `moov` box follows the media
-data, which go through a private temporary file because ffmpeg must seek).
+Matroska/WebM, AVI, MPEG-TS); the first audio stream is decoded. A FLAC
+stream behind an ID3v2 tag (how C2PA signing stores the manifest in FLAC) is
+detected and decoded as FLAC. The same input rules as the video modules
+apply, from the same code (the core's private `provenance_kit._ffmpeg`): type
+sniffed from the bytes, explicit demuxer, `-protocol_whitelist pipe`,
+defensive parsing of ffprobe's report, media through a pipe except MP4/M4A
+files whose `moov` box follows the media data, which go through a private
+temporary file because ffmpeg must seek.
 Limits are checked on the byte size, on the declared channels, sample rate and
 duration, on the requested layout, and while decoding: ffmpeg runs with `-t`
 one second past `max_duration_seconds` and the samples are counted, so media
@@ -38,19 +41,22 @@ to mono sums the channels at -3 dB each).
 
 ```python
 from provenance_kit.audio.fingerprint import (
-    AudioFingerprint, compare_fingerprints, fingerprint_audio,
+    AudioFingerprint,
+    compare_fingerprints,
+    fingerprint_audio,
 )
 
 reference = fingerprint_audio(track_bytes)
-stored = reference.to_bytes()                         # 4 bytes per 0.124 s + 20-byte header
-match = compare_fingerprints(fingerprint_audio(clip_bytes),
-                             AudioFingerprint.from_bytes(stored))
+stored = reference.to_bytes()  # 4 bytes per 0.124 s + 20-byte header
+match = compare_fingerprints(fingerprint_audio(clip_bytes), AudioFingerprint.from_bytes(stored))
 match.is_match, match.bit_error_rate, match.offset_seconds
 ```
 
 The media is decoded by ffmpeg (limits enforced) to mono 16-bit PCM at
-11,025 Hz, Chromaprint's working rate, and streamed into
-`fpcalc -raw -json -length 0 -` through standard input; fpcalc only ever sees
+11,025 Hz, Chromaprint's working rate, and ffmpeg's output is piped straight
+into `fpcalc -raw -json -length 0 -` (the runner feeds one tool's
+`ToolProcess` to the other's standard input; ffmpeg's output cap, set from
+`max_duration_seconds`, bounds what fpcalc receives). fpcalc only ever sees
 raw PCM, never the untrusted container. Its report is validated (a list of
 unsigned 32-bit integers). `fpcalc` reports a duration of 0.0 when it reads
 standard input, so the duration comes from the PCM sample count. Audio
@@ -94,9 +100,15 @@ from provenance_kit import PayloadCodec
 from provenance_kit.audio.watermark import AudioSealBackend, detect_watermark, embed_verified
 
 backend = AudioSealBackend(model_dir="/srv/models/audioseal")
-codec = PayloadCodec(16, version_bits=0, check_bits=4)        # 4,096 identifiers
-result = embed_verified(audio.samples, audio.sample_rate, codec.encode(42),
-                        encoder=my_encoder, backend=backend, codec=codec)
+codec = PayloadCodec(16, version_bits=0, check_bits=4)  # 4,096 identifiers
+result = embed_verified(
+    audio.samples,
+    audio.sample_rate,
+    codec.encode(42),
+    encoder=my_encoder,
+    backend=backend,
+    codec=codec,
+)
 detection = detect_watermark(samples, rate, backend=backend, codec=codec)
 detection.found, detection.confidence, detection.payload
 ```
@@ -114,7 +126,11 @@ detection.found, detection.confidence, detection.payload
 URL pattern: `https://huggingface.co/facebook/audioseal/resolve/<revision>/<file>`.
 The hashes equal the Git LFS object IDs published by the Hugging Face API and
 were recomputed after download. The streaming checkpoints added in December
-2025 are not used.
+2025 are not used. `model_dir` defaults to `$PROVENANCE_KIT_MODEL_DIR/audioseal`
+or, without the variable, `provenance-kit/models/audioseal` in the per-user
+cache directory (`provenance_kit.modelfiles`), and is refused inside
+`site-packages`; nothing is downloaded unless `download=True` is passed or
+`download_audioseal_models()` is called.
 
 **License check.** The weights were CC-BY-NC 4.0 (`LICENSE_weights` in the
 GitHub repository) until commit `2956515` of 2024-04-02 ("Re-update of
@@ -156,7 +172,8 @@ This is an upstream property, reproduced with the stock API: shifting the
 Encodings that record their encoder delay decode aligned: AAC in MP4/M4A
 (edit list), MP3 written to a seekable file (LAME/Info tag), Ogg Opus
 (pre-skip) and FLAC. Raw ADTS AAC and MP3 streamed to a pipe shift the audio
-by the encoder delay.
+by the encoder delay; the opt-in alignment search (below) recovers them on
+broadband content.
 
 **Measured robustness** (8 s, 44.1 kHz stereo, four payloads each, LGPL ffmpeg
 8.1 encoders; `tests/audio/test_watermark_integration.py`). Each cell:
@@ -181,6 +198,52 @@ and delay-signaling containers the payload survives intact. On sparse tonal
 content the detection still works but the 16 bits do not. A misaligned
 pipeline breaks both. `embed_verified` exists to catch exactly this in the
 application's real pipeline.
+
+**Alignment search (opt-in).** For audio that went through a pipeline that
+does not record the encoder delay, `detect_watermark(..., alignment=AlignmentSearch())`
+first searches for the number of leading samples to drop:
+
+```python
+from provenance_kit.audio.watermark import AlignmentSearch, detect_watermark
+
+detection = detect_watermark(
+    samples, rate, backend=backend, codec=codec, alignment=AlignmentSearch()
+)
+detection.offset_samples  # the samples dropped before detection
+```
+
+It tries the offsets `0, step_samples, ...` up to `max_offset_samples`
+(defaults 2 and 2048, in samples at the signal's rate: 1,025 offsets), scores
+the first `window_seconds` (0.5 s) after each, and keeps the offset whose 16
+bits are the most confident (mean `|2p - 1|`). The detection probability
+cannot pick the offset: it stays near 1 over a wide range of misalignments.
+When no offset reaches `min_bit_confidence` (0.2), the signal is detected
+unshifted. Cost: one detector call on 0.5 s of audio per offset, plus the
+final detection: 20 to 40 s per search with the defaults on the reference CPU
+(AudioSeal on CPU, 44.1 kHz input), linear in the number of offsets; narrow
+the range when the delay is known.
+
+Measured (8 s broadband test signal, 44.1 kHz stereo, payloads 1 and 777, the
+default search; `test_alignment_search_recovers_unsignaled_delays` and
+`test_alignment_search_on_unmarked_audio`, run with `-s`):
+
+| Pipeline | Encoder delay | Offset found | Bits without search | Bits with search |
+|---|---|---|---|---|
+| Raw ADTS AAC 128 kb/s | 1024 | 1024 and 1024 | 12 and 8 of 16 | 16 of 16, verified (2/2) |
+| MP3 128 kb/s to a pipe | 1105 (+1 from the decoder) | 1116 and 1106 | 10 and 9 of 16 | 16 of 16, verified (2/2) |
+
+* Best excerpt bit confidence at the found offset: 0.36 to 0.44 on marked
+  broadband audio, 0.04 to 0.05 on unmarked audio (broadband and tones, raw
+  and after ADTS AAC), so unmarked audio stays unshifted and its detection
+  probability unchanged. Without the confidence floor, the near-random best
+  offset of the unmarked tones raised their detection probability from 0.25
+  to 0.62 (above the 0.5 threshold), which is why the floor exists.
+* On the sparse tonal content the bit confidence is not a reliable guide:
+  the search picked offsets 78, 1102 and 1182 instead of 0, 1024 and about
+  1106 for payload 1 (bit accuracy 0.625). The 16 bits do not survive on that
+  content even when aligned (table above).
+* Encodings that record the delay (M4A, MP3 files, Ogg Opus, FLAC) do not
+  need the search.
 
 **Thread safety.** `AudioSealBackend` can be shared between threads (model
 calls are serialized). The eager-mode switch is a module-global flag in

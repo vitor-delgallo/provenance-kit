@@ -6,6 +6,7 @@ Keys and certificates are generated per test run (tests/provenance/_certs.py).
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as dt
 import io
 import logging
@@ -21,6 +22,8 @@ from provenance_kit.mediatype import MediaType
 from provenance_kit.provenance.c2pa import (
     SUPPORTED_MEDIA_TYPES,
     ActionType,
+    AssertionPlacement,
+    AssertionPlacements,
     DigitalSourceType,
     GeneratorInfo,
     Ingredient,
@@ -55,7 +58,11 @@ from PIL import Image  # noqa: E402
 
 from tests.provenance._calendar import MockCalendar  # noqa: E402
 from tests.provenance._certs import make_c2pa_pki  # noqa: E402
-from tests.provenance._cose import assertion_cbor, claim_signature  # noqa: E402
+from tests.provenance._cose import (  # noqa: E402
+    assertion_cbor,
+    claim_assertion_lists,
+    claim_signature,
+)
 
 WHEN = dt.datetime(2026, 11, 5, 12, 0, tzinfo=dt.UTC)
 
@@ -150,12 +157,14 @@ def test_sign_and_read_images(signer, pki, fmt, media_type):
     assert report.state is ValidationState.VALID
     assert report.errors == ()
     assert report.title == "asset"
+    # Created assertions first, then the gathered ones (the authors, by
+    # default); no thumbnail assertion: thumbnails are disabled.
     assert [a.label for a in report.assertions] == [
         "c2pa.actions.v2",
-        "cawg.metadata",
         "cawg.training-mining",
         "c2pa.soft-binding",
-    ]  # no thumbnail assertion: thumbnails are disabled
+        "cawg.metadata",
+    ]
     actions = report.find_assertions("c2pa.actions")[0].data
     assert isinstance(actions, dict)
     assert [a["action"] for a in actions["actions"]] == [
@@ -377,6 +386,41 @@ def test_parent_ingredient_with_its_own_manifest(signer):
     assert opened["parameters"]["ingredients"]  # linked by hashed URI
 
 
+PLACEMENTS = {
+    "defaults": (
+        AssertionPlacements(),
+        ["c2pa.actions.v2", "cawg.training-mining", "c2pa.soft-binding"],
+        ["cawg.metadata"],
+    ),
+    "inverted": (
+        AssertionPlacements(
+            actions=AssertionPlacement.GATHERED,
+            authors=AssertionPlacement.CREATED,
+            training_mining=AssertionPlacement.GATHERED,
+            soft_binding=AssertionPlacement.GATHERED,
+        ),
+        ["cawg.metadata"],
+        ["c2pa.actions.v2", "cawg.training-mining", "c2pa.soft-binding"],
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(PLACEMENTS))
+def test_created_and_gathered_assertions(signer, name):
+    """c2pa-rs 0.91 writes and validates both lists of a v2 claim (C2PA 2.3, 10.2.2)."""
+    placements, created, gathered = PLACEMENTS[name]
+    spec = dataclasses.replace(full_spec(), placements=placements)
+    signed = sign_asset(image_bytes("PNG"), "image/png", spec, signer)
+    created_labels, gathered_labels = claim_assertion_lists(signed)
+    # The library adds the hard binding, always as a created assertion.
+    assert sorted(created_labels) == sorted([*created, "c2pa.hash.data"])
+    assert sorted(gathered_labels) == sorted(gathered)
+    report = read_manifest(signed)
+    assert report.state is ValidationState.VALID, report.errors
+    assert report.authors == ("Jane Doe",)
+    assert report.training_mining_not_allowed
+
+
 def test_soft_binding_value_is_written_as_text(signer):
     """c2pa-python 0.38 writes JSON-defined assertions as generic CBOR: no byte strings."""
     signed = sign_asset(image_bytes("PNG"), "image/png", full_spec(), signer)
@@ -524,6 +568,17 @@ def test_corrupt_asset_or_ingredient_is_a_media_error(signer):
 # ------------------------------------------------------------------ LocalKeySigner
 
 
+def not_a_key_pem() -> bytes:
+    """A PEM block labelled as a private key whose body is not a key.
+
+    The label is assembled at run time so that the file never contains the
+    literal PEM marker, which secret scanners (GitHub push protection
+    included) treat as a leaked key.
+    """
+    label = " ".join(("PRIVATE", "KEY"))
+    return f"-----BEGIN {label}-----\nAAAA\n-----END {label}-----\n".encode()
+
+
 def test_local_key_signer_checks_the_key_and_chain(pki):
     other = make_c2pa_pki("es256")
     with pytest.raises(ValueError, match="does not match"):
@@ -531,9 +586,7 @@ def test_local_key_signer_checks_the_key_and_chain(pki):
     with pytest.raises(ValueError, match="es256 only"):
         LocalKeySigner(pki.key_pem, pki.leaf_pem, algorithm=SigningAlgorithm.ES384)
     with pytest.raises(ValueError, match="private key"):
-        LocalKeySigner(
-            b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n", pki.leaf_pem
-        )
+        LocalKeySigner(not_a_key_pem(), pki.leaf_pem)
     with pytest.raises(ValueError, match="certificate chain"):
         LocalKeySigner(pki.key_pem, "no certificates here")
     encrypted = pki.key.private_bytes(

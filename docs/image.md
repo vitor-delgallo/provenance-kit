@@ -5,7 +5,7 @@
 | Module | What it does | Needs |
 |---|---|---|
 | `provenance_kit.image.loading` | decodes untrusted image bytes safely | core install |
-| `provenance_kit.image.hashing` | PDQ, pHash and dHash; fingerprints; known-hash lists | core install for PDQ (NumPy port); extra `image-hash` for `pdqhash`, pHash and dHash |
+| `provenance_kit.image.hashing` | PDQ, pHash and dHash; fingerprints; known-hash lists | core install for PDQ (NumPy port; extra `pdq-native` adds the C++ `pdqhash`); extra `image-hash` for pHash and dHash |
 | `provenance_kit.image.watermark` | invisible watermark with read-back verification (TrustMark) | extra `image-watermark` and the model files |
 | `provenance_kit.image.visible` | visible text tiled diagonally across an image | core install |
 
@@ -23,9 +23,9 @@ from provenance_kit import MediaLimits
 from provenance_kit.image.loading import iter_frames, load_image, probe_image
 
 loaded = load_image(data, limits=MediaLimits())  # first frame, RGB or RGBA
-loaded.image            # PIL.Image.Image, orientation applied, 8-bit
+loaded.image  # PIL.Image.Image, orientation applied, 8-bit
 loaded.info.media_type  # MediaType.JPEG, ... (from the bytes)
-loaded.info.icc_profile # bytes or None (untrusted)
+loaded.info.icc_profile  # bytes or None (untrusted)
 
 for frame in iter_frames(gif_bytes):  # every frame, as displayed
     ...
@@ -39,11 +39,12 @@ What `load_image` guarantees, in order:
    JPEG, PNG/APNG, GIF, WebP, AVIF (official Pillow 11.3+ wheels have AVIF).
    TIFF and BMP need `allowed=`.
 3. Header only: dimensions (`limits.check_dimensions`, also for the size after
-   an EXIF rotation) and the frame count of animated images (default cap
-   `DEFAULT_MAX_IMAGE_FRAMES` = 5,000, plus `limits.max_frames`) are checked
-   before any pixel is decoded. Pillow's global `MAX_IMAGE_PIXELS` check is
-   bypassed (plugins are constructed directly), so the caller's limits decide
-   and no `DecompressionBombWarning` is emitted.
+   an EXIF rotation) and the frame count of animated images
+   (`limits.max_image_frames`, 5,000 by default, or the call's `max_frames`;
+   plus `limits.max_frames`) are checked before any pixel is decoded.
+   Pillow's global `MAX_IMAGE_PIXELS` check is bypassed (plugins are
+   constructed directly), so the caller's limits decide and no
+   `DecompressionBombWarning` is emitted.
 4. Every decoder failure becomes `MediaDecodeError`; unsupported or refused
    types `UnsupportedMediaError`; limits `MediaLimitExceededError`.
 5. EXIF orientation applied; ICC profile kept (`to_srgb=True` applies it with
@@ -68,9 +69,10 @@ exists today:
 * `pillow-heif` 1.8.1: Python code BSD-3-Clause, but its binary wheels are
   **GPL-2.0 as a whole** (they bundle the x265 encoder; libheif and libde265
   are LGPL-3.0), per its `LICENSES_bundled.txt`.
-* `pi-heif` 1.4.0, the decode-only LGPL variant, is **discontinued**, and its
-  wheels bundle libheif 1.23.0, affected by a heap buffer overflow on crafted
-  HEIC files (CVE-2026-84383); the pillow-heif README says to migrate.
+* `pi-heif` 1.4.0, the decode-only LGPL variant, is **discontinued**.
+  According to the [pillow-heif README](https://github.com/bigcat88/pillow_heif#readme),
+  its wheels bundle libheif 1.23.0, which is affected by a heap buffer
+  overflow on crafted HEIC files, and users should migrate.
 
 provenance-kit therefore ships no HEIF extra. Applications that accept a
 decoder's license plug it in: any Pillow `ImageFile` class works as an opener,
@@ -89,12 +91,12 @@ loaded = load_image(data, openers=openers)
 ```python
 from provenance_kit.image.hashing import HashList, PdqHasher, fingerprint_image
 
-hasher = PdqHasher()                  # "auto": pdqhash if installed, else NumPy
-h = hasher.hash_image(loaded.image)   # PdqHash(value=<32 bytes>, quality=0..100)
-h.hex()                               # canonical 64-digit hex, as Meta's tools print
+hasher = PdqHasher()  # "auto": pdqhash if installed, else NumPy
+h = hasher.hash_image(loaded.image)  # PdqHash(value=<32 bytes>, quality=0..100)
+h.hex()  # canonical 64-digit hex, as Meta's tools print
 
 known = HashList.from_hex(partner_lines, keys=partner_ids)
-matches = known.match(h) if h.is_reliable() else []   # distance <= 31 by default
+matches = known.match(h) if h.is_reliable() else []  # distance <= 31 by default
 ```
 
 ### PDQ
@@ -111,9 +113,12 @@ matches = known.match(h) if h.is_reliable() else []   # distance <= 31 by defaul
 * **Thresholds.** Meta's PDQ README: distance `<= 31` matches, discard
   quality `<= 49`; `python-threatexchange` rejects quality `< 50`
   (`PDQ_MATCH_DISTANCE`, `PDQ_MIN_QUALITY`).
-* **Backends.** `pdqhash` (Meta's C++, `float32`) or a NumPy port of Meta's
-  pure-Python reference (`float64`, ThreatExchange commit `a9a36d45`, BSD
-  notice kept in `_pdq_numpy.py`).
+* **Backends.** A NumPy port of Meta's pure-Python reference (`float64`,
+  ThreatExchange commit `a9a36d45`, BSD notice kept in `_pdq_numpy.py`), in
+  the core install, or `pdqhash` (Meta's C++, `float32`) from the optional
+  `pdq-native` extra. `PdqHasher("auto")` (the default) prefers `pdqhash` when
+  it is installed. `pdqhash` has no Linux wheels and needs a C++ compiler
+  there, which is why it is its own extra.
 
 Validation:
 
@@ -157,7 +162,9 @@ about 2 s per million.
 
 ```python
 from provenance_kit.image.watermark import (
-    ImageWatermarker, TrustMarkBackend, download_trustmark_models,
+    ImageWatermarker,
+    TrustMarkBackend,
+    download_trustmark_models,
 )
 
 # Deployment time (network, once): pinned, verified, atomic.
@@ -195,8 +202,10 @@ identifier bits with `BCH_5`).
 * `MODEL_FILES` pins the size and SHA-256 of the config, encoder and decoder
   of each variant (Q, P, B, C); each file's MD5 also matched the checksums in
   `trustmark` 0.9.2. The remover and box-detector models are not used.
-* `model_dir` defaults to `$PROVENANCE_KIT_MODEL_DIR/trustmark` or a per-user
-  cache directory, and is refused if it is inside `site-packages`.
+* `model_dir` defaults to `$PROVENANCE_KIT_MODEL_DIR/trustmark` or, without
+  the variable, `provenance-kit/models/trustmark` in the per-user cache
+  directory (the convention of `provenance_kit.modelfiles`, shared by every
+  model-backed backend), and is refused if it is inside `site-packages`.
 * The constructor never downloads (unless `download=True`); missing or altered
   files raise `ModelLoadError` naming the file, not the path.
 * Files are read once, hashed, and the models are built from those bytes in
@@ -204,7 +213,9 @@ identifier bits with `BCH_5`).
   may only name classes in the `trustmark` package and the two decoder
   architectures that do not fetch pretrained weights.
 * `trustmark`'s `print()` calls are redirected to DEBUG logging (the tests
-  assert empty stdout and stderr).
+  assert empty stdout and stderr). Each loaded `trustmark` module gets its
+  own module-global `print`; the built-in `print` is not patched, so other
+  libraries' output is untouched.
 
 Cost (CPU): first construction about 5 s (importing PyTorch, TorchVision and
 Lightning dominates); another backend in the same process about 0.6 s. The

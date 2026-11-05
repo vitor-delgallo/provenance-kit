@@ -56,6 +56,31 @@ def test_ffmpeg_output_pipes_into_ffprobe(ffmpeg_path, ffprobe_path):
     assert int(streams[0]["sample_rate"]) == 22050
 
 
+def test_ffmpeg_pipes_into_ffprobe_through_a_tool_process(ffmpeg_path, ffprobe_path):
+    probe_args = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-protocol_whitelist",
+        "pipe",
+        "-f",
+        "wav",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-i",
+        "pipe:0",
+    ]
+    with stream_tool(ffmpeg_path, TONE_WAV, tool="ffmpeg", timeout_seconds=60) as producer:
+        probe = run_tool(
+            ffprobe_path, probe_args, tool="ffprobe", stdin=producer, timeout_seconds=60
+        )
+    streams = json.loads(probe.stdout)["streams"]
+    assert int(streams[0]["sample_rate"]) == 22050
+    assert producer.bytes_read > 0
+    assert not producer.output_limit_exceeded
+
+
 def test_ffmpeg_streams_raw_pcm_records(ffmpeg_path):
     args = [*TONE_WAV[:-3], "-f", "s16le", "-ac", "1", "pipe:1"]
     frames = 0

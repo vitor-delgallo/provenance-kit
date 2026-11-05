@@ -17,7 +17,7 @@ have counsel review anything marked as a risk before you distribute a product.
 | TrustMark (`trustmark` 0.9.2) | `image-watermark` | MIT | MIT | Low |
 | VideoSeal (TorchScript model) | `video-watermark` | MIT | MIT | Low |
 | AudioSeal (`audioseal` 0.2.1) | `audio-watermark` | MIT | MIT (since 2024-04-02) | Low; use current weights only |
-| PDQ (`pdqhash` 0.2.8) | `image-hash` | MIT bindings + BSD-3-Clause PDQ | none | Low; no Linux wheels |
+| PDQ (`pdqhash` 0.2.8) | `pdq-native` | MIT bindings + BSD-3-Clause PDQ | none | Low; no Linux wheels |
 | imagehash (`ImageHash` 4.3.2) | `image-hash` | BSD-2-Clause | none | Low |
 | PDQ NumPy port (in `provenance_kit.image`) | core install | BSD-3-Clause (Meta ThreatExchange; notice kept) | none | Low |
 | PDQ test vectors (ThreatExchange) | tests only | BSD-3-Clause; images downloaded at test time, not redistributed | none | None |
@@ -138,8 +138,11 @@ them on your own servers does not trigger the distribution conditions.
   pure-Python reference implementation
   ([ThreatExchange/pdq/python](https://github.com/meta/ThreatExchange/tree/main/pdq/python)),
   validated against the reference test vectors in that repository; the
-  ported code keeps Meta's BSD-3-Clause notice. `auto` uses `pdqhash` when it
-  is installed and the port otherwise (ARCHITECTURE.md, decision 3).
+  ported code keeps Meta's BSD-3-Clause notice. The port is the default
+  backend and needs nothing beyond the core install; `pdqhash` is its own
+  optional extra, `pdq-native`, so that no other extra needs a C++ compiler.
+  `auto` uses `pdqhash` when it is installed and the port otherwise
+  (ARCHITECTURE.md, decision 3).
 
 ### imagehash
 
@@ -184,9 +187,10 @@ them on your own servers does not trigger the distribution conditions.
     plus MinGW runtimes on Windows. Shipping it with a proprietary product
     means GPL obligations; review with counsel.
   * [`pi-heif`](https://pypi.org/project/pi-heif/) 1.4.0 (decode-only, LGPL
-    wheels) is **discontinued**; per the pillow-heif README its wheels bundle
-    libheif 1.23.0, affected by a heap buffer overflow on crafted HEIC files
-    (CVE-2026-84383). Do not use it for untrusted uploads.
+    wheels) is **discontinued**. According to the
+    [pillow-heif README](https://github.com/bigcat88/pillow_heif#readme), its
+    wheels bundle libheif 1.23.0, which is affected by a heap buffer overflow
+    on crafted HEIC files. Do not use it for untrusted uploads.
   * HEVC (the codec inside HEIC) is patent-encumbered in some jurisdictions,
     independently of the copyright license.
 
