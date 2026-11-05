@@ -1,0 +1,15 @@
+# Normalize line endings: LF in the repository and in working trees.
+* text=auto eol=lf
+
+# Binary test data, if any is ever added (keep it tiny and generated when possible).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.mp4 binary
+*.mkv binary
+*.webm binary
+*.wav binary
+*.flac binary
+*.mp3 binary
