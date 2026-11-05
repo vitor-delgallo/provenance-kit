@@ -141,6 +141,105 @@ def test_rotation_matches_ffmpeg_autorotation(media, tools):
         assert np.array_equal(frame.image, np.rot90(original, k=1))  # 90 degrees counterclockwise
 
 
+@pytest.mark.parametrize(
+    "orientation",
+    [
+        (90, False, False),
+        (270, False, False),
+        (0, True, False),  # a phone's "flip" edit
+        (90, True, False),
+        (270, True, False),
+        (180, True, False),
+        (0, False, True),
+        (90, False, True),
+    ],
+)
+def test_display_matrices_match_ffmpeg_autorotation(media, tools, tmp_path, orientation):
+    rotation, hflip, vflip = orientation
+    source = tmp_path / "source.mp4"
+    source.write_bytes(media["faststart"])
+    flags = ["-display_rotation:v:0", str(rotation)]
+    flags += ["-display_hflip:v:0"] if hflip else []
+    flags += ["-display_vflip:v:0"] if vflip else []
+    data = to_file(
+        tools,
+        [*flags, "-i", str(source), "-c", "copy", "-movflags", "+faststart"],
+        tmp_path / "oriented.mp4",
+    )
+    ours = extract_frames(data, sampling="all", max_frames=3, tools=tools)
+    # ffmpeg decoding the same file with its default autorotation.
+    raw = ffmpeg(
+        tools,
+        ["-i", "pipe:0", "-frames:v", "3", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+        stdin=data,
+    )
+    height, width = ours[0].image.shape[:2]
+    reference = np.frombuffer(raw, np.uint8).reshape(3, height, width, 3)
+    for frame, expected in zip(ours, reference, strict=True):
+        assert np.array_equal(frame.image, expected)
+
+
+def _index_coded(tools, *, count: int, rate: int, setpts: str | None = None) -> bytes:
+    """Lossless video whose frame n is a uniform grey of level n."""
+    pixels = np.repeat(np.arange(count, dtype=np.uint8), 16 * 16 * 3)
+    args = ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "16x16", "-r", str(rate), "-i", "pipe:0"]
+    if setpts is not None:
+        args += ["-vf", f"setpts='{setpts}'", "-fps_mode", "passthrough"]
+    args += ["-c:v", "ffv1", "-pix_fmt", "bgr0", "-f", "matroska", "pipe:1"]
+    return ffmpeg(tools, args, stdin=pixels.tobytes())
+
+
+def _presentation_times(tools, data: bytes) -> list[float]:
+    result = tools.run(
+        Tool.FFPROBE,
+        [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "matroska",
+            "-i",
+            "pipe:0",
+            "-show_entries",
+            "frame=pts_time",
+            "-of",
+            "csv=p=0",
+        ],
+        stdin=data,
+        timeout_seconds=60,
+        max_stdout_bytes=1 << 20,
+    )
+    times = [float(line) for line in result.stdout.decode().split()]
+    return [t - times[0] for t in times]
+
+
+#: Variable frame rate: 30 fps for 1.5 s, then alternating gaps of 53 and 113 ms.
+VFR = "if(lt(N,45),N/30,1.5+(N-45)/12+0.03*mod(N,2))/TB"
+
+
+@pytest.mark.parametrize(
+    ("rate", "fps", "setpts"),
+    [
+        (30, 1.0, None),
+        (30, 2.0, None),
+        (30, 7.0, None),
+        (25, 3.0, None),
+        (30, 1.0, VFR),
+        (30, 4.0, VFR),
+    ],
+)
+def test_fps_sampling_returns_the_frame_shown_at_each_timestamp(tools, rate, fps, setpts):
+    # The frame labelled t is the last one whose presentation time is <= t:
+    # frames 0, 30, 60, ... at 1 fps from 30 fps (round=near gave 14, 44, 74).
+    data = _index_coded(tools, count=100, rate=rate, setpts=setpts)
+    times = _presentation_times(tools, data)
+    frames = extract_frames(data, fps=fps, tools=tools)
+    assert len(frames) >= int(times[-1] * fps)
+    for frame in frames:
+        shown = max(n for n, t in enumerate(times) if t <= frame.timestamp + 1e-6)
+        assert round(float(frame.image.mean())) == shown, frame.timestamp
+
+
 def test_keyframes_and_their_timestamps(media, tools):
     frames = extract_frames(media["faststart"], sampling=FrameSampling.KEYFRAMES, tools=tools)
     assert [round(f.timestamp, 3) for f in frames] == [0.0, 0.4, 0.8, 1.2, 1.6]

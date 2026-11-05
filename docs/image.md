@@ -108,8 +108,21 @@ matches = known.match(h) if h.is_reliable() else []  # distance <= 31 by default
   512 x 512 first (the C++ `pdqio.cpp` calls the two-pass blur "prohibitively
   expensive for larger images"; the Python reference calls
   `Image.thumbnail((512, 512))`). `PdqHasher(max_side=512)` does the same by
-  default. `max_side=None` hashes at full resolution like
-  `python-threatexchange`'s `pdq_from_bytes`.
+  default, with one difference: the shorter side is never shrunk below
+  64 px, PDQ's block size (a 4000 x 100 banner becomes 2560 x 64, not
+  512 x 12; an image whose shorter side is already under 64 px is not shrunk
+  at all), up to a longer side of `32 * max_side` (16,384 px by default, the
+  default `MediaLimits.max_width`). PDQ is numerically unstable on thinner
+  images (see the validation below), so Meta's rule would make hashes of
+  panoramas and banners depend on the backend. `max_side=None` hashes at full
+  resolution like `python-threatexchange`'s `pdq_from_bytes`.
+* **Tiny images.** A side under 5 px gives the all-zero hash with quality 0
+  on both backends, as in Meta's C++ hasher (`MIN_HASHABLE_DIM`); this is
+  the one place where the NumPy port follows the C++ code rather than the
+  pure-Python reference it is ported from.
+* **Pixels.** `hash_rgb` accepts arrays with any strides (rotated, transposed
+  or Fortran-ordered views); they are copied to C order before reaching a
+  backend, since `pdqhash` reads its buffer as row-major.
 * **Thresholds.** Meta's PDQ README: distance `<= 31` matches, discard
   quality `<= 49`; `python-threatexchange` rejects quality `< 50`
   (`PDQ_MATCH_DISTANCE`, `PDQ_MIN_QUALITY`).
@@ -128,11 +141,24 @@ Validation:
 | `pdqhash` vs the same reference vectors | identical |
 | ThreatExchange published vectors (`pdq_test.py`, 18 images: photos, rotations and flips, LabelMe subset), both backends, default `max_side=512` | distance 0 on all 17 images with quality >= 50; 10 on the one with quality 3 |
 | Same at full resolution (`max_side=None`) | up to 12 bits (photos 1,004 to 1,600 px) |
-| `pdqhash` vs NumPy port, 1,200 generated images (963 with quality >= 50) | 958 identical; 2, 2, 2, 7 and 8 bits on the other five (all with a side under 64 px); quality always equal |
+| `pdqhash` vs NumPy port through `PdqHasher`, 3,000 generated images (noise, blocks, shapes, JPEG, blurred and elongated), both sides >= 64 px as hashed | 2,302 of 2,307 reliable pairs identical, the other five within 2 bits |
+| Same, a side of 5 to 63 px (426 reliable pairs) | up to 21 bits (worst at sides of 8 and 16 px); 132 bits on one 854 x 6 JPEG in another sweep |
+| Same, quality scores | equal on 2,997 of 3,000 images, 1 apart on 3 (so an image at quality 49 or 50 can be reliable on one backend only) |
+| Same, a side under 5 px | both: zero hash, quality 0 |
+| One backend, JPEG q90 re-encode of images with a side of 5 to 16 px / 32 px / 40 to 63 px / 64 to 100 px | median 64 to 86 / 31 / 6 to 12 / 4 to 8 bits |
 
-The tests assert `PDQ_BACKEND_MAX_DISTANCE` = 10 bits between backends. Cost
-for one image: 9 ms (`pdqhash`) or 19 ms (NumPy) at 512 x 512; 41 or 44 ms for
-a 4000 x 3000 image with the default pre-scaling, 0.5 or 0.8 s without it.
+The tests assert `PDQ_BACKEND_MAX_DISTANCE` = 10 bits between backends for
+reliable hashes of images at least 64 px on each side as hashed. Thinner
+images have no such bound: many DCT coefficients nearly tie because the
+64 x 64 block repeats rows or columns, so `float32` and `float64` round them
+to different sides of the median, and even one backend's hash is unstable
+under re-encoding. Do not rely on PDQ for images with a side under 64 px,
+whatever their quality score.
+
+Cost for one image (measured 2026-11-05): 8 ms (`pdqhash`) or 15 ms (NumPy)
+at 512 x 512; 34 or 40 ms for a 4000 x 3000 image with the default
+pre-scaling, 0.5 or 0.8 s without it; 30 or 140 ms for the most elongated
+shape the pre-scaling keeps (16,384 x 64).
 
 The ThreatExchange images are not committed (their licensing is not stated
 separately from the repository's code license, and several exceed the size
@@ -143,11 +169,24 @@ pinned commit into `.cache/threatexchange-pdq/`, checking each file's SHA-256.
 
 `phash(image)` and `dhash(image)` wrap `imagehash` and return a 64-bit
 `BinaryHash` whose `hex()` equals `str(imagehash.phash(...))`.
-`fingerprint_image` computes all three; `compare_fingerprints` decides with
-PDQ when both PDQ hashes are reliable, else pHash, else dHash.
-`MatchThresholds` defaults: PDQ 31 / quality 50 (Meta), pHash 10, dHash 10
-(this library's starting points; there is no external standard, calibrate on
-your content).
+`fingerprint_image` computes all three; `compare_fingerprints` decides:
+
+* with PDQ hashes on both sides, PDQ alone decides, and only if both are
+  reliable (quality >= 50). A low-quality pair means a featureless image
+  (a flat canvas, a soft gradient), on which pHash and dHash are no better:
+  a white and a black canvas, or a red and a blue one, have pHash 0 to 1 bit
+  apart, and orthogonal ramps 7. The result is then `matched=False`,
+  `decided_by=None`, `undecided_reason=UndecidedReason.LOW_QUALITY`;
+* without a PDQ pair, pHash and then dHash decide, each only if both hashes
+  have at least `min_bit_balance` (1/8) of their bits set and clear. Flat
+  and smoothly shaded images give nearly all-zero or all-one hashes;
+  `imagehash`'s pHash of an image without ties always has half its bits set.
+  Otherwise `undecided_reason=UndecidedReason.LOW_INFORMATION` (or
+  `NO_COMMON_HASH` when the fingerprints share no hash type).
+
+`MatchThresholds` defaults: PDQ 31 / quality 50 (Meta), pHash 10, dHash 10,
+`min_bit_balance` 0.125 (this library's starting points; there is no
+external standard, calibrate on your content).
 
 ### Known-hash lists
 
@@ -156,7 +195,10 @@ vectorized XOR and population count, so matches are exact. Memory: 32 bytes
 per PDQ hash (32 MB per million) plus the keys (`keys=range(n)` costs
 nothing); a query needs under 1 MB of scratch. One query against 1,000,000 PDQ
 hashes: 12 ms. Building from packed bytes: 10 ms per million; from hex lines:
-about 2 s per million.
+about 2 s per million. `HashList.from_packed` takes bytes or a `uint8` array
+shaped `(n, 32)` (one PDQ hash per row) or `(n * 32,)`; any other shape,
+such as a transposed `(32, n)` array of the right total size, is refused
+with `ValueError` instead of being silently reinterpreted.
 
 ## Invisible watermark (TrustMark)
 
@@ -269,7 +311,10 @@ with an optional dark outline (`shadow=True`) for legibility on light and dark
 areas. `size` is the font height as a fraction of the shorter side (default
 0.04, at least 10 px); `spacing` the gap in font heights (default 2). Same
 size and mode out (RGB, RGBA, L, LA directly; CMYK, YCbCr, LAB, HSV, RGBX
-through RGB; P back onto its palette, transparency kept; 1 through L).
+through RGB; P back onto its palette, transparency kept: pixels on a
+transparent or semi-transparent entry keep it and the others are mapped onto
+the fully opaque entries only, so no opaque pixel becomes a hole; 1 through
+L).
 Deterministic for given Pillow and FreeType versions. 0.3 s for a 4000 x 3000
 image.
 

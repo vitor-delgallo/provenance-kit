@@ -12,7 +12,9 @@ order (luma weights, the four-phase running-sum box filter, decimation, the
 other image axis. For the same RGB input it therefore reproduces the
 reference hash bit for bit; see ``tests/image/test_hashing_pdq.py``. Meta's
 C++ code (wrapped by the ``pdqhash`` package) computes in ``float32``, so it
-can differ by a few bits on coefficients that sit next to the median.
+can differ by a few bits on coefficients that sit next to the median (and by
+many more on images with a side under 64 pixels; see
+:mod:`provenance_kit.image.hashing`).
 
 The original code carries this notice, which must be kept with the port:
 
@@ -50,7 +52,9 @@ The original code carries this notice, which must be kept with the port:
     SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Modifications for provenance-kit (MIT): vectorized with NumPy; only the
-hash and quality computation is kept (no file reading, no dihedral variants).
+hash and quality computation is kept (no file reading, no dihedral variants);
+images with a side under ``MIN_HASHABLE_DIM`` (5) pixels get the all-zero
+hash with quality 0, as in Meta's C++ hasher.
 """
 
 from __future__ import annotations
@@ -68,6 +72,11 @@ _LUMA_FROM_B = 0.114
 _DCT_MATRIX_SCALE_FACTOR = math.sqrt(2.0 / 64.0)
 _NUM_JAROSZ_XY_PASSES = 2
 _JAROSZ_WINDOW_SIZE_DIVISOR = 128
+# Meta's C++ hasher (and so pdqhash) returns the all-zero hash with quality 0
+# when a side is shorter than this (MIN_HASHABLE_DIM); the port does the same,
+# so that the two backends agree on such images.
+_MIN_HASHABLE_DIM = 5
+_ZERO_HASH = bytes(32)
 
 
 def _compute_dct_matrix() -> NDArray[np.float64]:
@@ -95,9 +104,12 @@ def pdq_hash_rgb(rgb: NDArray[np.uint8]) -> tuple[bytes, int]:
     Returns:
         The 32-byte hash (canonical PDQ order: bit ``k`` of the reference
         ``Hash256`` is bit ``k % 8`` of byte ``31 - k // 8``) and the quality
-        score, 0 to 100.
+        score, 0 to 100. Images with a side under 5 pixels get the all-zero
+        hash and quality 0, as in Meta's C++ hasher.
     """
     rows, cols = rgb.shape[0], rgb.shape[1]
+    if rows < _MIN_HASHABLE_DIM or cols < _MIN_HASHABLE_DIM:
+        return _ZERO_HASH, 0
     luma = (
         _LUMA_FROM_R * rgb[:, :, 0].astype(np.float64)
         + _LUMA_FROM_G * rgb[:, :, 1].astype(np.float64)
@@ -193,8 +205,10 @@ def _torben(values: NDArray[np.float64]) -> float:
     """Torben's median (MatrixUtil.torben): the ``(n + 1) // 2``-th smallest value."""
     count = values.size
     half = (count + 1) // 2
-    low = float(values.min())
-    high = float(values.max())
+    # np.min / np.max rather than the methods: NumPy 2.5's stubs reject
+    # ndarray.min() without arguments under mypy --strict.
+    low = float(np.min(values))
+    high = float(np.max(values))
     # The reference loops until the bracket settles, which takes a few dozen
     # rounds for finite input; the cap only guards against a pathological
     # input that would never settle.
@@ -205,8 +219,8 @@ def _torben(values: NDArray[np.float64]) -> float:
         less = int(np.count_nonzero(below))
         greater = int(np.count_nonzero(above))
         equal = count - less - greater
-        max_below = max(low, float(values[below].max())) if less else low
-        min_above = min(high, float(values[above].min())) if greater else high
+        max_below = max(low, float(np.max(values[below]))) if less else low
+        min_above = min(high, float(np.min(values[above]))) if greater else high
         if less <= half and greater <= half:
             if less >= half:
                 return max_below

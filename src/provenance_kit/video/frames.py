@@ -9,11 +9,16 @@ resolution mid-way cannot inflate the records.
 Sampling (:class:`FrameSampling`):
 
 * ``FPS`` (default): frames at a fixed rate (``fps`` per second) through
-  ffmpeg's ``fps`` filter, which picks the frame shown at each instant.
-  Timestamps are rebased to the stream's first frame first, so the sampling
-  grid does not depend on the container's start offset (Matroska and MPEG-TS
-  often start at a few milliseconds). Timestamps are exact by construction:
-  ``index / fps`` seconds from the first frame.
+  ffmpeg's ``fps`` filter with ``round=up``, so the frame with timestamp
+  ``index / fps`` is the frame shown at that instant: the last frame whose
+  presentation time is at or before it (frame 0, 30, 60, ... at 1 fps from
+  30 fps; with the filter's default ``round=near`` it was the frame shown
+  about half an interval later, 14, 44, 74, ...). This also holds for
+  variable frame rates. Timestamps are rebased to the stream's first frame
+  first, so the sampling grid does not depend on the container's start
+  offset (Matroska and MPEG-TS often start at a few milliseconds). The
+  reported timestamp is ``index / fps`` seconds from the first frame, and
+  the pixels are those displayed at that time.
 * ``KEYFRAMES``: only key frames (``-skip_frame nokey``, so non-key frames
   are not even decoded). Timestamps come from a first ffprobe pass over the
   key frames, relative to the stream's start time.
@@ -21,11 +26,13 @@ Sampling (:class:`FrameSampling`):
   nominal, ``index / frame_rate`` with the declared average frame rate, which
   is exact for constant-frame-rate video only.
 
-Rotation: the container's display rotation (display matrix or legacy
-``rotate`` tag, see :class:`~provenance_kit.video.probe.VideoInfo`) is applied
-explicitly in the filter graph (ffmpeg's implicit autorotation is disabled),
-so frames come out in display orientation with known dimensions. The sample
-aspect ratio is not applied: frames have the stored pixel grid, rotated.
+Rotation: the container's display transform (display matrix, including
+mirrored ones such as a phone's "flip" edit, or the legacy ``rotate`` tag; see
+:class:`~provenance_kit.video.probe.VideoInfo`) is applied explicitly in the
+filter graph, with the same filters ffmpeg's own autorotation would insert
+(which is disabled), so frames come out in display orientation with known
+dimensions. The sample aspect ratio is not applied: frames have the stored
+pixel grid, rotated and mirrored.
 
 Limits (:class:`~provenance_kit.limits.MediaLimits`): the probe checks the
 byte size, dimensions, declared duration and declared frame count before
@@ -94,7 +101,19 @@ MAX_SAMPLING_FPS = 240.0
 
 _DURATION_SLACK_SECONDS = 1.0  # ffmpeg decodes a little past the limit, to detect overflow
 _KEYFRAME_ENTRY_BYTES = 96  # generous bound on one ffprobe JSON frame entry
-_ROTATION_FILTERS = {90: "transpose=clock", 180: "hflip,vflip", 270: "transpose=cclock"}
+# (clockwise rotation, mirrored) -> filters; mirrored means "flip horizontally,
+# then rotate". These are the filters ffmpeg's autorotation inserts for the
+# same display matrices (transpose=clock_flip is the anti-transpose,
+# cclock_flip the transpose).
+_ORIENTATION_FILTERS: dict[tuple[int, bool], str] = {
+    (90, False): "transpose=clock",
+    (180, False): "hflip,vflip",
+    (270, False): "transpose=cclock",
+    (0, True): "hflip",
+    (90, True): "transpose=clock_flip",
+    (180, True): "vflip",
+    (270, True): "transpose=cclock_flip",
+}
 
 
 class FrameSampling(enum.StrEnum):
@@ -408,11 +427,14 @@ def _ffmpeg_args(
     if mode is FrameSampling.KEYFRAMES:
         before_input += ["-skip_frame", "nokey"]
     filters: list[str] = []
-    rotation = _ROTATION_FILTERS.get(info.rotation)
-    if rotation:
-        filters.append(rotation)
+    orientation = _ORIENTATION_FILTERS.get((info.rotation, info.mirrored))
+    if orientation:
+        filters.append(orientation)
     if mode is FrameSampling.FPS:
-        filters += ["setpts=PTS-STARTPTS", f"fps={fps!r}"]
+        # round=up: output frame k (time k / fps) is the last input frame
+        # shown at or before k / fps; the default round=near would pick the
+        # one shown up to half an output interval later.
+        filters += ["setpts=PTS-STARTPTS", f"fps={fps!r}:round=up"]
     filters += [f"scale={width}:{height}:flags=bicubic", "format=rgb24"]
     return [
         *FFMPEG_COMMON,

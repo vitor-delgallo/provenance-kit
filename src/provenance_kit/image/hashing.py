@@ -8,8 +8,9 @@ small edits:
   pure-Python reference implementation that needs nothing beyond the core
   install (the default backend), and the ``pdqhash`` package (Meta's C++
   code, extra ``pdq-native``), which ``"auto"`` prefers when it is
-  installed. Both give the same hash for the same pixels on the test
-  corpus; see "Backend agreement" below.
+  installed. Both give the same hash for the same pixels, to within a few
+  bits, on images at least 64 pixels on each side; see "Backend agreement"
+  below.
 * **pHash** (DCT) and **dHash** (gradient), 64 bits each by default, through
   the ``imagehash`` package (extra ``image-hash``): :func:`phash`,
   :func:`dhash`.
@@ -31,20 +32,39 @@ above the median) is bit ``k % 8`` (least significant = 0) of byte ``31 - k //
 larger images" (``pdq/cpp/io/pdqio.cpp``; the Python reference calls
 ``Image.thumbnail((512, 512))``). :class:`PdqHasher` does the same by default
 (``max_side=512``, aspect ratio kept, Pillow's ``thumbnail``), so both
-backends see identical pixels and the cost is bounded. ``max_side=None``
-hashes at full resolution, as ``python-threatexchange``'s ``pdq_from_bytes``
-does; the two settings usually differ by a few bits only.
+backends see identical pixels and the cost is bounded, with one deliberate
+difference: the shorter side is never shrunk below 64 pixels (see
+:class:`PdqHasher`), because PDQ is numerically unstable on thinner images.
+``max_side=None`` hashes at full resolution, as ``python-threatexchange``'s
+``pdq_from_bytes`` does; the two settings usually differ by a few bits only.
 
 **Backend agreement.** The NumPy port reproduces Meta's pure-Python
-reference bit for bit on the generated test corpus (``tests/image``). On
+reference bit for bit on the generated test corpus (``tests/image``), except
+that an image with a side under 5 pixels gets the C++ hasher's all-zero hash
+with quality 0 (see below). On
 ThreatExchange's published test images, both backends return the published
 hashes exactly (distance 0) for every image with quality >= 50. ``pdqhash``
-computes in ``float32``, the port in ``float64``: over 1,200 generated
-images (963 with quality >= 50) the two were identical on 958, and 2, 2, 2,
-7 and 8 bits apart on the other five, all tiny or extreme-aspect images (a
-side under 64 pixels) where several DCT coefficients tie with the median.
-The tests assert :data:`PDQ_BACKEND_MAX_DISTANCE` (10 bits), far below the
-match threshold.
+computes in ``float32``, the port in ``float64``, so DCT coefficients that
+sit next to the median can come out on different sides of it:
+
+* both sides at least 64 pixels as hashed (every image at least 64 x 64,
+  whatever its aspect ratio, thanks to the pre-scaling rule): over 3,000
+  generated images, 2,302 of the 2,307 reliable pairs were identical and the
+  other five within 2 bits. The tests assert :data:`PDQ_BACKEND_MAX_DISTANCE`
+  (10 bits), far below the match threshold;
+* a side of 5 to 63 pixels: no bound. Many coefficients nearly tie (the
+  64 x 64 block repeats rows or columns), so the backends measured up to 21
+  bits apart (426 pairs; worst at sides of 8 and 16 pixels) and 132 bits on
+  one 854 x 6 image, and even one backend's hash moves a median of 64 to 86
+  bits after a JPEG re-encode when the side is under 20 pixels. Do not rely
+  on PDQ for such images, whatever their quality;
+* a side under 5 pixels: both return the all-zero hash with quality 0
+  (Meta's ``MIN_HASHABLE_DIM``).
+
+The quality scores are computed from the same truncated gradients and agree
+on almost every image, but not always: they differed by 1 on 3 of the
+3,000 images, so an image at the threshold (49 or 50) can be reliable with
+one backend only.
 
 **Thresholds.** Meta's PDQ README recommends treating hashes at Hamming
 distance ``<= 31`` as matching and discarding hashes with quality ``<= 49``
@@ -52,7 +72,10 @@ distance ``<= 31`` as matching and discarding hashes with quality ``<= 49``
 and :data:`PDQ_MIN_QUALITY`. The pHash and dHash defaults
 (:data:`PHASH_MATCH_DISTANCE`, :data:`DHASH_MATCH_DISTANCE`) are this
 library's conservative starting points, not an external standard: calibrate
-them on your own content.
+them on your own content. :func:`compare_fingerprints` never lets pHash or
+dHash overrule a low-quality PDQ pair (featureless images look alike to
+every perceptual hash), and uses them only with enough set and clear bits
+(:attr:`MatchThresholds.min_bit_balance`).
 
 Thread safety: hashing functions, :class:`PdqHasher` and :class:`HashList`
 queries are thread-safe (they keep no mutable state after construction).
@@ -83,6 +106,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 __all__ = [
+    "BINARY_MIN_BALANCE",
     "DHASH_MATCH_DISTANCE",
     "PDQ_BACKEND_MAX_DISTANCE",
     "PDQ_BITS",
@@ -101,6 +125,7 @@ __all__ = [
     "PdqBackendName",
     "PdqHash",
     "PdqHasher",
+    "UndecidedReason",
     "compare_fingerprints",
     "dhash",
     "fingerprint_image",
@@ -124,9 +149,23 @@ PDQ_MIN_QUALITY = 50
 PDQ_DEFAULT_MAX_SIDE = 512
 
 #: The largest distance between the two PDQ backends' hashes of the same image
-#: that the test suite accepts, for images with quality >= PDQ_MIN_QUALITY.
-#: The measured maximum is 8 bits (see the module docstring and docs/image.md).
+#: that the test suite accepts, for images with quality >= PDQ_MIN_QUALITY on
+#: both backends whose sides are both at least 64 pixels as hashed. The
+#: measured maximum is 2 bits; thinner images have no bound (see the module
+#: docstring and docs/image.md).
 PDQ_BACKEND_MAX_DISTANCE = 10
+
+#: Pre-scaling never shrinks the shorter side below this (PDQ's 64 x 64 block).
+_PDQ_MIN_SCALED_SIDE = 64
+
+#: An elongated image keeps its shorter side at 64 px only while its longer
+#: side stays within this multiple of ``max_side`` (16,384 px by default, the
+#: default ``MediaLimits.max_width``), which bounds the cost.
+_PDQ_MAX_ELONGATION = 32
+
+#: Default for :attr:`MatchThresholds.min_bit_balance`: a pHash or dHash
+#: decides only if at least 1/8 of its bits are set and 1/8 clear.
+BINARY_MIN_BALANCE = 0.125
 
 #: Default pHash threshold (64-bit hash): a starting point, calibrate it.
 PHASH_MATCH_DISTANCE = 10
@@ -359,8 +398,10 @@ class _PdqhashBackend:
 
     def hash_rgb(self, rgb: NDArray[np.uint8]) -> tuple[bytes, int]:
         # pdqhash returns the 256 bits with bit 255 first, which is exactly
-        # the canonical byte order once packed.
-        vector, quality = self._compute(rgb)
+        # the canonical byte order once packed. It reads the buffer as
+        # row-major whatever the array's strides, so a transposed or
+        # Fortran-ordered view must be copied first.
+        vector, quality = self._compute(np.ascontiguousarray(rgb))
         bits = np.asarray(vector, dtype=np.uint8)
         return np.packbits(bits).tobytes(), int(quality)
 
@@ -395,20 +436,28 @@ class PdqHasher:
         if h.is_reliable():
             matches = known_hashes.match(h)
 
-    Construct one hasher and reuse it. The ``pdqhash`` backend takes about
-    1 ms for a 512 x 512 image; the NumPy port about 15 ms.
+    Construct one hasher and reuse it. Hashing a 512 x 512 image takes about
+    8 ms with the ``pdqhash`` backend and 15 ms with the NumPy port; the most
+    elongated shape the pre-scaling keeps (16,384 x 64) up to 30 and 140 ms
+    (see ``docs/image.md`` for the measurements).
 
     Thread safety: safe to share between threads.
 
     Args:
         backend: ``"auto"`` (default), ``"pdqhash"``, ``"numpy"``, or an
             object implementing :class:`PdqBackend` (for tests or other
-            implementations).
+            implementations). Backends always receive C-contiguous pixels.
         max_side: Shrink images whose longer side exceeds this many pixels
             before hashing, keeping the aspect ratio (Pillow ``thumbnail``),
-            like Meta's reference hashers. ``None`` hashes at full resolution
-            (cost and memory grow with the pixel count: the NumPy port holds
-            about 24 bytes per pixel).
+            like Meta's reference hashers, with one difference: the shorter
+            side is never shrunk below 64 pixels (PDQ's block size), so an
+            elongated image such as a 4000 x 100 banner becomes 2560 x 64
+            rather than 512 x 12, and an image whose shorter side is already
+            under 64 pixels is not shrunk at all. The longer side is capped
+            at ``32 * max_side`` (16,384 pixels by default) to bound the cost,
+            which only affects images more elongated than that. ``None``
+            hashes at full resolution (cost and memory grow with the pixel
+            count: the NumPy port holds about 24 bytes per pixel).
 
     Raises:
         TypeError: If ``backend`` or ``max_side`` has the wrong type.
@@ -446,8 +495,9 @@ class PdqHasher:
         """Hashes a decoded image.
 
         The image is converted to 8-bit RGB first (alpha is ignored, as in
-        Meta's tools; 16-bit modes are scaled to 8 bits) and shrunk to
-        ``max_side``.
+        Meta's tools; 16-bit modes are scaled to 8 bits) and shrunk according
+        to ``max_side``. An image with a side under 5 pixels gets the all-zero
+        hash with quality 0, as in Meta's C++ hasher.
 
         Args:
             image: The image, at least 1 x 1 pixels.
@@ -464,9 +514,10 @@ class PdqHasher:
         if image.width < 1 or image.height < 1:
             raise ValueError("cannot hash an empty image")
         rgb = _modes.to_rgb(image)
-        if self._max_side is not None and max(rgb.size) > self._max_side:
+        box = _thumbnail_box(rgb.width, rgb.height, self._max_side)
+        if box is not None:
             work = rgb.copy() if rgb is image else rgb
-            work.thumbnail((self._max_side, self._max_side))
+            work.thumbnail((box, box))
             rgb = work
         return self._hash_array(np.asarray(rgb))
 
@@ -474,9 +525,10 @@ class PdqHasher:
         """Hashes an RGB frame given as an array (for example a video frame).
 
         Args:
-            rgb: ``uint8`` array of shape ``(height, width, 3)``. Frames larger
-                than ``max_side`` are shrunk exactly as :meth:`hash_image`
-                would.
+            rgb: ``uint8`` array of shape ``(height, width, 3)``, with any
+                strides (a transposed, rotated or Fortran-ordered view is
+                copied to C order first). Frames larger than ``max_side`` are
+                shrunk exactly as :meth:`hash_image` would.
 
         Returns:
             The hash and its quality.
@@ -493,13 +545,32 @@ class PdqHasher:
             raise ValueError("rgb must have shape (height, width, 3)")
         if rgb.shape[0] < 1 or rgb.shape[1] < 1:
             raise ValueError("cannot hash an empty image")
-        if self._max_side is not None and max(rgb.shape[:2]) > self._max_side:
+        if _thumbnail_box(rgb.shape[1], rgb.shape[0], self._max_side) is not None:
             return self.hash_image(Image.fromarray(np.ascontiguousarray(rgb)))
         return self._hash_array(rgb)
 
     def _hash_array(self, rgb: NDArray[np.uint8]) -> PdqHash:
-        value, quality = self._backend.hash_rgb(rgb)
+        value, quality = self._backend.hash_rgb(np.ascontiguousarray(rgb))
         return PdqHash(bytes(value), int(quality))
+
+
+def _thumbnail_box(width: int, height: int, max_side: int | None) -> int | None:
+    """The ``thumbnail((box, box))`` bound for pre-scaling, or ``None`` to keep the size.
+
+    Meta's rule (a ``max_side`` box), except that the shorter side never
+    drops below ``_PDQ_MIN_SCALED_SIDE`` and the longer side never exceeds
+    ``_PDQ_MAX_ELONGATION * max_side``.
+    """
+    if max_side is None:
+        return None
+    longer, shorter = max(width, height), min(width, height)
+    if longer <= max_side:
+        return None
+    # The longer side at which the shorter one is exactly 64 px (rounded up,
+    # so that Pillow's rounding of the shorter side cannot give 63).
+    keeps_short_side = -(-_PDQ_MIN_SCALED_SIDE * longer // shorter)
+    box = min(max(max_side, keeps_short_side), _PDQ_MAX_ELONGATION * max_side)
+    return box if box < longer else None
 
 
 # ---------------------------------------------------------------- pHash / dHash
@@ -668,16 +739,25 @@ class MatchThresholds:
             of 64 bits; a starting point, calibrate it).
         dhash_max_distance: dHash matches at distance ``<=`` this (default 10
             of 64 bits; a starting point, calibrate it).
+        min_bit_balance: pHash and dHash decide only when, on both sides, at
+            least this fraction of the hash's bits are set and at least this
+            fraction are clear (default :data:`BINARY_MIN_BALANCE`, 1/8: 8 of
+            64 bits). Flat or smoothly shaded images give nearly all-zero or
+            all-one hashes that are close to each other whatever the picture;
+            ``imagehash``'s pHash of an image without ties always has half its
+            bits set. 0 disables the check; at most 0.5.
 
     Raises:
-        TypeError: If a field is not an ``int``.
-        ValueError: If a field is negative or a quality is above 100.
+        TypeError: If a field has the wrong type.
+        ValueError: If a field is negative, a quality is above 100, or
+            ``min_bit_balance`` is not between 0 and 0.5.
     """
 
     pdq_max_distance: int = PDQ_MATCH_DISTANCE
     pdq_min_quality: int = PDQ_MIN_QUALITY
     phash_max_distance: int = PHASH_MATCH_DISTANCE
     dhash_max_distance: int = DHASH_MATCH_DISTANCE
+    min_bit_balance: float = BINARY_MIN_BALANCE
 
     def __post_init__(self) -> None:
         """Validates the fields."""
@@ -694,6 +774,25 @@ class MatchThresholds:
                 raise ValueError(f"{name} must not be negative")
         if self.pdq_min_quality > 100:
             raise ValueError("pdq_min_quality must be at most 100")
+        balance: object = self.min_bit_balance
+        if isinstance(balance, bool) or not isinstance(balance, (int, float)):
+            raise TypeError("min_bit_balance must be a number")
+        if not 0.0 <= balance <= 0.5:  # also false for NaN
+            raise ValueError("min_bit_balance must be between 0 and 0.5")
+
+
+class UndecidedReason(enum.StrEnum):
+    """Why :func:`compare_fingerprints` made no decision (``decided_by is None``)."""
+
+    #: Both fingerprints have PDQ hashes and at least one is below
+    #: ``pdq_min_quality``: the image is too featureless for a perceptual hash
+    #: to tell a copy from a look-alike, so pHash and dHash are not consulted.
+    LOW_QUALITY = "low-quality"
+    #: There is no PDQ pair, and every pHash / dHash pair has a hash below
+    #: ``min_bit_balance`` (a flat or smoothly shaded image).
+    LOW_INFORMATION = "low-information"
+    #: The fingerprints have no hash type in common.
+    NO_COMMON_HASH = "no-common-hash"
 
 
 @dataclass(frozen=True, slots=True)
@@ -707,11 +806,17 @@ class FingerprintComparison:
             (``None`` without PDQ hashes).
         phash_distance: pHash distance, or ``None``.
         dhash_distance: dHash distance, or ``None``.
-        decided_by: The hash that decided :attr:`matched`, or ``None`` when no
-            usable pair of hashes existed.
-        matched: The decision. PDQ decides when both PDQ hashes exist and
-            are reliable; otherwise pHash, then dHash, whichever both sides
-            have. Applications with another policy use the distances.
+        decided_by: The hash that decided :attr:`matched`, or ``None`` when
+            there was no decision (see :attr:`undecided_reason`).
+        matched: The decision; ``False`` when there was none. When both
+            fingerprints have PDQ hashes, PDQ alone decides, and only if both
+            hashes are reliable: an unreliable PDQ pair means "featureless
+            image", for which pHash and dHash are no better. Only when a side
+            has no PDQ hash do pHash, then dHash decide, and only with
+            informative hashes on both sides (``min_bit_balance``).
+            Applications with another policy use the distances.
+        undecided_reason: Why there was no decision, or ``None`` when there
+            was one.
     """
 
     pdq_distance: int | None
@@ -720,6 +825,7 @@ class FingerprintComparison:
     dhash_distance: int | None
     decided_by: HashAlgorithm | None
     matched: bool
+    undecided_reason: UndecidedReason | None = None
 
 
 def compare_fingerprints(
@@ -729,6 +835,12 @@ def compare_fingerprints(
     thresholds: MatchThresholds | None = None,
 ) -> FingerprintComparison:
     """Compares two fingerprints hash by hash.
+
+    The decision rule (see :class:`FingerprintComparison`): with PDQ hashes
+    on both sides, PDQ decides if both are reliable and nothing decides
+    otherwise (:attr:`UndecidedReason.LOW_QUALITY`); without a PDQ pair,
+    pHash and then dHash decide, each only if both of its hashes pass the
+    ``min_bit_balance`` information check.
 
     Args:
         a: One fingerprint.
@@ -760,12 +872,20 @@ def compare_fingerprints(
     )
     decided_by: HashAlgorithm | None = None
     matched = False
-    if pdq_distance is not None and pdq_reliable:
-        decided_by, matched = HashAlgorithm.PDQ, pdq_distance <= limits.pdq_max_distance
-    elif phash_distance is not None:
+    reason: UndecidedReason | None = None
+    if pdq_distance is not None:
+        if pdq_reliable:
+            decided_by, matched = HashAlgorithm.PDQ, pdq_distance <= limits.pdq_max_distance
+        else:
+            reason = UndecidedReason.LOW_QUALITY
+    elif phash_distance is not None and _informative(a.phash, b.phash, limits):
         decided_by, matched = HashAlgorithm.PHASH, phash_distance <= limits.phash_max_distance
-    elif dhash_distance is not None:
+    elif dhash_distance is not None and _informative(a.dhash, b.dhash, limits):
         decided_by, matched = HashAlgorithm.DHASH, dhash_distance <= limits.dhash_max_distance
+    elif phash_distance is not None or dhash_distance is not None:
+        reason = UndecidedReason.LOW_INFORMATION
+    else:
+        reason = UndecidedReason.NO_COMMON_HASH
     return FingerprintComparison(
         pdq_distance=pdq_distance,
         pdq_reliable=pdq_reliable,
@@ -773,7 +893,19 @@ def compare_fingerprints(
         dhash_distance=dhash_distance,
         decided_by=decided_by,
         matched=matched,
+        undecided_reason=reason,
     )
+
+
+def _informative(a: BinaryHash | None, b: BinaryHash | None, limits: MatchThresholds) -> bool:
+    """Whether both hashes have enough set and clear bits (``min_bit_balance``)."""
+    for value in (a, b):
+        if value is None:
+            return False
+        ones = value.value.bit_count()
+        if min(ones, value.bits - ones) < limits.min_bit_balance * value.bits:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------- hash lists
@@ -886,7 +1018,8 @@ class HashList(Generic[K]):
         Args:
             data: ``len(keys) * ceil(bits / 8)`` bytes: each hash big-endian
                 (for PDQ, :attr:`PdqHash.value`), or a ``uint8`` array of
-                shape ``(n, ceil(bits / 8))``.
+                shape ``(len(keys), ceil(bits / 8))`` (one hash per row) or
+                of that many elements in one dimension.
             keys: One key per hash, in order. ``range(n)`` gives positional
                 keys without storing them.
             bits: The hash width.
@@ -895,15 +1028,25 @@ class HashList(Generic[K]):
             The list.
 
         Raises:
-            ValueError: If the sizes do not agree.
+            TypeError: If ``data`` is an array whose dtype is not ``uint8``.
+            ValueError: If the sizes do not agree, or an array has another
+                shape (a transposed ``(nbytes, n)`` array is refused rather
+                than silently reinterpreted).
         """
         nbytes = _check_bits(bits)
-        flat = (
-            np.frombuffer(bytes(data), dtype=np.uint8)
-            if not isinstance(data, np.ndarray)
-            else (np.ascontiguousarray(data, dtype=np.uint8).ravel())
-        )
-        if flat.size != len(keys) * nbytes:
+        expected = len(keys) * nbytes
+        if isinstance(data, np.ndarray):
+            if data.dtype != np.uint8:
+                raise TypeError(f"a packed hash array must be uint8, got {data.dtype}")
+            if data.shape not in ((len(keys), nbytes), (expected,)):
+                raise ValueError(
+                    f"a packed hash array must have shape ({len(keys)}, {nbytes}) "
+                    f"or ({expected},), got {data.shape}"
+                )
+            flat = np.ascontiguousarray(data).reshape(-1)
+        else:
+            flat = np.frombuffer(bytes(data), dtype=np.uint8)
+        if flat.size != expected:
             raise ValueError(f"expected {len(keys)} hashes of {nbytes} bytes")
         instance = cls.__new__(cls)
         instance._init(flat, keys, bits)

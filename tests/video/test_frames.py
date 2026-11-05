@@ -46,7 +46,8 @@ def test_fps_sampling_reads_frames_with_exact_timestamps():
     assert args[args.index("-protocol_whitelist") + 1] == "pipe"
     assert "-noautorotate" in args
     vf = args[args.index("-vf") + 1]
-    assert vf == f"setpts=PTS-STARTPTS,fps=2.0,scale={W}:{H}:flags=bicubic,format=rgb24"
+    # round=up: the frame labelled k / fps is the one shown at that instant.
+    assert vf == f"setpts=PTS-STARTPTS,fps=2.0:round=up,scale={W}:{H}:flags=bicubic,format=rgb24"
     assert args[args.index("-map") + 1] == "0:0"
     assert args[-1] == "pipe:1"
 
@@ -169,12 +170,38 @@ def test_too_many_keyframes_raise():
         run(tools, sampling="keyframes", limits=limits)
 
 
+ONE = 1 << 16
+
+
+def _matrix(a: int, b: int, c: int, d: int) -> str:
+    rows = ((a, b, 0), (c, d, 0), (0, 0, 1 << 30))
+    lines = (f"{i:08x}: {x:11d} {y:11d} {z:11d}\n" for i, (x, y, z) in enumerate(rows))
+    return "\n" + "".join(lines)
+
+
 @pytest.mark.parametrize(
-    ("rotation", "filters", "shape"),
-    [(-90, "transpose=clock", (W, H, 3)), (180, "hflip,vflip", (H, W, 3))],
+    ("side_data", "filters", "shape"),
+    [
+        ({"rotation": -90}, "transpose=clock", (W, H, 3)),
+        ({"rotation": 180}, "hflip,vflip", (H, W, 3)),
+        # Mirrored display matrices (horizontal flip, then the rotation): the
+        # filters ffmpeg's own autorotation inserts for the same matrices.
+        ({"rotation": -180, "displaymatrix": _matrix(-ONE, 0, 0, ONE)}, "hflip", (H, W, 3)),
+        ({"rotation": 0, "displaymatrix": _matrix(ONE, 0, 0, -ONE)}, "vflip", (H, W, 3)),
+        (
+            {"rotation": 90, "displaymatrix": _matrix(0, -ONE, -ONE, 0)},
+            "transpose=clock_flip",
+            (W, H, 3),
+        ),
+        (
+            {"rotation": -90, "displaymatrix": _matrix(0, ONE, ONE, 0)},
+            "transpose=cclock_flip",
+            (W, H, 3),
+        ),
+    ],
 )
-def test_rotation_is_applied_in_the_filter_graph(rotation, filters, shape):
-    report = probe_json(side_data_list=[{"rotation": rotation}])
+def test_rotation_is_applied_in_the_filter_graph(side_data, filters, shape):
+    report = probe_json(side_data_list=[side_data])
     info = parse_probe_output(report, MediaType.MP4, MediaLimits())
     width, height = output_size(info)
     tools = FakeTools(ffprobe=report, ffmpeg=frames_bytes(1, width, height))

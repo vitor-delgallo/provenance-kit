@@ -159,15 +159,16 @@ class VerifiedEmbedding:
         verified: Whether some strength survived the encoder.
         strength: The strength that survived, or ``None``.
         image: The watermarked image of the successful attempt, or of the
-            last attempt when none survived.
-        encoded: The encoder's output for that image: what to publish.
+            last attempt when none survived (left out of ``repr``).
+        encoded: The encoder's output for that image: what to publish (left
+            out of ``repr``, so that logging a result does not log the media).
         attempts: Every attempt, in order.
     """
 
     verified: bool
     strength: float | None
-    image: Image.Image
-    encoded: bytes
+    image: Image.Image = dataclasses.field(repr=False)
+    encoded: bytes = dataclasses.field(repr=False)
     attempts: tuple[EmbedAttempt, ...]
 
 

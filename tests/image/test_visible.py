@@ -123,6 +123,45 @@ def test_palette_images_keep_their_palette_and_transparency():
     assert marked.info["transparency"] == 0
 
 
+def _palette_image_with_white_transparent_entry():
+    # Entry 0 is the transparent one and its RGB is white: white text drawn
+    # on opaque grey is nearest to it.
+    palette = [255, 255, 255, 0, 0, 0, 128, 128, 128] + [0, 0, 0] * 253
+    indices = np.full((200, 300), 2, np.uint8)
+    indices[:, :100] = 0  # transparent left third
+    image = Image.frombytes("P", (300, 200), indices.tobytes())
+    image.putpalette(palette)
+    return image, indices
+
+
+def test_opaque_palette_pixels_never_become_transparent():
+    image, indices = _palette_image_with_white_transparent_entry()
+    image.info["transparency"] = 0
+    marked = tile_text(image, "PREVIEW 2026", opacity=0.9, color=(255, 255, 255))
+    result = np.asarray(marked)
+    opaque = indices != 0
+    assert np.count_nonzero(opaque & (result == 0)) == 0
+    assert np.all(result[~opaque] == 0)
+    assert np.any(result[opaque] != 2)  # the text is visible (drawn with another entry)
+    assert marked.info["transparency"] == 0
+    assert marked.getpalette() == image.getpalette()
+
+
+def test_palette_alpha_tables_are_kept_and_respected():
+    # A tRNS table (bytes): entry 0 fully transparent, entry 1 half transparent.
+    image, indices = _palette_image_with_white_transparent_entry()
+    indices[:20, 100:] = 1
+    image = Image.frombytes("P", (300, 200), indices.tobytes())
+    image.putpalette([255, 255, 255, 0, 0, 0, 128, 128, 128] + [0, 0, 0] * 253)
+    image.info["transparency"] = b"\x00\x80"
+    marked = tile_text(image, "PREVIEW 2026", opacity=0.9, color=(255, 255, 255))
+    result = np.asarray(marked)
+    assert marked.info["transparency"] == b"\x00\x80"
+    see_through = np.isin(indices, (0, 1))
+    assert np.array_equal(result[see_through], indices[see_through])
+    assert not np.any(np.isin(result[~see_through], (0, 1)))
+
+
 def test_greyscale_uses_luma_of_the_colour():
     marked = tile_text(
         Image.new("L", (200, 200), 0), "abc", color=(255, 0, 0), opacity=1.0, shadow=False

@@ -193,6 +193,17 @@ def test_embed_verified_with_a_lossless_encoder_needs_one_attempt():
     assert len(result.attempts) == 1
 
 
+def test_verified_embedding_repr_leaves_out_the_media():
+    # Like the video and audio results: a log line must not carry the encoded
+    # bytes (139 KB for a 256 x 256 JPEG) or the image.
+    result = ImageWatermarker(RowBackend()).embed_verified(sample(256, 256), 7, encode=lossy_png(0))
+    text = repr(result)
+    assert len(text) < 2000
+    assert "encoded=" not in text
+    assert "image=" not in text
+    assert "verified=True" in text
+
+
 def test_embed_verified_argument_and_encoder_errors():
     marker = ImageWatermarker(RowBackend())
     with pytest.raises(TypeError):

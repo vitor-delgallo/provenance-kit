@@ -145,6 +145,92 @@ def test_hasher_shrinks_large_images_to_max_side_keeping_aspect():
     assert fake.shapes == [(256, 512, 3), (256, 85, 3), (700, 1500, 3), (100, 512, 3)]
 
 
+@pytest.mark.parametrize(
+    ("size", "shape"),
+    [
+        # Meta's rule would give 512 x 51: the short side is kept at 64 instead.
+        ((1000, 100), (64, 640, 3)),
+        ((100, 1000), (640, 64, 3)),
+        ((1000, 123), (64, 521, 3)),
+        # Already under 64 px: never shrunk further (Meta's rule: 512 x 3).
+        ((3000, 20), (20, 3000, 3)),
+        # The longer side is capped at 32 * max_side (16,384 px).
+        ((20000, 100), (64, 12800, 3)),
+        ((40000, 100), (41, 16384, 3)),
+    ],
+)
+def test_pre_scaling_never_pushes_the_short_side_below_64_pixels(size, shape):
+    fake = FakeBackend()
+    PdqHasher(fake).hash_image(Image.new("RGB", size))
+    assert fake.shapes == [shape]
+
+
+def test_pre_scaling_bounds_follow_max_side():
+    fake = FakeBackend()
+    PdqHasher(fake, max_side=128).hash_image(Image.new("RGB", (4000, 100)))
+    PdqHasher(fake, max_side=128).hash_image(Image.new("RGB", (8000, 100)))  # 32 * 128 cap
+    PdqHasher(fake, max_side=None).hash_image(Image.new("RGB", (8000, 100)))
+    assert fake.shapes == [(64, 2560, 3), (51, 4096, 3), (100, 8000, 3)]
+
+
+class ContiguityBackend:
+    name = "contiguity"
+
+    def __init__(self):
+        self.contiguous = []
+
+    def hash_rgb(self, rgb):
+        self.contiguous.append(bool(rgb.flags["C_CONTIGUOUS"]))
+        return pdq_hash_rgb(np.ascontiguousarray(rgb))
+
+
+def _strided_views(array):
+    return {
+        "rot90": np.rot90(array),
+        "transpose": array.transpose(1, 0, 2),
+        "fortran": np.asfortranarray(array),
+        "mirrored": array[:, ::-1],
+        "rgba-slice": np.dstack([array, array[..., :1]])[..., :3],
+    }
+
+
+@pytest.mark.parametrize("view", ["rot90", "transpose", "fortran", "mirrored", "rgba-slice"])
+def test_backends_receive_c_contiguous_pixels(view):
+    # pdqhash reads the buffer as row-major whatever the strides: a rotated or
+    # Fortran-ordered view gave a hash about 126 bits away from the right one.
+    array = _strided_views(make_image(200, 120, "shapes", 8))[view]
+    assert not array.flags["C_CONTIGUOUS"]
+    backend = ContiguityBackend()
+    result = PdqHasher(backend).hash_rgb(array)
+    assert backend.contiguous == [True]
+    assert result == PdqHasher("numpy").hash_rgb(np.ascontiguousarray(array))
+
+
+@pytest.mark.parametrize("view", ["rot90", "transpose", "fortran"])
+def test_numpy_backend_hashes_strided_views_like_their_copies(view):
+    array = _strided_views(make_image(300, 200, "smooth", 9))[view]
+    hasher = PdqHasher("numpy")
+    assert hasher.hash_rgb(array) == hasher.hash_rgb(np.ascontiguousarray(array))
+
+
+@pytest.mark.parametrize("shape", [(4, 300, 3), (300, 4, 3), (1, 1, 3), (4, 4, 3)])
+def test_sides_under_five_pixels_give_the_zero_hash_like_meta(shape):
+    # Meta's C++ hasher (MIN_HASHABLE_DIM = 5) returns the all-zero hash with
+    # quality 0 for such images; the port must not call them reliable.
+    rng = np.random.default_rng(10)
+    array = rng.integers(0, 256, shape, dtype=np.uint8)
+    assert pdq_hash_rgb(array) == (bytes(32), 0)
+    result = PdqHasher("numpy").hash_rgb(array)
+    assert result == PdqHash(bytes(32), 0)
+    assert not result.is_reliable()
+
+
+def test_five_pixel_sides_are_hashed():
+    value, quality = pdq_hash_rgb(make_image(300, 5, "noise", 11))
+    assert value != bytes(32)
+    assert quality > 0
+
+
 def test_hash_rgb_matches_hash_image_including_shrinking():
     hasher = PdqHasher("numpy")
     for array in (make_image(300, 200, "smooth", 1), make_image(900, 700, "shapes", 2)):

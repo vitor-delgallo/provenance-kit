@@ -72,8 +72,10 @@ class VideoWatermarkDetection(WatermarkDetection):
             (useful to inspect a near miss; do not trust them then).
         agreement: Fraction of copy bits agreeing with the decoded bits
             (repetition code only), else ``None``.
-        p_value: Probability that unmarked content shows at least this
-            agreement (repetition code only), else ``None``.
+        p_value: Probability that the copies of unmarked content agree among
+            themselves (each data bit's hard majority) at least as much as
+            observed (repetition code only), else ``None``; see
+            :class:`~provenance_kit.video.watermark.RepetitionDecoded`.
         mean_abs_score: Mean magnitude of the frame-averaged channel scores:
             a weak, uncalibrated strength indicator (VideoSeal: about 0.05 to
             0.25 on unmarked frames, above 1 on freshly marked ones).

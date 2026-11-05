@@ -17,6 +17,7 @@ from provenance_kit.image.hashing import (
     ImageFingerprint,
     MatchThresholds,
     PdqHash,
+    UndecidedReason,
     compare_fingerprints,
     fingerprint_image,
 )
@@ -50,6 +51,11 @@ def test_thresholds_follow_meta_guidance():
         ({"pdq_min_quality": 101}, ValueError),
         ({"phash_max_distance": 1.5}, TypeError),
         ({"dhash_max_distance": True}, TypeError),
+        ({"min_bit_balance": -0.1}, ValueError),
+        ({"min_bit_balance": 0.6}, ValueError),
+        ({"min_bit_balance": float("nan")}, ValueError),
+        ({"min_bit_balance": "0.1"}, TypeError),
+        ({"min_bit_balance": True}, TypeError),
     ],
 )
 def test_thresholds_validation(kwargs, error):
@@ -192,23 +198,87 @@ def test_pdq_decides_when_reliable():
     assert not strict.matched
 
 
-def test_low_quality_pdq_falls_back_to_phash_then_dhash():
-    a = ImageFingerprint(pdq=GOOD_A, phash=BinaryHash(0, 64), dhash=BinaryHash(0, 64))
-    b = ImageFingerprint(pdq=POOR_B, phash=BinaryHash(0b111, 64), dhash=BinaryHash(-1 & 0xFF, 64))
+#: 64-bit hashes with 32 bits set, as pHash gives for any image without ties.
+BALANCED = 0xF0F0F0F0F0F0F0F0
+BALANCED_NEAR = BALANCED ^ 0b111  # 3 bits away, still balanced
+
+
+def test_unreliable_pdq_decides_nothing_even_when_phash_and_dhash_agree():
+    # A white and a black canvas: PDQ says "featureless" (quality 0), and the
+    # pHash / dHash of both are all zeros. Falling back to them would call
+    # any two flat images the same picture.
+    a = ImageFingerprint(pdq=GOOD_A, phash=BinaryHash(BALANCED, 64), dhash=BinaryHash(0, 64))
+    b = ImageFingerprint(pdq=POOR_B, phash=BinaryHash(BALANCED, 64), dhash=BinaryHash(0, 64))
     result = compare_fingerprints(a, b)
     assert result.pdq_reliable is False
+    assert result.phash_distance == 0
+    assert result.dhash_distance == 0
+    assert result.decided_by is None
+    assert result.undecided_reason is UndecidedReason.LOW_QUALITY
+    assert not result.matched
+
+
+def test_phash_then_dhash_decide_only_without_pdq():
+    a = ImageFingerprint(phash=BinaryHash(BALANCED, 64), dhash=BinaryHash(BALANCED, 64))
+    b = ImageFingerprint(pdq=GOOD_B, phash=BinaryHash(BALANCED_NEAR, 64))
+    result = compare_fingerprints(a, b)
+    assert result.pdq_distance is None
     assert result.decided_by is HashAlgorithm.PHASH
+    assert result.undecided_reason is None
     assert result.matched
     only_dhash = compare_fingerprints(
-        ImageFingerprint(dhash=BinaryHash(0, 64)), ImageFingerprint(dhash=BinaryHash(0xFFF, 64))
+        ImageFingerprint(dhash=BinaryHash(BALANCED, 64)),
+        ImageFingerprint(dhash=BinaryHash(BALANCED ^ 0xFFF, 64)),
     )
     assert only_dhash.decided_by is HashAlgorithm.DHASH
-    assert not only_dhash.matched
+    assert not only_dhash.matched  # 12 bits apart
+
+
+@pytest.mark.parametrize(
+    ("value_a", "value_b"),
+    [
+        (0, 1),  # flat images: pHash / dHash all zeros (one tie-breaking bit)
+        (0, 0),
+        ((1 << 64) - 1, (1 << 64) - 1),  # dHash of a left-to-right ramp: all ones
+        (0b111, 0),  # 3 of 64 bits set: below the 8-bit minimum
+    ],
+)
+def test_low_information_phash_and_dhash_do_not_decide(value_a, value_b):
+    a = ImageFingerprint(phash=BinaryHash(value_a, 64), dhash=BinaryHash(value_a, 64))
+    b = ImageFingerprint(phash=BinaryHash(value_b, 64), dhash=BinaryHash(value_b, 64))
+    result = compare_fingerprints(a, b)
+    assert result.phash_distance is not None
+    assert result.phash_distance <= 10
+    assert result.decided_by is None
+    assert result.undecided_reason is UndecidedReason.LOW_INFORMATION
+    assert not result.matched
+
+
+def test_an_informative_dhash_decides_when_phash_is_low_information():
+    a = ImageFingerprint(phash=BinaryHash(0, 64), dhash=BinaryHash(BALANCED, 64))
+    b = ImageFingerprint(phash=BinaryHash(1, 64), dhash=BinaryHash(BALANCED_NEAR, 64))
+    result = compare_fingerprints(a, b)
+    assert result.decided_by is HashAlgorithm.DHASH
+    assert result.matched
+
+
+def test_the_information_gate_is_configurable():
+    a = ImageFingerprint(phash=BinaryHash(0b111, 64))
+    b = ImageFingerprint(phash=BinaryHash(0b110, 64))
+    assert compare_fingerprints(a, b).decided_by is None
+    lenient = compare_fingerprints(a, b, thresholds=MatchThresholds(min_bit_balance=0.0))
+    assert lenient.decided_by is HashAlgorithm.PHASH
+    assert lenient.matched
+    # The gate is a fraction of the width: 9-bit hashes need 2 minority bits (ceil 1.125).
+    small_a = ImageFingerprint(phash=BinaryHash(0b000000011, 9))
+    small_b = ImageFingerprint(phash=BinaryHash(0b000000111, 9))
+    assert compare_fingerprints(small_a, small_b).decided_by is HashAlgorithm.PHASH
 
 
 def test_nothing_to_compare():
     result = compare_fingerprints(ImageFingerprint(pdq=GOOD_A), ImageFingerprint())
     assert result.decided_by is None
+    assert result.undecided_reason is UndecidedReason.NO_COMMON_HASH
     assert not result.matched
     with pytest.raises(TypeError):
         compare_fingerprints(GOOD_A, ImageFingerprint())  # type: ignore[arg-type]
@@ -295,6 +365,30 @@ def test_hash_list_from_hex_and_errors():
         HashList.from_hex(["0" * 64, "1" * 64], keys=range(3))
     with pytest.raises(ValueError):
         HashList.from_packed(b"\x00" * 33, keys=[1])
+
+
+def test_from_packed_accepts_one_row_per_hash_or_a_flat_array(rng):
+    packed = _random_pdq_bytes(rng, 64)
+    query = bytes(packed[5].tobytes())
+    for data in (packed, packed.ravel(), packed.tobytes()):
+        known = HashList.from_packed(data, keys=range(64))
+        assert [(m.key, m.distance) for m in known.match(query, max_distance=0)] == [(5, 0)]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(32, 64), (64, 32, 1), (2048, 1), (1, 2048)],  # right total size, wrong layout
+)
+def test_from_packed_rejects_mis_shaped_arrays(rng, shape):
+    packed = np.ascontiguousarray(_random_pdq_bytes(rng, 64).reshape(shape))
+    with pytest.raises(ValueError, match="shape"):
+        HashList.from_packed(packed, keys=range(64))
+
+
+def test_from_packed_rejects_other_dtypes(rng):
+    packed = _random_pdq_bytes(rng, 4).astype(np.int64)
+    with pytest.raises(TypeError, match="uint8"):
+        HashList.from_packed(packed, keys=range(4))
 
 
 def test_empty_hash_list():

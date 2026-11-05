@@ -41,11 +41,15 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from provenance_kit._typing import StrPath
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 __all__ = ["MAX_TEXT_LENGTH", "MIN_FONT_PX", "tile_text"]
 
@@ -81,7 +85,10 @@ def tile_text(
             kept unchanged), ``RGBX``, ``CMYK``, ``YCbCr``, ``LAB``, ``HSV``
             (through RGB and back), ``P`` (through RGB and mapped back to the
             original palette, so the text colour snaps to the nearest palette
-            entry; transparent pixels stay transparent) and ``1`` (through
+            entry; pixels on a transparent or semi-transparent entry keep it,
+            so the text is not drawn on them, and opaque pixels are mapped
+            onto opaque entries only, so they never turn transparent)
+            and ``1`` (through
             ``L``, then thresholded). Convert other modes (16-bit, float)
             first.
         text: The text, 1 to :data:`MAX_TEXT_LENGTH` characters; a newline
@@ -347,15 +354,50 @@ def _apply_palette(
     color: tuple[int, int, int],
     shadow_color: tuple[int, int, int],
 ) -> Image.Image:
-    rgb = image.convert("RGBA").convert("RGB") if "transparency" in image.info else image
-    marked = _apply(rgb.convert("RGB"), text_alpha, shadow_alpha, color, shadow_color)
-    result = marked.quantize(palette=image, dither=Image.Dither.NONE)
     transparency = image.info.get("transparency")
-    if isinstance(transparency, int):
-        original = np.asarray(image)
-        indices = np.asarray(result).copy()
-        indices[original == transparency] = transparency
-        result = Image.frombytes("P", image.size, indices.tobytes())
-        result.putpalette(image.getpalette() or [])
-        result.info["transparency"] = transparency
+    rgb = image.convert("RGBA").convert("RGB") if transparency is not None else image
+    marked = _apply(rgb.convert("RGB"), text_alpha, shadow_alpha, color, shadow_color)
+    palette = image.getpalette() or []
+    entries = len(palette) // 3
+    alpha = _palette_alpha(transparency, entries)
+    if alpha is None:
+        return marked.quantize(palette=image, dither=Image.Dither.NONE)
+    # Pixels on a (partly) transparent entry keep their index. Every other
+    # pixel is mapped onto the fully opaque entries only: mapping onto the
+    # whole palette could turn an opaque pixel whose new colour is nearest to
+    # a transparent entry's RGB into a hole.
+    opaque_entries = np.flatnonzero(alpha == 255)
+    original = np.asarray(image)
+    see_through = alpha[original] < 255
+    if opaque_entries.size == 0:
+        return image.copy()
+    reduced = Image.new("P", (1, 1))
+    reduced.putpalette(
+        np.asarray(palette, dtype=np.uint8).reshape(-1, 3)[opaque_entries].ravel().tolist()
+    )
+    quantized = np.asarray(marked.quantize(palette=reduced, dither=Image.Dither.NONE))
+    indices = opaque_entries.astype(np.uint8)[quantized]
+    indices[see_through] = original[see_through]
+    result = Image.frombytes("P", image.size, indices.tobytes())
+    result.putpalette(palette)
+    result.info["transparency"] = transparency
     return result
+
+
+def _palette_alpha(transparency: object, entries: int) -> NDArray[np.uint8] | None:
+    """Alpha of each palette entry from ``info["transparency"]``, or ``None`` if all are opaque.
+
+    The table has 256 entries so that it can be indexed with any pixel value.
+    """
+    alpha = np.full(256, 255, dtype=np.uint8)
+    if isinstance(transparency, int) and not isinstance(transparency, bool):
+        if not 0 <= transparency < 256:
+            return None
+        alpha[transparency] = 0
+    elif isinstance(transparency, (bytes, bytearray)):
+        table = np.frombuffer(bytes(transparency[:256]), dtype=np.uint8)
+        alpha[: table.size] = table
+    else:
+        return None
+    alpha[max(entries, 0) :] = 0  # pixels never use entries beyond the palette
+    return alpha

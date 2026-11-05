@@ -8,9 +8,26 @@ compact, versioned binary form for a database column (33 bytes per sampled
 frame plus a 20-byte header: about 116 KiB for an hour at 1 frame per
 second); :meth:`VideoFingerprint.from_bytes` validates it strictly.
 
-:func:`match_fingerprints` aligns a query against a reference: for every
-temporal offset it counts the aligned frame pairs whose Hamming distance is at
-most ``max_distance``, and keeps the offset with the most matched frames.
+:func:`match_fingerprints` aligns a query against a reference and looks for a
+**matched segment**: a stretch of time over which the aligned frames match.
+For every temporal offset it walks the aligned frame pairs in order; a pair
+matches when its Hamming distance is at most ``max_distance``, and a segment
+is a run of matched pairs that may skip at most ``max_gap_seconds`` of
+unmatched pairs at a time. The decision depends on the segment only, never on
+the length of either video:
+
+* **duration**: the segment spans at least ``min_matched_seconds`` (5 s);
+* **distinct frames**: at least ``min_distinct_frames`` (3) of its matched
+  frames are distinct pictures. Consecutive near-identical samples (a still
+  image, an end card, a frozen frame: each within ``static_distance`` bits of
+  the first sample of its run) count as one, on both sides, so a static
+  card shared by two unrelated videos is one matched frame, not three;
+* **density**: at least ``min_match_fraction`` (half) of the segment's
+  compared pairs match.
+
+So a 15-second excerpt is found whatever surrounds it in either video (an
+intro, an outro, a compilation), and a few seconds of shared boilerplate are
+not a match. The result reports the segment's start and end in both videos.
 The query may be a clip cut from anywhere in the reference (or extend past
 either end of it).
 
@@ -46,6 +63,7 @@ provided the hasher is (the default PDQ hasher is).
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import math
 import struct
@@ -70,9 +88,12 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_FRAME_SIZE",
     "DEFAULT_MAX_DISTANCE",
-    "DEFAULT_MIN_MATCHED_FRAMES",
+    "DEFAULT_MAX_GAP_SECONDS",
+    "DEFAULT_MIN_DISTINCT_FRAMES",
+    "DEFAULT_MIN_MATCHED_SECONDS",
     "DEFAULT_MIN_MATCH_FRACTION",
     "DEFAULT_MIN_QUALITY",
+    "DEFAULT_STATIC_DISTANCE",
     "FORMAT_VERSION",
     "MAX_FINGERPRINT_FRAMES",
     "FrameHash",
@@ -97,10 +118,11 @@ DEFAULT_FRAME_SIZE = 256
 #: most this many of 256 bits count as matched. It is above the 31 bits Meta
 #: recommends for PDQ image matching because aligned video samples also differ
 #: by the sampling-phase offset of a trimmed clip (measured: median 6 to 10
-#: bits after re-encoding, scaling or a frame-rate change; median 30, maximum
-#: 34 for a clip cut 0.4 s off the sampling grid of fast-moving content), while
-#: unrelated frames measure about 128 (minimum 106 in the same test). A match
-#: also needs several frames (see the thresholds below).
+#: bits after re-encoding, scaling or a frame-rate change, with one sample of
+#: 40 at 44 bits after halving the frame rate; median 24, maximum 34 for a
+#: clip cut 0.4 s off the sampling grid of fast-moving content), while
+#: unrelated frames measure about 128 (minimum 102 in the same test). A match
+#: also needs a matched segment (see the thresholds below).
 DEFAULT_MAX_DISTANCE = 40
 
 #: Frames whose hash quality is below this are ignored when matching (PDQ's
@@ -108,11 +130,26 @@ DEFAULT_MAX_DISTANCE = 40
 #: black or flat frames, which match each other spuriously).
 DEFAULT_MIN_QUALITY = 50
 
-#: A match needs at least this many matched frames ...
-DEFAULT_MIN_MATCHED_FRAMES = 3
+#: A match needs a segment with at least this many distinct matched frames
+#: (static runs counted once) ...
+DEFAULT_MIN_DISTINCT_FRAMES = 3
 
-#: ... and at least this fraction of the compared frames matched.
+#: ... spanning at least this many seconds (first to last matched sample,
+#: inclusive: 5 samples at 1 fps) ...
+DEFAULT_MIN_MATCHED_SECONDS = 5.0
+
+#: ... in which at least this fraction of the compared pairs matched.
 DEFAULT_MIN_MATCH_FRACTION = 0.5
+
+#: A segment survives at most this many seconds of consecutive unmatched
+#: pairs (an occasional noisy sample, a scene cut sampled off the grid).
+DEFAULT_MAX_GAP_SECONDS = 2.0
+
+#: Consecutive samples within this many bits of the first sample of their run
+#: are one static picture (measured within one encode: 0 to 2 bits for a still
+#: end card, 4 to 14 for a still scene with heavy grain; moving content 40 or
+#: more between samples one second apart).
+DEFAULT_STATIC_DISTANCE = 16
 
 #: The longest fingerprint :meth:`VideoFingerprint.from_bytes` accepts.
 MAX_FINGERPRINT_FRAMES = 1_000_000
@@ -120,8 +157,8 @@ MAX_FINGERPRINT_FRAMES = 1_000_000
 _MAGIC = b"PKVF"
 _HEADER = struct.Struct(">4sBBHdI")  # magic, version, hash bytes, reserved, fps, count
 _MAX_HASH_BYTES = 64
-_CHUNK_CELLS = 1 << 21  # distance-matrix cells computed per block (bounds memory)
 _POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint16)
+_EPSILON = 1e-9
 
 
 class FrameHash(Protocol):
@@ -310,25 +347,45 @@ class VideoFingerprint:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class VideoMatch:
-    """The best temporal alignment of a query fingerprint against a reference.
+    """The best matched segment of a query fingerprint against a reference.
+
+    The counts, the similarity and the times describe the **segment** (see
+    :func:`match_fingerprints`): the best stretch of matched frames at the
+    reported offset. When no aligned pair matches at any offset, there is no
+    segment: the offset is then the one whose aligned frames are closest on
+    average, ``matched_frames``, ``distinct_frames`` and the times are 0, and
+    ``compared_frames`` and ``similarity`` describe the whole overlap there.
 
     Attributes:
-        is_match: The decision: at least ``min_matched_frames`` matched frames
-            and a ``match_fraction`` of at least ``min_match_fraction``.
+        is_match: The decision: the segment has at least
+            ``min_distinct_frames`` distinct matched frames, spans at least
+            ``min_matched_seconds`` and has a ``match_fraction`` of at least
+            ``min_match_fraction``.
         similarity: Mean of ``1 - distance / hash_bits`` over the compared
-            frame pairs at the best offset (1.0 for identical frames, about 0.5
-            for unrelated ones); 0.0 when nothing could be compared.
+            pairs (1.0 for identical frames, about 0.5 for unrelated ones);
+            0.0 when nothing could be compared.
         offset_seconds: Where the query starts in the reference:
             ``reference_time = query_time + offset_seconds``. Negative when
             the query starts before the reference.
         offset_frames: The same offset in sampled frames.
-        matched_frames: Aligned pairs within ``max_distance``.
-        compared_frames: Aligned pairs where both hashes had usable quality.
+        matched_frames: Matched pairs in the segment.
+        distinct_frames: Matched frames in the segment after counting each
+            run of near-identical samples once, on each side; the smaller of
+            the two counts.
+        compared_frames: Pairs in the segment (from its first to its last
+            matched pair) where both hashes had usable quality.
         match_fraction: ``matched_frames / compared_frames`` (0.0 if none).
+        matched_seconds: The segment's duration, from its first to its last
+            matched sample inclusive: ``(last - first + 1) / fps``.
+        query_start_seconds: Where the segment starts in the query.
+        query_end_seconds: Where it ends in the query (exclusive: the last
+            matched sample plus one sampling interval).
+        reference_start_seconds: Where the segment starts in the reference.
+        reference_end_seconds: Where it ends in the reference (exclusive).
         query_coverage: ``compared_frames`` over the query's usable frames:
-            how much of the query overlaps the reference at that offset.
+            how much of the query the segment covers.
     """
 
     is_match: bool
@@ -336,8 +393,14 @@ class VideoMatch:
     offset_seconds: float
     offset_frames: int
     matched_frames: int
+    distinct_frames: int
     compared_frames: int
     match_fraction: float
+    matched_seconds: float
+    query_start_seconds: float
+    query_end_seconds: float
+    reference_start_seconds: float
+    reference_end_seconds: float
     query_coverage: float
 
 
@@ -459,34 +522,71 @@ def match_fingerprints(
     *,
     max_distance: int = DEFAULT_MAX_DISTANCE,
     min_quality: int = DEFAULT_MIN_QUALITY,
-    min_matched_frames: int = DEFAULT_MIN_MATCHED_FRAMES,
+    min_distinct_frames: int = DEFAULT_MIN_DISTINCT_FRAMES,
+    min_matched_seconds: float = DEFAULT_MIN_MATCHED_SECONDS,
     min_match_fraction: float = DEFAULT_MIN_MATCH_FRACTION,
+    max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
+    static_distance: int = DEFAULT_STATIC_DISTANCE,
     max_offset_seconds: float | None = None,
 ) -> VideoMatch:
-    """Finds the temporal offset that best aligns ``query`` with ``reference``.
+    """Finds the best matched segment of ``query`` in ``reference``.
 
-    Every offset at which at least ``min_matched_frames`` usable frame pairs
-    overlap is scored by its number of matched pairs (Hamming distance at most
-    ``max_distance``); ties go to the higher match fraction, then the lower
-    mean distance, then the smaller absolute offset. Cost: one Hamming
-    distance per pair of usable frames (``len(query) * len(reference)``),
-    computed in blocks of bounded memory; ``max_offset_seconds`` restricts
-    the offsets considered.
+    For every temporal offset (``reference_time = query_time + offset``), the
+    aligned pairs of usable frames (quality at least ``min_quality`` on both
+    sides) are walked in time order. A pair matches when its Hamming distance
+    is at most ``max_distance``. A **segment** starts at a matched pair and
+    extends over the following pairs until more than ``max_gap_seconds`` of
+    consecutive pairs fail to match; it ends at its last matched pair. Each
+    segment is described by:
+
+    * its matched pairs and its compared pairs (from its first to its last
+      matched pair), whose ratio is its ``match_fraction``;
+    * its duration, from the first to the last matched sample inclusive;
+    * its distinct frames: each fingerprint is split into runs of
+      near-identical consecutive samples (each within ``static_distance``
+      bits of the run's first sample; low-quality samples are skipped), and
+      the segment's matched pairs are counted once per run on each side; the
+      smaller count is kept. A still end card is one distinct frame however
+      many seconds it lasts.
+
+    A segment **qualifies** when it has at least ``min_distinct_frames``
+    distinct frames, lasts at least ``min_matched_seconds`` and has a
+    ``match_fraction`` of at least ``min_match_fraction``. None of this
+    depends on the length of either fingerprint, so an excerpt is found
+    whatever surrounds it. The result is the best segment over all offsets,
+    ranked by: qualifying first, then more distinct frames, more matched
+    pairs, a higher match fraction, a lower mean distance, a smaller absolute
+    offset; on one offset, the earliest of equal segments.
+
+    Cost: one Hamming distance per pair of frames (``len(query) *
+    len(reference)``), computed one row at a time (memory proportional to
+    the longer fingerprint); ``max_offset_seconds`` restricts the offsets
+    reported.
 
     Args:
         query: The fingerprint to look up (for example a clip).
         reference: The fingerprint to search in.
         max_distance: The per-frame Hamming threshold, 0 to ``hash_bits``.
         min_quality: Frames with a lower hash quality are ignored.
-        min_matched_frames: Matched frames required for ``is_match`` (and
-            overlapping usable pairs required for an offset to be scored).
-        min_match_fraction: Matched fraction required for ``is_match``.
+        min_distinct_frames: Distinct matched frames required for
+            ``is_match`` (at least 1).
+        min_matched_seconds: Segment duration required for ``is_match``.
+        min_match_fraction: Fraction of the segment's compared pairs that
+            must match, 0 to 1.
+        max_gap_seconds: The longest run of unmatched pairs a segment may
+            skip, in seconds (``floor(max_gap_seconds * fps)`` samples).
+        static_distance: Consecutive samples within this many bits of the
+            first sample of their run count as one picture, 0 to
+            ``hash_bits``. 0 counts only bit-identical samples as static.
         max_offset_seconds: If given, only offsets with
-            ``abs(offset_seconds) <= max_offset_seconds`` are scored.
+            ``abs(offset_seconds) <= max_offset_seconds`` are considered.
 
     Returns:
-        The best alignment. When no offset can be scored, ``is_match`` is
-        false and the counts are zero.
+        The best segment (see :class:`VideoMatch`). When no aligned pair
+        matches, ``is_match`` is false and the result describes the offset
+        whose aligned frames are closest on average (among offsets with at
+        least ``min_distinct_frames`` compared pairs); when there is no such
+        offset either, the counts are zero.
 
     Raises:
         TypeError: If an argument has the wrong type.
@@ -500,67 +600,93 @@ def match_fingerprints(
     if query.hash_bits != reference.hash_bits:
         raise ValueError("the fingerprints use different hash sizes")
     bits = query.hash_bits
+    fps = query.fps
     check_int("max_distance", max_distance, minimum=0, maximum=bits)
     check_int("min_quality", min_quality, minimum=0, maximum=100)
-    check_int("min_matched_frames", min_matched_frames, minimum=1)
+    check_int("min_distinct_frames", min_distinct_frames, minimum=1)
+    min_seconds = check_number("min_matched_seconds", min_matched_seconds, minimum=0.0)
     check_number("min_match_fraction", min_match_fraction, minimum=0.0, maximum=1.0)
+    gap_seconds = check_number("max_gap_seconds", max_gap_seconds, minimum=0.0)
+    check_int("static_distance", static_distance, minimum=0, maximum=bits)
     max_offset: int | None = None
     if max_offset_seconds is not None:
         seconds = check_number("max_offset_seconds", max_offset_seconds, minimum=0.0)
-        max_offset = math.floor(seconds * query.fps + 1e-9)
+        max_offset = math.floor(seconds * fps + _EPSILON)
+    rule = _Rule(
+        max_distance=max_distance,
+        max_gap=math.floor(gap_seconds * fps + _EPSILON),
+        min_distinct=min_distinct_frames,
+        min_span=max(1, math.ceil(min_seconds * fps - _EPSILON)),
+        min_fraction=float(min_match_fraction),
+    )
 
     q_usable = np.array([quality >= min_quality for quality in query.qualities], dtype=bool)
     r_usable = np.array([quality >= min_quality for quality in reference.qualities], dtype=bool)
     usable_query = int(q_usable.sum())
-    nothing = VideoMatch(
-        is_match=False,
-        similarity=0.0,
-        offset_seconds=0.0,
-        offset_frames=0,
-        matched_frames=0,
-        compared_frames=0,
-        match_fraction=0.0,
-        query_coverage=0.0,
-    )
     if usable_query == 0 or not r_usable.any():
-        return nothing
+        return _no_match()
 
-    matched, compared, distance_sum = _diagonal_counts(
-        _hash_matrix(query.hashes, bits),
-        _hash_matrix(reference.hashes, bits),
-        q_usable,
-        r_usable,
-        max_distance,
+    # Scan the rows of the shorter fingerprint ("a") against the longer one
+    # ("b"); the diagonal of a pair (a, b) is b - a + len(a) - 1.
+    swapped = len(query) > len(reference)
+    a_fp, b_fp = (reference, query) if swapped else (query, reference)
+    a_usable, b_usable = (r_usable, q_usable) if swapped else (q_usable, r_usable)
+    scan = _scan(
+        _Side.of(a_fp, a_usable, static_distance),
+        _Side.of(b_fp, b_usable, static_distance),
+        rule,
     )
-    n_query = len(query)
-    offsets = np.arange(matched.size) - (n_query - 1)
-    eligible = compared >= min_matched_frames
+    shift = np.arange(scan.size, dtype=np.int64) - (len(a_fp) - 1)  # b index - a index
+    offsets = -shift if swapped else shift  # reference index - query index
+    allowed = np.ones(scan.size, dtype=bool)
     if max_offset is not None:
-        eligible &= np.abs(offsets) <= max_offset
-    if not eligible.any():
-        return nothing
+        allowed = np.abs(offsets) <= max_offset
 
-    candidates = np.flatnonzero(eligible)
-    fraction = matched[candidates] / compared[candidates]
-    mean_distance = distance_sum[candidates] / compared[candidates]
+    found = np.flatnonzero(scan.best_valid & allowed)
+    if found.size == 0:
+        return _closest_overlap(
+            scan,
+            offsets=offsets,
+            allowed=allowed,
+            min_compared=min_distinct_frames,
+            usable_query=usable_query,
+            bits=bits,
+            fps=fps,
+        )
     # np.lexsort sorts by the last key first.
     order = np.lexsort(
-        (np.abs(offsets[candidates]), mean_distance, -fraction, -matched[candidates])
+        (
+            offsets[found],
+            np.abs(offsets[found]),
+            scan.best_mean[found],
+            -scan.best_fraction[found],
+            -scan.best_matched[found],
+            -scan.best_distinct[found],
+            ~scan.best_passes[found],
+        )
     )
-    best = int(candidates[order[0]])
-    best_matched = int(matched[best])
-    best_compared = int(compared[best])
-    best_fraction = best_matched / best_compared
-    offset_frames = int(offsets[best])
+    best = int(found[order[0]])
+    offset = int(offsets[best])
+    first, last = int(scan.best_first[best]), int(scan.best_last[best])
+    if swapped:  # first and last are reference indices
+        first, last = first - offset, last - offset
+    matched = int(scan.best_matched[best])
+    compared = int(scan.best_compared[best])
     return VideoMatch(
-        is_match=best_matched >= min_matched_frames and best_fraction >= min_match_fraction,
-        similarity=1.0 - float(distance_sum[best]) / (best_compared * bits),
-        offset_seconds=offset_frames / query.fps,
-        offset_frames=offset_frames,
-        matched_frames=best_matched,
-        compared_frames=best_compared,
-        match_fraction=best_fraction,
-        query_coverage=best_compared / usable_query,
+        is_match=bool(scan.best_passes[best]),
+        similarity=1.0 - int(scan.best_distance[best]) / (compared * bits),
+        offset_seconds=offset / fps,
+        offset_frames=offset,
+        matched_frames=matched,
+        distinct_frames=int(scan.best_distinct[best]),
+        compared_frames=compared,
+        match_fraction=matched / compared,
+        matched_seconds=(last - first + 1) / fps,
+        query_start_seconds=first / fps,
+        query_end_seconds=(last + 1) / fps,
+        reference_start_seconds=(first + offset) / fps,
+        reference_end_seconds=(last + offset + 1) / fps,
+        query_coverage=compared / usable_query,
     )
 
 
@@ -569,52 +695,296 @@ def match_fingerprints(
 # --------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _Rule:
+    """The segment thresholds, in samples."""
+
+    max_distance: int
+    max_gap: int
+    min_distinct: int
+    min_span: int
+    min_fraction: float
+
+
+class _Scan:
+    """Per-diagonal state of the segment scan.
+
+    ``cur_*`` describe the segment in progress on each diagonal, ``best_*``
+    the best closed segment, ``overlap_*`` every usable pair (for the result
+    when nothing matches).
+    """
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self.cur_open = np.zeros(size, dtype=bool)
+        self.cur_first = np.zeros(size, dtype=np.int64)
+        self.cur_last = np.zeros(size, dtype=np.int64)
+        self.cur_gap = np.zeros(size, dtype=np.int64)
+        self.cur_matched = np.zeros(size, dtype=np.int64)
+        self.cur_compared = np.zeros(size, dtype=np.int64)  # including trailing misses
+        self.cur_distance = np.zeros(size, dtype=np.int64)
+        self.cur_compared_at_last = np.zeros(size, dtype=np.int64)
+        self.cur_distance_at_last = np.zeros(size, dtype=np.int64)
+        self.cur_runs_a = np.zeros(size, dtype=np.int64)
+        self.cur_runs_b = np.zeros(size, dtype=np.int64)
+        self.cur_run_a = np.zeros(size, dtype=np.int64)
+        self.cur_run_b = np.zeros(size, dtype=np.int64)
+        self.best_valid = np.zeros(size, dtype=bool)
+        self.best_passes = np.zeros(size, dtype=bool)
+        self.best_distinct = np.zeros(size, dtype=np.int64)
+        self.best_matched = np.zeros(size, dtype=np.int64)
+        self.best_compared = np.zeros(size, dtype=np.int64)
+        self.best_distance = np.zeros(size, dtype=np.int64)
+        self.best_fraction = np.zeros(size, dtype=np.float64)
+        self.best_mean = np.zeros(size, dtype=np.float64)
+        self.best_first = np.zeros(size, dtype=np.int64)
+        self.best_last = np.zeros(size, dtype=np.int64)
+        self.overlap_compared = np.zeros(size, dtype=np.int64)
+        self.overlap_distance = np.zeros(size, dtype=np.int64)
+
+    def miss(self, index: npt.NDArray[np.intp], dist: npt.NDArray[np.int64], rule: _Rule) -> None:
+        """Unmatched pairs on open segments: longer gaps; too long a gap closes."""
+        self.cur_gap[index] += 1
+        self.cur_compared[index] += 1
+        self.cur_distance[index] += dist
+        self.close(index[self.cur_gap[index] > rule.max_gap], rule)
+
+    def hit(
+        self,
+        index: npt.NDArray[np.intp],
+        dist: npt.NDArray[np.int64],
+        *,
+        row: int,
+        run_a: int,
+        run_b: npt.NDArray[np.int64],
+    ) -> None:
+        """Matched pairs: they extend the open segments and start the others."""
+        extend = self.cur_open[index]
+        grow = index[extend]
+        self.cur_matched[grow] += 1
+        self.cur_compared[grow] += 1
+        self.cur_distance[grow] += dist[extend]
+        self.cur_compared_at_last[grow] = self.cur_compared[grow]
+        self.cur_distance_at_last[grow] = self.cur_distance[grow]
+        self.cur_last[grow] = row
+        self.cur_gap[grow] = 0
+        self.cur_runs_a[grow] += self.cur_run_a[grow] != run_a
+        self.cur_run_a[grow] = run_a
+        self.cur_runs_b[grow] += self.cur_run_b[grow] != run_b[extend]
+        self.cur_run_b[grow] = run_b[extend]
+        new = index[~extend]
+        self.cur_open[new] = True
+        self.cur_first[new] = row
+        self.cur_last[new] = row
+        self.cur_gap[new] = 0
+        self.cur_matched[new] = 1
+        self.cur_compared[new] = 1
+        self.cur_distance[new] = dist[~extend]
+        self.cur_compared_at_last[new] = 1
+        self.cur_distance_at_last[new] = dist[~extend]
+        self.cur_runs_a[new] = 1
+        self.cur_runs_b[new] = 1
+        self.cur_run_a[new] = run_a
+        self.cur_run_b[new] = run_b[~extend]
+
+    def close(self, index: npt.NDArray[np.intp], rule: _Rule) -> None:
+        """Ends the segments in progress on the diagonals ``index``."""
+        if index.size == 0:
+            return
+        matched = self.cur_matched[index]
+        compared = self.cur_compared_at_last[index]
+        distance = self.cur_distance_at_last[index]
+        distinct = np.minimum(self.cur_runs_a[index], self.cur_runs_b[index])
+        span = self.cur_last[index] - self.cur_first[index] + 1
+        fraction = matched / compared
+        mean = distance / compared
+        passes = (
+            (distinct >= rule.min_distinct)
+            & (span >= rule.min_span)
+            & (fraction >= rule.min_fraction - _EPSILON)
+        )
+        better = ~self.best_valid[index] | _ranks_higher(
+            (passes, distinct, matched, fraction, -mean),
+            (
+                self.best_passes[index],
+                self.best_distinct[index],
+                self.best_matched[index],
+                self.best_fraction[index],
+                -self.best_mean[index],
+            ),
+        )
+        chosen = index[better]
+        self.best_valid[chosen] = True
+        self.best_passes[chosen] = passes[better]
+        self.best_distinct[chosen] = distinct[better]
+        self.best_matched[chosen] = matched[better]
+        self.best_compared[chosen] = compared[better]
+        self.best_distance[chosen] = distance[better]
+        self.best_fraction[chosen] = fraction[better]
+        self.best_mean[chosen] = mean[better]
+        self.best_first[chosen] = self.cur_first[chosen]
+        self.best_last[chosen] = self.cur_last[chosen]
+        self.cur_open[index] = False
+
+
+def _ranks_higher(
+    new: Sequence[npt.ArrayLike], old: Sequence[npt.ArrayLike]
+) -> npt.NDArray[np.bool_]:
+    """Element-wise lexicographic ``new > old`` (higher keys rank first)."""
+    keys = [
+        (np.asarray(n, dtype=np.float64), np.asarray(o, dtype=np.float64))
+        for n, o in zip(new, old, strict=True)
+    ]
+    result = np.zeros(keys[0][0].shape, dtype=bool)
+    tied = np.ones(keys[0][0].shape, dtype=bool)
+    for new_key, old_key in keys:
+        result |= tied & (new_key > old_key)
+        tied &= new_key == old_key
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class _Side:
+    """One fingerprint prepared for the scan."""
+
+    hashes: npt.NDArray[np.uint8]
+    usable: npt.NDArray[np.bool_]
+    runs: npt.NDArray[np.int64]
+
+    @classmethod
+    def of(
+        cls, fingerprint: VideoFingerprint, usable: npt.NDArray[np.bool_], static_distance: int
+    ) -> _Side:
+        return cls(
+            hashes=_hash_matrix(fingerprint.hashes, fingerprint.hash_bits),
+            usable=usable,
+            runs=_static_runs(fingerprint.hashes, usable, static_distance),
+        )
+
+
+def _scan(a: _Side, b: _Side, rule: _Rule) -> _Scan:
+    """Finds the best segment on every diagonal, one row of ``a`` at a time."""
+    n_a, n_b = a.hashes.shape[0], b.hashes.shape[0]
+    scan = _Scan(n_a + n_b - 1)
+    distances = _RowDistances(b.hashes)
+    for row in range(n_a):
+        if not a.usable[row]:
+            continue
+        start = n_a - 1 - row  # the diagonal of the pair (row, 0)
+        window = slice(start, start + n_b)
+        dist = distances.to(a.hashes[row])
+        scan.overlap_compared[window] += b.usable
+        scan.overlap_distance[window] += np.where(b.usable, dist, 0)
+        hit = b.usable & (dist <= rule.max_distance)
+        miss = np.flatnonzero(b.usable & ~hit & scan.cur_open[window])
+        if miss.size:
+            scan.miss(miss + start, dist[miss], rule)
+        columns = np.flatnonzero(hit)
+        if columns.size:
+            scan.hit(
+                columns + start,
+                dist[columns],
+                row=row,
+                run_a=int(a.runs[row]),
+                run_b=b.runs[columns],
+            )
+    scan.close(np.flatnonzero(scan.cur_open), rule)
+    return scan
+
+
+class _RowDistances:
+    """Hamming distances from one hash to every row of ``b``."""
+
+    def __init__(self, b: npt.NDArray[np.uint8]) -> None:
+        self._bytes = np.ascontiguousarray(b)
+        native = hasattr(np, "bitwise_count") and b.shape[1] % 8 == 0
+        self._words = self._bytes.view(np.uint64) if native else None
+
+    def to(self, row: npt.NDArray[np.uint8]) -> npt.NDArray[np.int64]:
+        if self._words is not None:
+            words = np.ascontiguousarray(row).view(np.uint64)
+            native: npt.NDArray[np.int64] = np.bitwise_count(self._words ^ words).sum(
+                axis=1, dtype=np.int64
+            )
+            return native
+        table: npt.NDArray[np.int64] = _POPCOUNT[self._bytes ^ row].sum(axis=1, dtype=np.int64)
+        return table
+
+
+def _static_runs(
+    hashes: Sequence[int], usable: npt.NDArray[np.bool_], static_distance: int
+) -> npt.NDArray[np.int64]:
+    """The run number of each usable sample (``-1`` for unusable ones).
+
+    A run continues while samples stay within ``static_distance`` bits of its
+    first sample; anchoring on the first sample keeps a slow pan from chaining
+    into one run.
+    """
+    runs = np.full(len(hashes), -1, dtype=np.int64)
+    run = -1
+    anchor: int | None = None
+    for position, value in enumerate(hashes):
+        if not usable[position]:
+            continue
+        if anchor is None or (value ^ anchor).bit_count() > static_distance:
+            run += 1
+            anchor = value
+        runs[position] = run
+    return runs
+
+
+def _no_match() -> VideoMatch:
+    return VideoMatch(
+        is_match=False,
+        similarity=0.0,
+        offset_seconds=0.0,
+        offset_frames=0,
+        matched_frames=0,
+        distinct_frames=0,
+        compared_frames=0,
+        match_fraction=0.0,
+        matched_seconds=0.0,
+        query_start_seconds=0.0,
+        query_end_seconds=0.0,
+        reference_start_seconds=0.0,
+        reference_end_seconds=0.0,
+        query_coverage=0.0,
+    )
+
+
+def _closest_overlap(
+    scan: _Scan,
+    *,
+    offsets: npt.NDArray[np.int64],
+    allowed: npt.NDArray[np.bool_],
+    min_compared: int,
+    usable_query: int,
+    bits: int,
+    fps: float,
+) -> VideoMatch:
+    """The result when nothing matched: the offset whose frames are closest."""
+    eligible = np.flatnonzero(allowed & (scan.overlap_compared >= min_compared))
+    if eligible.size == 0:
+        return _no_match()
+    mean = scan.overlap_distance[eligible] / scan.overlap_compared[eligible]
+    order = np.lexsort((offsets[eligible], np.abs(offsets[eligible]), mean))
+    best = int(eligible[order[0]])
+    count = int(scan.overlap_compared[best])
+    offset = int(offsets[best])
+    return dataclasses.replace(
+        _no_match(),
+        similarity=1.0 - int(scan.overlap_distance[best]) / (count * bits),
+        offset_seconds=offset / fps,
+        offset_frames=offset,
+        compared_frames=count,
+        query_coverage=count / usable_query,
+    )
+
+
 def _hash_matrix(hashes: Sequence[int], bits: int) -> npt.NDArray[np.uint8]:
     width = bits // 8
     raw = b"".join(value.to_bytes(width, "big") for value in hashes)
     return np.frombuffer(raw, dtype=np.uint8).reshape(len(hashes), width)
-
-
-def _diagonal_counts(
-    q: npt.NDArray[np.uint8],
-    r: npt.NDArray[np.uint8],
-    q_usable: npt.NDArray[np.bool_],
-    r_usable: npt.NDArray[np.bool_],
-    max_distance: int,
-) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.float64]]:
-    """Per-offset matched / compared counts and distance sums.
-
-    Offset ``d`` (index ``d + len(q) - 1``) pairs query frame ``i`` with
-    reference frame ``i + d``.
-    """
-    n_q, n_r = q.shape[0], r.shape[0]
-    n_offsets = n_q + n_r - 1
-    matched = np.zeros(n_offsets, dtype=np.int64)
-    compared = np.zeros(n_offsets, dtype=np.int64)
-    distance_sum = np.zeros(n_offsets, dtype=np.float64)
-    rows = max(1, _CHUNK_CELLS // max(n_r * q.shape[1], 1))
-    columns = np.arange(n_r)
-    for start in range(0, n_q, rows):
-        stop = min(start + rows, n_q)
-        block = _POPCOUNT[q[start:stop, None, :] ^ r[None, :, :]].sum(axis=2)
-        valid = q_usable[start:stop, None] & r_usable[None, :]
-        index = columns[None, :] - np.arange(start, stop)[:, None] + (n_q - 1)
-        flat_index = index.ravel()
-        flat_valid = valid.ravel()
-        matched += np.bincount(
-            flat_index,
-            weights=(flat_valid & (block.ravel() <= max_distance)).astype(np.float64),
-            minlength=n_offsets,
-        ).astype(np.int64)
-        compared += np.bincount(
-            flat_index, weights=flat_valid.astype(np.float64), minlength=n_offsets
-        ).astype(np.int64)
-        distance_sum += np.bincount(
-            flat_index,
-            weights=np.where(flat_valid, block.ravel(), 0).astype(np.float64),
-            minlength=n_offsets,
-        )
-    return matched, compared, distance_sum
 
 
 def _check_frame(array: object) -> None:

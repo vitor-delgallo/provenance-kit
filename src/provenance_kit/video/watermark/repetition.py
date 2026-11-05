@@ -63,11 +63,19 @@ class RepetitionDecoded:
 
     Attributes:
         bits: The decoded data bits (``data_bits`` characters).
-        agreement: Fraction of the copy bits that agree with the decoded bit,
-            in ``[0.5, 1.0]`` (1.0: every copy of every bit agreed).
-        p_value: Probability that ``copies`` independent fair bits per data
-            bit agree at least this much: small values mean a watermark is
-            present. 1.0 when there is a single copy (no information).
+        agreement: Fraction of the copy bits (each copy's score sign) that
+            agree with the decoded bit, in ``[0.0, 1.0]`` (1.0: every copy of
+            every bit agreed). Because bits are decoded by the soft sum, a
+            few confident copies can outvote many unsure ones, so this can
+            fall below 0.5.
+        p_value: The detection statistic: the probability that ``copies``
+            independent fair bits per data bit agree among themselves at
+            least as much as observed, where a data bit's agreement is the
+            size of its hard majority (``max(ones, copies - ones)`` over the
+            copies' score signs). Small values mean a watermark is present.
+            It is computed from the hard majority, not from :attr:`agreement`,
+            because that is the quantity whose null distribution is exact.
+            1.0 when there is a single copy (no information).
     """
 
     bits: str
@@ -162,15 +170,17 @@ class RepetitionCode:
         copies = values[: self.copies * self.data_bits].reshape(self.copies, self.data_bits)
         decoded = copies.sum(axis=0) > 0
         hard = copies > 0
+        # Agreement with the decoded (soft-vote) bits, as documented.
+        agreement = int(np.count_nonzero(hard == decoded[None, :])) / hard.size
+        # The detection statistic uses the hard majority of each bit's copies,
+        # whose distribution under the null hypothesis is known exactly.
         ones = hard.sum(axis=0)
-        agree_counts = np.maximum(ones, self.copies - ones)
-        total_agree = int(agree_counts.sum())
-        agreement = total_agree / (self.copies * self.data_bits)
+        majority_agree = int(np.maximum(ones, self.copies - ones).sum())
         bits = "".join("1" if bit else "0" for bit in decoded)
         return RepetitionDecoded(
             bits=bits,
             agreement=agreement,
-            p_value=_agreement_p_value(self.copies, self.data_bits, total_agree),
+            p_value=_agreement_p_value(self.copies, self.data_bits, majority_agree),
         )
 
 

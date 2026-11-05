@@ -65,6 +65,35 @@ def test_soft_vote_uses_magnitudes(rng):
     assert code.decode(scores).bits == payload
 
 
+def test_agreement_is_measured_against_the_soft_decoded_bits():
+    # Data bit 0: three weak "0" votes and one strong "1" vote, so the soft
+    # sum decodes 1 while the hard majority says 0. Data bit 1: all agree on 1.
+    code = RepetitionCode(copies=4, total_bits=8, whiten=False)
+    scores = np.array([-0.1, 1.0, -0.1, 1.0, -0.1, 1.0, 5.0, 1.0])
+    decoded = code.decode(scores)
+    assert decoded.bits == "11"
+    # Bit 0: 1 of 4 copies agree with the decoded 1; bit 1: 4 of 4.
+    assert decoded.agreement == pytest.approx(5 / 8)
+    # The p-value stays the calibrated hard-majority statistic: 3 + 4 copies.
+    majority = RepetitionCode(copies=4, total_bits=8, whiten=False).decode(
+        np.array([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 1.0, 1.0])
+    )
+    assert majority.agreement == pytest.approx(7 / 8)
+    assert decoded.p_value == pytest.approx(majority.p_value)
+
+
+def test_agreement_with_whitening_matches_the_unwhitened_layout(rng):
+    code = RepetitionCode(copies=4)
+    payload = random_bits(rng, code.data_bits)
+    scores = hard_scores(code.encode(payload)) * rng.uniform(0.1, 2.0, size=256)
+    # Make copy 3 of every bit wrong but very confident: the soft vote flips
+    # each bit to copy 3's value, so only 1 of 4 copies agrees with it.
+    scores[3 * 64 : 4 * 64] *= -1000.0
+    decoded = code.decode(scores)
+    assert decoded.bits == "".join("1" if c == "0" else "0" for c in payload)
+    assert decoded.agreement == pytest.approx(0.25)
+
+
 def test_p_value_is_tiny_for_a_clean_watermark(rng):
     code = RepetitionCode(copies=4)
     decoded = code.decode(hard_scores(code.encode(random_bits(rng, 64))))

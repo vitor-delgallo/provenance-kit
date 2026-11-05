@@ -87,18 +87,23 @@ _PROBE_ENTRIES = (
     "r_frame_rate,nb_frames,duration,start_time"
     ":stream_disposition=attached_pic"
     ":stream_tags=rotate"
-    ":stream_side_data=rotation"
+    ":stream_side_data=rotation,displaymatrix"
 )
+_MAX_DISPLAY_MATRIX_TEXT = 512  # ffprobe prints about 130 characters
+_INT32 = 1 << 31
 
 
 @dataclass(frozen=True, slots=True)
 class VideoInfo:
     """What ffprobe reports about a video, after validation.
 
-    Dimensions are those of the stored (coded) frames. ``rotation`` is how
-    far the frames must be turned clockwise for display; the
-    ``display_width`` / ``display_height`` properties account for it, and
-    :mod:`provenance_kit.video.frames` applies it.
+    Dimensions are those of the stored (coded) frames. The display transform
+    is: mirror the frames horizontally if ``mirrored``, then turn them
+    clockwise by ``rotation``. Every orientation a display matrix can encode
+    (the four rotations, each with or without a mirror, such as a phone's
+    "flip" edit) is one such pair. The ``display_width`` / ``display_height``
+    properties account for it, and :mod:`provenance_kit.video.frames`
+    applies it exactly as ffmpeg's own autorotation does.
 
     Attributes:
         container: The container detected from the bytes.
@@ -123,6 +128,8 @@ class VideoInfo:
             it in ffmpeg).
         start_time: Start time of the selected stream in seconds (0.0 when
             not declared).
+        mirrored: Whether the display matrix mirrors the frames (negative
+            determinant); the horizontal flip is applied before ``rotation``.
     """
 
     container: MediaType
@@ -143,6 +150,7 @@ class VideoInfo:
     bit_rate: int | None
     stream_index: int
     start_time: float = 0.0
+    mirrored: bool = False
 
     def __post_init__(self) -> None:
         """Validates the fields."""
@@ -150,6 +158,8 @@ class VideoInfo:
             raise ValueError("width and height must be positive")
         if self.rotation not in (0, 90, 180, 270):
             raise ValueError("rotation must be 0, 90, 180 or 270")
+        if not isinstance(self.mirrored, bool):
+            raise TypeError("mirrored must be a bool")
 
     @property
     def display_width(self) -> int:
@@ -309,6 +319,7 @@ def validate_probe_report(
     start_time = _non_negative(json_float(selected.get("start_time")))
     if start_time is None or start_time > limits.max_duration_seconds:
         start_time = 0.0
+    rotation, mirrored = _display_transform(selected)
 
     return VideoInfo(
         container=media_type,
@@ -316,7 +327,7 @@ def validate_probe_report(
         duration_seconds=duration,
         width=width,
         height=height,
-        rotation=_rotation(selected),
+        rotation=rotation,
         frame_rate=frame_rate,
         frame_count=frame_count,
         video_codec=json_name(selected.get("codec_name")) or "unknown",
@@ -329,6 +340,7 @@ def validate_probe_report(
         bit_rate=_non_negative(json_int(fmt.get("bit_rate"))),
         stream_index=index,
         start_time=start_time,
+        mirrored=mirrored,
     )
 
 
@@ -383,28 +395,93 @@ def _non_negative(value: _N | None) -> _N | None:
     return value if value is not None and value >= 0 else None
 
 
-def _rotation(stream: Mapping[str, Any]) -> int:
-    """Clockwise display rotation from the display matrix or the legacy tag."""
+def _display_transform(stream: Mapping[str, Any]) -> tuple[int, bool]:
+    """Clockwise display rotation and mirroring from the display matrix or the legacy tag.
+
+    ffprobe reports a display matrix's rotation counterclockwise (``r``, from
+    ``av_display_rotation_get``). Without a mirror, ffmpeg's autorotation
+    turns the frames clockwise by ``-r``; with one (negative determinant), it
+    flips them horizontally and turns them clockwise by ``180 - r``. Both
+    were checked against ffmpeg 8.1 for every combination of
+    ``-display_rotation``, ``-display_hflip`` and ``-display_vflip``.
+    """
     degrees: float | None = None
+    mirrored = False
     side_data = stream.get("side_data_list")
     if isinstance(side_data, list):
         for entry in side_data[:16]:
-            if isinstance(entry, dict):
-                value = json_float(entry.get("rotation"))
-                if value is not None:
-                    # ffprobe reports the display matrix rotation
-                    # counterclockwise; ffmpeg's autorotate turns the frame by
-                    # its negation.
-                    degrees = -value
-                    break
+            if not isinstance(entry, dict):
+                continue
+            matrix = _display_matrix(entry.get("displaymatrix"))
+            value = json_float(entry.get("rotation"))
+            if value is None and matrix is not None:
+                value = _matrix_rotation(matrix)
+            if value is not None:
+                mirrored = matrix is not None and _determinant(matrix) < 0
+                degrees = 180.0 - value if mirrored else -value
+                break
     if degrees is None:
         tags = stream.get("tags")
         if isinstance(tags, dict):
             degrees = json_float(tags.get("rotate"))  # legacy tag: clockwise
     if degrees is None or abs(degrees) > 3600:
-        return 0
+        return 0, False
     quarter = round(degrees / 90.0)
     if abs(degrees - 90.0 * quarter) > 2.0:
         _log.debug("ignoring a display rotation that is not a multiple of 90 degrees")
-        return 0
-    return (quarter % 4) * 90
+        return 0, False
+    return (quarter % 4) * 90, mirrored
+
+
+def _display_matrix(text: object) -> tuple[int, int, int, int] | None:
+    """The 2 x 2 linear part ``(a, b, c, d)`` of ffprobe's printed display matrix.
+
+    ffprobe prints three rows such as ``00000000:  0  65536  0`` (16.16 fixed
+    point; the third column and row are the translation and the scale).
+    Anything else (wrong count, values outside 32 bits, a singular matrix)
+    gives ``None``.
+    """
+    if not isinstance(text, str) or len(text) > _MAX_DISPLAY_MATRIX_TEXT:
+        return None
+    try:
+        values = _display_matrix_values(text)
+    except ValueError:
+        return None
+    a, b, _, c, d, _, _, _, _ = values
+    if a * d - b * c == 0:
+        return None
+    return a, b, c, d
+
+
+def _display_matrix_values(text: str) -> list[int]:
+    """The nine integers of a printed display matrix; ``ValueError`` if malformed."""
+    values: list[int] = []
+    for line in text.splitlines():
+        label, separator, rest = line.partition(":")
+        if not separator:
+            if line.strip():
+                raise ValueError("a display matrix row has no label")
+            continue
+        if not label.strip().isalnum():
+            raise ValueError("bad display matrix row label")
+        for token in rest.split():
+            number = int(token)  # ValueError if not an integer
+            if not -_INT32 <= number < _INT32:
+                raise ValueError("display matrix value out of range")
+            values.append(number)
+    if len(values) != 9:
+        raise ValueError("a display matrix has nine values")
+    return values
+
+
+def _determinant(matrix: tuple[int, int, int, int]) -> int:
+    a, b, c, d = matrix
+    return a * d - b * c
+
+
+def _matrix_rotation(matrix: tuple[int, int, int, int]) -> float:
+    """Counterclockwise rotation in degrees, as ``av_display_rotation_get`` computes it."""
+    a, b, c, d = matrix
+    scale_0 = math.hypot(a, c)
+    scale_1 = math.hypot(b, d)
+    return -math.degrees(math.atan2(b / scale_1, a / scale_0))

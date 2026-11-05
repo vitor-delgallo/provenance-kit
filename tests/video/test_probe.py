@@ -179,10 +179,77 @@ def test_unsafe_codec_names_are_replaced(name):
     assert parse(probe_json(codec_name=name)).video_codec == "unknown"
 
 
+def display_matrix(a: int, b: int, c: int, d: int) -> str:
+    """ffprobe's text form of a display matrix (16.16 fixed point, as printed)."""
+    rows = ((a, b, 0), (c, d, 0), (0, 0, 1 << 30))
+    return "\n" + "".join(
+        f"{index:08x}: {x:11d} {y:11d} {z:11d}\n" for index, (x, y, z) in enumerate(rows)
+    )
+
+
+ONE = 1 << 16
+
+# (ffprobe rotation, matrix) -> (clockwise rotation, mirrored), as ffmpeg's own
+# autorotation transforms the frames (measured with ffmpeg 8.1 for every
+# -display_rotation / -display_hflip / -display_vflip combination).
+DISPLAY_MATRICES = [
+    (-180, (-ONE, 0, 0, ONE), (0, True)),  # -display_hflip
+    (0, (ONE, 0, 0, -ONE), (180, True)),  # -display_vflip
+    (90, (0, -ONE, -ONE, 0), (90, True)),  # rotation 90 + hflip
+    (-90, (0, ONE, ONE, 0), (270, True)),  # rotation 270 + hflip
+    (-180, (-ONE, 0, 0, -ONE), (180, False)),  # rotation 180 (or hflip + vflip)
+    (90, (0, -ONE, ONE, 0), (270, False)),  # rotation 90
+    (-90, (0, ONE, -ONE, 0), (90, False)),  # rotation 270
+]
+
+
+@pytest.mark.parametrize(("rotation", "matrix", "expected"), DISPLAY_MATRICES)
+def test_mirrored_display_matrices(rotation, matrix, expected):
+    entry = {
+        "side_data_type": "Display Matrix",
+        "displaymatrix": display_matrix(*matrix),
+        "rotation": rotation,
+    }
+    info = parse(probe_json(side_data_list=[entry]))
+    assert (info.rotation, info.mirrored) == expected
+
+
+@pytest.mark.parametrize(("rotation", "matrix", "expected"), DISPLAY_MATRICES)
+def test_display_matrix_without_a_rotation_field(rotation, matrix, expected):
+    entry = {"side_data_type": "Display Matrix", "displaymatrix": display_matrix(*matrix)}
+    info = parse(probe_json(side_data_list=[entry]))
+    assert (info.rotation, info.mirrored) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "garbage",
+        display_matrix(0, 0, 0, 0),  # degenerate
+        "\n00000000: 1 2\n",  # too few values
+        "x" * 10_000,
+        display_matrix(-ONE, 0, 0, ONE) + "00000003: 1 2 3\n",  # too many values
+        "\n00000000: 99999999999 0 0\n00000001: 0 1 0\n00000002: 0 0 1\n",  # not int32
+        7,
+    ],
+)
+def test_unusable_display_matrices_are_ignored(text):
+    entry = {"displaymatrix": text, "rotation": -90}
+    info = parse(probe_json(side_data_list=[entry]))
+    assert (info.rotation, info.mirrored) == (90, False)
+
+
+def test_legacy_rotate_tag_is_never_mirrored():
+    info = parse(probe_json(tags={"rotate": "90"}))
+    assert (info.rotation, info.mirrored) == (90, False)
+
+
 def test_video_info_validates_rotation():
     info = parse(probe_json())
     with pytest.raises(ValueError):
         dataclasses.replace(info, rotation=45)
+    with pytest.raises(TypeError):
+        dataclasses.replace(info, mirrored=1)
 
 
 # ------------------------------------------------------------ probe_video
