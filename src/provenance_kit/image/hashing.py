@@ -910,7 +910,7 @@ def _informative(a: BinaryHash | None, b: BinaryHash | None, limits: MatchThresh
 
 # ---------------------------------------------------------------- hash lists
 
-K = TypeVar("K")
+_K = TypeVar("_K")
 
 #: A hash given to :class:`HashList`: a :class:`PdqHash`, a
 #: :class:`BinaryHash`, big-endian ``bytes``, a non-negative ``int``, or a hex
@@ -962,7 +962,7 @@ def _popcount_rows(words: NDArray[np.uint64]) -> NDArray[np.int64]:
     return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
 
 
-class HashList(Generic[K]):
+class HashList(Generic[_K]):
     """An in-memory list of known hashes, searched by Hamming distance.
 
     Built for lists shared by other organizations (for example PDQ hash lists
@@ -995,10 +995,10 @@ class HashList(Generic[K]):
         ValueError: If a hash has the wrong width or ``bits`` < 1.
     """
 
-    def __init__(self, entries: Iterable[tuple[K, HashValue]], *, bits: int = PDQ_BITS) -> None:
+    def __init__(self, entries: Iterable[tuple[_K, HashValue]], *, bits: int = PDQ_BITS) -> None:
         """Packs the entries (see the class docstring)."""
         nbytes = _check_bits(bits)
-        keys: list[K] = []
+        keys: list[_K] = []
         packed = bytearray()
         for key, value in entries:
             keys.append(key)
@@ -1010,9 +1010,9 @@ class HashList(Generic[K]):
         cls,
         data: bytes | bytearray | memoryview | NDArray[np.uint8],
         *,
-        keys: Sequence[K],
+        keys: Sequence[_K],
         bits: int = PDQ_BITS,
-    ) -> HashList[K]:
+    ) -> HashList[_K]:
         """Builds a list from hashes packed back to back.
 
         Args:
@@ -1057,9 +1057,9 @@ class HashList(Generic[K]):
         cls,
         hashes: Iterable[str],
         *,
-        keys: Sequence[K],
+        keys: Sequence[_K],
         bits: int = PDQ_BITS,
-    ) -> HashList[K]:
+    ) -> HashList[_K]:
         """Builds a list from hex strings (for example one PDQ hash per line).
 
         Args:
@@ -1089,7 +1089,7 @@ class HashList(Generic[K]):
             raise ValueError(f"got {count} hashes for {len(keys)} keys")
         return cls.from_packed(bytes(packed), keys=keys, bits=bits)
 
-    def _init(self, flat: NDArray[np.uint8], keys: Sequence[K], bits: int) -> None:
+    def _init(self, flat: NDArray[np.uint8], keys: Sequence[_K], bits: int) -> None:
         nbytes = (bits + 7) // 8
         words = -(-nbytes // 8)
         count = len(keys)
@@ -1098,7 +1098,7 @@ class HashList(Generic[K]):
             padded[:, :nbytes] = flat.reshape(count, nbytes)
         self._words: NDArray[np.uint64] = padded.view(np.uint64)
         self._words.flags.writeable = False
-        self._keys: Sequence[K] = keys
+        self._keys: Sequence[_K] = keys
         self._bits = bits
         self._nbytes = nbytes
 
@@ -1116,7 +1116,7 @@ class HashList(Generic[K]):
         """The number of hashes."""
         return int(self._words.shape[0])
 
-    def __iter__(self) -> Iterator[K]:
+    def __iter__(self) -> Iterator[_K]:
         """Iterates over the keys."""
         return iter(self._keys)
 
@@ -1126,7 +1126,7 @@ class HashList(Generic[K]):
         *,
         max_distance: int | None = None,
         limit: int | None = None,
-    ) -> list[HammingMatch[K]]:
+    ) -> list[HammingMatch[_K]]:
         """Finds the entries within ``max_distance`` bits of ``query``.
 
         A low-quality PDQ query (``not query.is_reliable()``) still runs; the
@@ -1177,7 +1177,7 @@ class HashList(Generic[K]):
             for i in order
         ]
 
-    def nearest(self, query: HashValue, *, count: int = 1) -> list[HammingMatch[K]]:
+    def nearest(self, query: HashValue, *, count: int = 1) -> list[HammingMatch[_K]]:
         """Returns the ``count`` closest entries, whatever their distance.
 
         Raises:

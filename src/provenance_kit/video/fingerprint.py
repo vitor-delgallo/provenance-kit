@@ -80,7 +80,8 @@ from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.errors import BackendUnavailableError
 from provenance_kit.limits import MediaLimits
 from provenance_kit.tools import ExternalTools
-from provenance_kit.video.frames import MAX_SAMPLING_FPS, FrameSampling, VideoFrame, iter_frames
+from provenance_kit.video.frames import MAX_SAMPLING_FPS as _MAX_SAMPLING_FPS
+from provenance_kit.video.frames import FrameSampling, VideoFrame, iter_frames
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -244,8 +245,8 @@ class VideoFingerprint:
         """Validates the fields."""
         if isinstance(self.fps, bool) or not isinstance(self.fps, (int, float)):
             raise TypeError("fps must be a number")
-        if not math.isfinite(self.fps) or not 0 < self.fps <= MAX_SAMPLING_FPS:
-            raise ValueError(f"fps must be positive and at most {MAX_SAMPLING_FPS:g}")
+        if not math.isfinite(self.fps) or not 0 < self.fps <= _MAX_SAMPLING_FPS:
+            raise ValueError(f"fps must be positive and at most {_MAX_SAMPLING_FPS:g}")
         object.__setattr__(self, "fps", float(self.fps))
         if isinstance(self.hash_bits, bool) or not isinstance(self.hash_bits, int):
             raise TypeError("hash_bits must be an int")

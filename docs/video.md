@@ -233,9 +233,21 @@ verifies it before loading and raises `ModelLoadError` on a mismatch.
 the variable, `provenance-kit/models/videoseal` in the per-user cache
 directory (`provenance_kit.modelfiles.default_model_dir`), and is refused
 inside `site-packages`; nothing is downloaded unless `download=True` is
-passed or `download_videoseal_model()` is called (which keeps a valid file
-and replaces a missing or invalid one). Pre-provisioned directories work
+passed (with `download_timeout_seconds`, the per-read network timeout, 60 s
+by default) or `download_videoseal_models(model_dir, *, timeout_seconds=...)`
+is called (which keeps a valid file, replaces a missing or invalid one, and
+returns the directory, like the TrustMark and AudioSeal download functions).
+`model_path` and `sha256` point the backend at a single file kept elsewhere
+(or converted by the application) instead. Pre-provisioned directories work
 offline.
+
+**Errors.** A model that fails while it runs (a PyTorch runtime or device
+error) raises `provenance_kit.errors.WatermarkBackendError` (also importable
+from `provenance_kit.video.watermark`), as do scores of
+the wrong shape or non-finite scores from any backend, and watermarked frames
+that are not `uint8` `(height, width, 3)` arrays; the image and audio modules
+raise the same type. `ModelLoadError` is reserved for model files that
+cannot be downloaded, verified or loaded.
 
 **Decoded media only** (decision 2): frames in, frames out; the application
 encodes. `embed_verified` streams the watermarked frames into the caller's

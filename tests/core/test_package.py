@@ -80,8 +80,11 @@ def test_error_hierarchy():
         errors.ExternalToolError,
         errors.ModelLoadError,
         errors.PayloadError,
+        errors.WatermarkBackendError,
     ):
         assert issubclass(cls, base)
+    assert not issubclass(errors.WatermarkBackendError, (errors.MediaError, errors.ModelLoadError))
+    assert set(errors.__all__) <= set(provenance_kit.__all__)
     for cls in (
         errors.MediaDecodeError,
         errors.UnsupportedMediaError,

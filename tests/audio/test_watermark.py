@@ -9,7 +9,7 @@ import types
 import numpy as np
 import pytest
 
-from provenance_kit import PayloadCodec
+from provenance_kit import PayloadCodec, modelfiles
 from provenance_kit.audio.pcm import PcmAudio
 from provenance_kit.audio.watermark import (
     AUDIOSEAL_DETECTOR,
@@ -26,7 +26,12 @@ from provenance_kit.audio.watermark import (
     embed_verified,
     embed_watermark,
 )
-from provenance_kit.errors import BackendUnavailableError, MediaLimitExceededError, ModelLoadError
+from provenance_kit.errors import (
+    BackendUnavailableError,
+    MediaLimitExceededError,
+    ModelLoadError,
+    WatermarkBackendError,
+)
 from provenance_kit.limits import MediaLimits
 from tests.audio.fakes import WAV, FakeTools, probe_json
 
@@ -73,6 +78,44 @@ def test_embed_and_detect():
     assert detection.bits == bits
     assert detection.decoded_bits == bits
     assert detection.bit_confidence == pytest.approx(0.8)
+
+
+def test_backend_errors_are_the_shared_type():
+    from provenance_kit import errors
+    from provenance_kit.audio import watermark
+
+    assert watermark.WatermarkBackendError is errors.WatermarkBackendError is WatermarkBackendError
+
+
+@pytest.mark.parametrize(
+    "scores",
+    [
+        AudioScores(detection_probability=0.9, bit_probabilities=(0.5,) * 10),
+        (0.9, (0.5,) * 16),
+    ],
+)
+def test_malformed_backend_scores_are_refused(scores):
+    class Broken(FakeBackend):
+        def score(self, samples, sample_rate):
+            return scores
+
+    with pytest.raises(WatermarkBackendError):
+        detect_watermark(silence(), 16000, backend=Broken())
+    with pytest.raises(WatermarkBackendError):
+        detect_watermark(silence(), 16000, backend=Broken(), alignment=AlignmentSearch())
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [np.zeros((2, 999), np.float32), np.zeros((2, 1000), np.float64), [[0.0]]],
+)
+def test_malformed_backend_output_is_refused(returned):
+    class Broken(FakeBackend):
+        def embed(self, samples, sample_rate, bits):
+            return returned
+
+    with pytest.raises(WatermarkBackendError, match="shape"):
+        embed_watermark(silence(), 16000, "0" * 16, backend=Broken())
 
 
 def test_low_probability_is_not_found():
@@ -404,6 +447,7 @@ def test_audioseal_backend_reports_missing_packages(monkeypatch):
         {"chunk_seconds": 0.5},
         {"frame_threshold": 2.0},
         {"device": "gpu"},
+        {"download_timeout_seconds": -1.0},
     ],
 )
 def test_audioseal_backend_validates_arguments_before_loading(kwargs, monkeypatch):
@@ -460,10 +504,26 @@ def test_download_audioseal_models_fetches_both_pinned_files(tmp_path, monkeypat
         return tuple(directory / spec.name for spec in specs)
 
     monkeypatch.setattr(_audioseal, "ensure_model_files", ensure)
-    generator, detector = download_audioseal_models(tmp_path, timeout_seconds=9)
-    assert generator == tmp_path.resolve() / AUDIOSEAL_GENERATOR.name
-    assert detector == tmp_path.resolve() / AUDIOSEAL_DETECTOR.name
+    directory = download_audioseal_models(tmp_path, timeout_seconds=9)
+    assert directory == tmp_path.resolve()  # the directory, like the other backends
     assert calls == [((AUDIOSEAL_GENERATOR, AUDIOSEAL_DETECTOR), tmp_path.resolve(), 9)]
+    download_audioseal_models(tmp_path)
+    assert calls[-1][2] == modelfiles.DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+
+
+def test_backend_passes_the_download_timeout(tmp_path, monkeypatch):
+    seen = []
+
+    def find(spec, **kwargs):
+        seen.append(kwargs)
+        return tmp_path / spec.name
+
+    monkeypatch.setattr(_audioseal, "import_optional", fake_import)
+    monkeypatch.setattr(_audioseal, "find_model_file", find)
+    with pytest.raises(ModelLoadError):  # stops at building the fake models
+        AudioSealBackend(model_dir=tmp_path, download=True, download_timeout_seconds=7)
+    assert [call["timeout_seconds"] for call in seen] == [7, 7]
+    assert [call["download"] for call in seen] == [True, True]
 
 
 def test_model_dir_inside_site_packages_is_refused(monkeypatch):

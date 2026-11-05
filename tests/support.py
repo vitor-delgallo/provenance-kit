@@ -129,10 +129,20 @@ def assert_imports_lightly(
 
 
 def require_module(name: str, *, extra: str) -> ModuleType:
-    """Imports an optional module or skips the test with a clear reason."""
+    """Imports an optional module or skips the test with a clear reason.
+
+    Only a missing ``name`` (or a missing parent package of it) skips. Every
+    other import failure propagates and fails the test: a missing transitive
+    dependency, a broken native library, or an error inside the module, and
+    above all a broken ``provenance_kit`` import, which must never be
+    mistaken for "extra not installed".
+    """
+    if name == "provenance_kit" or name.startswith("provenance_kit."):
+        raise ValueError("provenance_kit modules are not optional: import them directly")
     try:
         return importlib.import_module(name)
-    except ImportError:
-        pytest.skip(f'needs {name}: pip install "provenance-kit[{extra}]"')
-    except Exception as exc:  # a broken native library is also "unavailable"
-        pytest.skip(f"{name} failed to import ({type(exc).__name__}); reinstall the {extra} extra")
+    except ModuleNotFoundError as exc:
+        missing = exc.name or ""
+        if missing and (name == missing or name.startswith(missing + ".")):
+            pytest.skip(f'needs {name}: pip install "provenance-kit[{extra}]"')
+        raise

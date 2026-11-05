@@ -26,7 +26,7 @@ from provenance_kit.video.watermark import (
     RepetitionCode,
     VideoSealBackend,
     detect_watermark,
-    download_videoseal_model,
+    download_videoseal_models,
     embed_verified,
     embed_watermark,
 )
@@ -55,7 +55,7 @@ def ensure_model(request: pytest.FixtureRequest) -> None:
         pytest.skip(
             f"the VideoSeal model is not in {MODEL_DIR}: run with --run-network to download it"
         )
-    download_videoseal_model(MODEL_DIR)
+    download_videoseal_models(MODEL_DIR)
 
 
 @pytest.fixture(scope="module")
@@ -89,8 +89,8 @@ def payload() -> str:
 @pytest.mark.network
 def test_download_verifies_the_pinned_model():
     require_module("torch", extra="video-watermark")
-    path = download_videoseal_model(MODEL_DIR)
-    assert path.stat().st_size == VIDEOSEAL_MODEL.size
+    directory = download_videoseal_models(MODEL_DIR)
+    assert (directory / VIDEOSEAL_MODEL.name).stat().st_size == VIDEOSEAL_MODEL.size
 
 
 def test_the_default_strength_and_the_upstream_one(backends):

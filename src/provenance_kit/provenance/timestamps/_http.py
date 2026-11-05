@@ -5,7 +5,12 @@ Only the standard library is used (``http.client``). What it enforces:
 * ``https`` only, unless the caller explicitly allows ``http`` (tests);
 * a deadline for the whole exchange (connect, headers and body). Socket
   timeouts bound each read; a watchdog shuts the socket down at the deadline,
-  so a server that trickles bytes cannot hold the call longer;
+  so a server that trickles bytes cannot hold the call longer. Once the
+  watchdog has fired the exchange is a timeout, whatever the read returned:
+  on Linux a read blocked on a socket that is shut down returns end of file
+  instead of raising, which must not pass for a complete body;
+* a body shorter than its ``Content-Length`` is refused (``http.client``'s
+  ``read1`` reports such an early end of file as an empty read);
 * a response size cap, checked against ``Content-Length`` and while reading;
 * redirects only to the same scheme, host and port, at most a few hops;
 * no proxies, cookies or credentials. Environment proxy variables are
@@ -35,7 +40,8 @@ class HttpFailure(Exception):
 
     Attributes:
         reason: For example ``"timeout"``, ``"http status 500"``,
-            ``"response too large"`` or ``"redirect refused"``.
+            ``"response too large"``, ``"truncated response"`` or
+            ``"redirect refused"``.
     """
 
     def __init__(self, reason: str) -> None:
@@ -172,7 +178,8 @@ def _exchange(
         connection = http.client.HTTPConnection(host, port, timeout=remaining)
     # The watchdog covers the TLS handshake too: it shuts down whatever socket
     # the connection holds when the deadline passes.
-    watchdog = threading.Timer(max(0.0, remaining), _abort, (connection,))
+    fired = threading.Event()
+    watchdog = threading.Timer(max(0.0, remaining), _abort, (connection, fired))
     watchdog.daemon = True
     try:
         watchdog.start()
@@ -189,6 +196,10 @@ def _exchange(
         ):
             raise HttpFailure("response too large")
         payload = _read_capped(response, deadline, max_response_bytes)
+        if fired.is_set():  # the deadline passed: the body may have been cut short
+            raise HttpFailure("timeout")
+        if response.length:  # bytes still declared, but the connection ended
+            raise HttpFailure("truncated response")
         return response.status, location, payload
     except HttpFailure:
         raise
@@ -197,7 +208,7 @@ def _exchange(
     except ssl.SSLError:
         raise HttpFailure("tls error") from None
     except (OSError, http.client.HTTPException, ValueError):
-        if time.monotonic() >= deadline:
+        if fired.is_set() or time.monotonic() >= deadline:
             raise HttpFailure("timeout") from None
         raise HttpFailure("connection failed") from None
     finally:
@@ -220,8 +231,9 @@ def _read_capped(response: http.client.HTTPResponse, deadline: float, cap: int) 
         chunks.append(chunk)
 
 
-def _abort(connection: http.client.HTTPConnection) -> None:
+def _abort(connection: http.client.HTTPConnection, fired: threading.Event) -> None:
     """Shuts the socket down so that a blocked read returns (watchdog)."""
+    fired.set()
     sock = connection.sock
     if sock is None:
         return

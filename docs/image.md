@@ -210,17 +210,33 @@ from provenance_kit.image.watermark import (
 )
 
 # Deployment time (network, once): pinned, verified, atomic.
-download_trustmark_models("Q", model_dir="/srv/models/trustmark")
+download_trustmark_models("/srv/models/trustmark", variant="Q")
 
 # Worker (offline):
 marker = ImageWatermarker(TrustMarkBackend(model_dir="/srv/models/trustmark"))
-result = marker.embed_verified(image, identifier=123_456, encode=to_webp_q80)
+result = marker.embed_verified(image, identifier=123_456, encoder=to_webp_q80)
 if not result.verified:
     ...  # publish result.encoded anyway and flag the asset
 detection = marker.detect_encoded(published_bytes)
 if detection.found and detection.payload.valid:
     detection.payload.identifier
 ```
+
+**Shape of the API, compared with video and audio.** The video and audio
+watermark modules expose module functions (`embed_watermark`,
+`detect_watermark`, `embed_verified`) over raw payload **bits**, because
+their payload layout is chosen per call (a repetition code, a codec). The
+image module is a class instead, on purpose: TrustMark's capacity is fixed
+by the backend's BCH mode, so `ImageWatermarker` binds the backend, a
+`PayloadCodec` and the limits once, and its methods take **integer
+identifiers** (`embed_bits` takes raw bits). What is the same in all three:
+the encoder callable of `embed_verified` is passed as `encoder=`, the model
+files are fetched by `download_<backend>_models(model_dir, *,
+timeout_seconds=...)`, and a model that fails while it runs, or a backend
+that returns malformed output (a payload of the wrong length, an image of
+another size), raises `provenance_kit.errors.WatermarkBackendError`
+(re-exported by `image.watermark`). `ModelLoadError` is reserved for model
+files that cannot be downloaded, verified or loaded.
 
 ### Capacity
 
@@ -248,8 +264,19 @@ identifier bits with `BCH_5`).
   the variable, `provenance-kit/models/trustmark` in the per-user cache
   directory (the convention of `provenance_kit.modelfiles`, shared by every
   model-backed backend), and is refused if it is inside `site-packages`.
-* The constructor never downloads (unless `download=True`); missing or altered
-  files raise `ModelLoadError` naming the file, not the path.
+* The constructor never downloads (unless `download=True`, with
+  `download_timeout_seconds` as the per-read network timeout, 60 s by
+  default like the other backends); missing or altered files raise
+  `ModelLoadError` naming the file, not the path.
+  `download_trustmark_models(model_dir, *, variant=..., timeout_seconds=...)`
+  returns the directory, like `download_videoseal_models` and
+  `download_audioseal_models`.
+* Unlike VideoSeal and AudioSeal, there is no single-file `model_path` /
+  `sha256` override: a variant is three files that must belong together (the
+  configuration describes the encoder and decoder that the two checkpoints
+  fill, and names the Python classes to build), so only the pinned set is
+  accepted. To load them from elsewhere, put the three files in one directory
+  and pass it as `model_dir`.
 * Files are read once, hashed, and the models are built from those bytes in
   memory; checkpoints load with `torch.load(weights_only=True)`; config files
   may only name classes in the `trustmark` package and the two decoder

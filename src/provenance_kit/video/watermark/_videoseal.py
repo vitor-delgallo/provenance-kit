@@ -22,8 +22,9 @@ from provenance_kit._optional import import_optional
 from provenance_kit._typing import StrPath
 from provenance_kit.bits import normalize_bits
 from provenance_kit.device import parse_device, resolve_device
-from provenance_kit.errors import ModelLoadError, UnsupportedMediaError
+from provenance_kit.errors import ModelLoadError, WatermarkBackendError
 from provenance_kit.modelfiles import (
+    DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     ModelFile,
     ensure_model_files,
     find_model_file,
@@ -43,7 +44,7 @@ __all__ = [
     "VIDEOSEAL_MODEL",
     "VIDEOSEAL_PAYLOAD_BITS",
     "VideoSealBackend",
-    "download_videoseal_model",
+    "download_videoseal_models",
 ]
 
 _log = get_logger(__name__)
@@ -74,35 +75,42 @@ _BACKEND = "videoseal"
 _JIT_WARNING = r".*torch\.jit\.load.* is deprecated"
 
 
-def download_videoseal_model(
+def download_videoseal_models(
     model_dir: StrPath | None = None,
     *,
-    timeout_seconds: float = 60.0,
+    timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
 ) -> Path:
-    """Downloads and verifies the VideoSeal model (explicit, opt-in).
+    """Downloads and verifies the VideoSeal model file (explicit, opt-in).
 
     Does nothing but verify when a valid file is already present; a missing
     or invalid file is fetched from the official URL
-    (:func:`provenance_kit.modelfiles.ensure_model_files`).
+    (:func:`provenance_kit.modelfiles.ensure_model_files`). Same signature
+    and return value as ``download_trustmark_models`` and
+    ``download_audioseal_models``.
 
     Args:
         model_dir: Target directory. Defaults to
             :func:`provenance_kit.modelfiles.default_model_dir` for
             ``"videoseal"`` (``$PROVENANCE_KIT_MODEL_DIR/videoseal`` or the
-            per-user cache).
-        timeout_seconds: The network timeout of each read.
+            per-user cache). Created if needed.
+        timeout_seconds: The network timeout of each read (default
+            :data:`~provenance_kit.modelfiles.DEFAULT_DOWNLOAD_TIMEOUT_SECONDS`).
 
     Returns:
-        The path of the verified model file.
+        The model directory (absolute), holding the verified
+        ``y_256b_img.jit``.
 
     Raises:
+        TypeError: If ``model_dir`` is not a path or ``timeout_seconds`` is
+            not a number.
         ValueError: If the directory is inside ``site-packages`` or the
             timeout is not positive.
         ModelLoadError: If the download fails or the file fails its SHA-256
             check.
     """
     directory = model_directory(model_dir, _BACKEND)
-    return ensure_model_files([VIDEOSEAL_MODEL], directory, timeout_seconds=timeout_seconds)[0]
+    ensure_model_files([VIDEOSEAL_MODEL], directory, timeout_seconds=timeout_seconds)
+    return directory
 
 
 class VideoSealBackend:
@@ -124,6 +132,11 @@ class VideoSealBackend:
     with an internal lock (iterators interleave between batches). The
     strength and step size are fixed at construction.
 
+    Model location: the same options as the TrustMark and AudioSeal backends
+    (``model_dir``, ``download``, ``download_timeout_seconds``), plus a
+    single-file override (``model_path`` and ``sha256``) for weights kept
+    elsewhere or converted by the application.
+
     Args:
         model_path: An explicit model file, verified against ``sha256``.
         model_dir: The directory holding ``y_256b_img.jit``. Defaults to
@@ -132,7 +145,9 @@ class VideoSealBackend:
             inside ``site-packages``.
         download: Download the model from the official URL if it is missing.
             Off by default: the backend never touches the network unless
-            asked.
+            asked. Not combinable with ``model_path``.
+        download_timeout_seconds: The network timeout of each read during
+            that download.
         sha256: The expected model digest; defaults to the pinned one.
         device: ``"cpu"`` (default), ``"cuda"``, ``"cuda:<n>"`` or ``"auto"``.
         strength: The blending factor of the watermark (the model's
@@ -162,6 +177,7 @@ class VideoSealBackend:
         model_path: StrPath | None = None,
         model_dir: StrPath | None = None,
         download: bool = False,
+        download_timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
         sha256: str | None = None,
         device: str = "cpu",
         strength: float | None = VIDEOSEAL_DEFAULT_STRENGTH,
@@ -170,6 +186,12 @@ class VideoSealBackend:
     ) -> None:
         """Loads and verifies the model (see the class docstring)."""
         parse_device(device)
+        check_number(
+            "download_timeout_seconds",
+            download_timeout_seconds,
+            minimum=0.0,
+            exclusive_minimum=True,
+        )
         if strength is not None:
             check_number("strength", strength, minimum=0.0, maximum=4.0, exclusive_minimum=True)
         if step_size is not None:
@@ -187,6 +209,7 @@ class VideoSealBackend:
             model_path=model_path,
             sha256=sha256,
             download=download,
+            timeout_seconds=download_timeout_seconds,
         )
         try:
             with warnings.catch_warnings():
@@ -249,7 +272,8 @@ class VideoSealBackend:
             TypeError: If a frame is not a NumPy array (on iteration).
             ValueError: If ``bits`` or a frame is malformed (on iteration for
                 frames).
-            UnsupportedMediaError: If the model cannot process the frames.
+            WatermarkBackendError: If the model fails on the frames (on
+                iteration).
         """
         channel = normalize_bits(bits, length=VIDEOSEAL_PAYLOAD_BITS)
         message = [float(c == "1") for c in channel]
@@ -268,7 +292,8 @@ class VideoSealBackend:
         Raises:
             TypeError: If a frame is not a NumPy array (on iteration).
             ValueError: If a frame is malformed (on iteration).
-            UnsupportedMediaError: If the model cannot process the frames.
+            WatermarkBackendError: If the model fails on the frames or
+                returns an unexpected output shape (on iteration).
         """
         return self._score(frames)
 
@@ -315,8 +340,14 @@ class VideoSealBackend:
                         .cpu()
                         .numpy()
                     )
-            except RuntimeError as exc:
-                raise UnsupportedMediaError("VideoSeal could not process these frames") from exc
+            except MemoryError:
+                raise
+            except Exception as exc:
+                raise WatermarkBackendError("VideoSeal embedding failed") from exc
+            if out.shape != stacked.shape:
+                raise WatermarkBackendError(
+                    "the VideoSeal model returned an unexpected output shape"
+                )
             yield from out
 
     def _score(self, frames: Iterable[Frame]) -> Iterator[npt.NDArray[np.float32]]:
@@ -329,10 +360,14 @@ class VideoSealBackend:
                     x = x.permute(0, 3, 1, 2).float().div_(255.0)
                     preds = self._model.detect(x, is_video=True)
                     scores = preds[:, 1:].float().cpu().numpy()
-            except RuntimeError as exc:
-                raise UnsupportedMediaError("VideoSeal could not process these frames") from exc
+            except MemoryError:
+                raise
+            except Exception as exc:
+                raise WatermarkBackendError("VideoSeal detection failed") from exc
             if scores.shape != (len(batch), VIDEOSEAL_PAYLOAD_BITS):
-                raise ModelLoadError("the VideoSeal model returned an unexpected output shape")
+                raise WatermarkBackendError(
+                    "the VideoSeal model returned an unexpected output shape"
+                )
             yield from scores.astype(np.float32, copy=False)
 
 

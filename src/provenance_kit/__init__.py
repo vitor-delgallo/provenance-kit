@@ -33,6 +33,7 @@ from provenance_kit.errors import (
     PayloadError,
     ProvenanceKitError,
     UnsupportedMediaError,
+    WatermarkBackendError,
 )
 from provenance_kit.limits import MediaLimits
 from provenance_kit.payload import DecodedPayload, PayloadCodec
@@ -53,5 +54,6 @@ __all__ = [
     "PayloadError",
     "ProvenanceKitError",
     "UnsupportedMediaError",
+    "WatermarkBackendError",
     "__version__",
 ]

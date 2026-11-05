@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -35,9 +36,10 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      # Core and dev tools only: the unit tests use fakes, and the heavy
-      # optional dependencies are exercised by integration tests, which CI
-      # does not run.
+      # Core and dev tools only: the unit tests use fakes for every backend.
+      # mypy runs here, without the optional packages; pyproject.toml tells it
+      # to ignore their missing imports (the full environment type-checks
+      # against them).
       - name: Install
         run: |
           python -m pip install --upgrade pip
@@ -54,3 +56,76 @@ jobs:
 
       - name: Unit tests
         run: pytest -m "not integration and not network"
+
+  # Integration tests against the real binaries and the light extras, on
+  # Linux. They need no network beyond the installs below: tests marked
+  # `network` skip without --run-network, and the watermark tests skip with
+  # a reason because the model weights (about 390 MB) and PyTorch are not
+  # installed here; run those locally (docs/DEVELOPMENT.md).
+  integration:
+    name: integration / ubuntu-latest / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    env:
+      # FFmpeg: BtbN's LGPL static build of the 8.1 branch (the branch the
+      # Windows reference binaries come from), verified against the
+      # checksums.sha256 published in the same release. "latest" moves daily;
+      # BtbN deletes dated releases after a while, so a dated URL would break.
+      FFMPEG_RELEASE: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
+      FFMPEG_ARCHIVE: ffmpeg-n8.1-latest-linux64-lgpl-8.1.tar.xz
+      # fpcalc: the Chromaprint 1.6.2 release asset, pinned by SHA-256 (the
+      # digest GitHub reports for the asset; same release as on Windows).
+      FPCALC_URL: https://github.com/acoustid/chromaprint/releases/download/v1.6.2/chromaprint-fpcalc-1.6.2-linux-x86_64.tar.gz
+      FPCALC_SHA256: c968ad4a0821592a79b158fb2e1f46cbe0a22a0a1dbc0743c67d68e75d15d2bb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # Outside the checkout, so the working tree stays clean; the tests find
+      # the binaries through the PROVENANCE_KIT_* variables.
+      - name: Fetch ffmpeg, ffprobe and fpcalc
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/tools"
+          mkdir -p "$dest/download"
+          cd "$dest/download"
+          curl -fsSL --retry 3 -o "$FFMPEG_ARCHIVE" "$FFMPEG_RELEASE/$FFMPEG_ARCHIVE"
+          curl -fsSL --retry 3 -o checksums.sha256 "$FFMPEG_RELEASE/checksums.sha256"
+          awk -v name="$FFMPEG_ARCHIVE" '$2 == name' checksums.sha256 > ffmpeg.sha256
+          sha256sum --check --strict ffmpeg.sha256  # fails if the line is missing
+          curl -fsSL --retry 3 -o fpcalc.tar.gz "$FPCALC_URL"
+          echo "$FPCALC_SHA256  fpcalc.tar.gz" | sha256sum --check --strict -
+          tar -xJf "$FFMPEG_ARCHIVE" -C "$dest"
+          tar -xzf fpcalc.tar.gz -C "$dest"
+          ffmpeg_bin="$dest/${FFMPEG_ARCHIVE%.tar.xz}/bin"
+          fpcalc_dir="$dest/${FPCALC_URL##*/}"
+          fpcalc_dir="${fpcalc_dir%.tar.gz}"
+          {
+            echo "PROVENANCE_KIT_FFMPEG=$ffmpeg_bin/ffmpeg"
+            echo "PROVENANCE_KIT_FFPROBE=$ffmpeg_bin/ffprobe"
+            echo "PROVENANCE_KIT_FPCALC=$fpcalc_dir/fpcalc"
+          } >> "$GITHUB_ENV"
+          "$ffmpeg_bin/ffmpeg" -hide_banner -version | sed -n 1p
+          "$fpcalc_dir/fpcalc" -version
+
+      # Every extra that needs neither PyTorch nor model weights. c2pa-python
+      # resolves to 0.38.1 here (docs/THIRD_PARTY.md).
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[image-hash,video,audio,c2pa,timestamps,dev]"
+          python -m pip list --format=freeze | grep -i -E "^(c2pa-python|cryptography|imagehash|opentimestamps)=="
+
+      - name: Integration tests
+        run: pytest -m integration

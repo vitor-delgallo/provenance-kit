@@ -65,7 +65,7 @@ _log = get_logger(__name__)
 MAX_STREAMS = 64
 
 #: The containers the video modules accept (detected from the bytes).
-VIDEO_CONTAINERS: frozenset[MediaType] = frozenset(
+_VIDEO_CONTAINERS: frozenset[MediaType] = frozenset(
     {
         MediaType.MP4,
         MediaType.QUICKTIME,
@@ -208,14 +208,14 @@ def probe_video(
     """
     limits = MediaLimits() if limits is None else limits
     tools = ExternalTools.from_env() if tools is None else tools
-    media_type = check_media_input(data, limits, VIDEO_CONTAINERS)
+    media_type = check_media_input(data, limits, _VIDEO_CONTAINERS)
     with staged_input(data, media_type, temp_dir=temp_dir) as staged:
-        return probe_staged(
+        return _probe_staged(
             staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout_seconds
         )
 
 
-def probe_staged(
+def _probe_staged(
     staged: StagedInput,
     media_type: MediaType,
     *,
@@ -223,7 +223,7 @@ def probe_staged(
     limits: MediaLimits,
     timeout_seconds: float | None,
 ) -> VideoInfo:
-    """Runs ffprobe on an already staged input (internal, shared with frames).
+    """Runs ffprobe on an already staged input (internal, shared with ``video.frames``).
 
     Args:
         staged: The staged input.
@@ -244,10 +244,10 @@ def probe_staged(
         timeout_seconds=timeout,
         max_output_bytes=_MAX_PROBE_OUTPUT,
     )
-    return validate_probe_report(document, media_type, limits)
+    return _validate_probe_report(document, media_type, limits)
 
 
-def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -> VideoInfo:
+def _parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -> VideoInfo:
     """Parses and validates ffprobe's JSON report (internal; untrusted input).
 
     Args:
@@ -264,10 +264,10 @@ def parse_probe_output(raw: bytes, media_type: MediaType, limits: MediaLimits) -
         UnsupportedMediaError: If there is no video stream or too many streams.
         MediaLimitExceededError: If a declared value exceeds ``limits``.
     """
-    return validate_probe_report(load_json_object(raw, "video probe"), media_type, limits)
+    return _validate_probe_report(load_json_object(raw, "video probe"), media_type, limits)
 
 
-def validate_probe_report(
+def _validate_probe_report(
     document: Mapping[str, Any], media_type: MediaType, limits: MediaLimits
 ) -> VideoInfo:
     """Validates ffprobe's decoded report (internal; untrusted input).

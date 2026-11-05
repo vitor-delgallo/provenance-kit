@@ -8,7 +8,7 @@ checks the watermark after that real encoding.
 * :class:`VideoSealBackend` loads the official VideoSeal v1.0 TorchScript
   model (256 bits) from a pinned, SHA-256-verified file. It works offline
   from a pre-provisioned directory; downloading happens only with
-  ``download=True`` or :func:`download_videoseal_model`.
+  ``download=True`` or :func:`download_videoseal_models`.
 * :class:`RepetitionCode` repeats a shorter payload across the 256 bits and
   decodes it by soft majority vote, which also yields a calibrated detection
   p-value (decision 8).
@@ -35,6 +35,11 @@ Example::
 
 Robustness numbers measured with real codecs are in ``docs/video.md``.
 
+Errors: a model that fails while it runs, or a backend that returns
+malformed scores or frames, raises
+:class:`~provenance_kit.errors.WatermarkBackendError` (re-exported here, as
+in the image and audio watermark modules).
+
 Thread safety: :class:`VideoSealBackend` can be shared between threads (model
 calls are serialized); the functions are thread-safe given a thread-safe
 backend.
@@ -42,6 +47,7 @@ backend.
 
 from __future__ import annotations
 
+from provenance_kit.errors import WatermarkBackendError
 from provenance_kit.modelfiles import MODEL_DIR_ENV, ModelFile
 from provenance_kit.video.watermark._api import (
     DEFAULT_MAX_P_VALUE,
@@ -57,7 +63,7 @@ from provenance_kit.video.watermark._videoseal import (
     VIDEOSEAL_MODEL,
     VIDEOSEAL_PAYLOAD_BITS,
     VideoSealBackend,
-    download_videoseal_model,
+    download_videoseal_models,
 )
 from provenance_kit.video.watermark.base import (
     Frame,
@@ -82,8 +88,9 @@ __all__ = [
     "VideoSealBackend",
     "VideoWatermarkBackend",
     "VideoWatermarkDetection",
+    "WatermarkBackendError",
     "detect_watermark",
-    "download_videoseal_model",
+    "download_videoseal_models",
     "embed_verified",
     "embed_watermark",
 ]

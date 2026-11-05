@@ -174,7 +174,15 @@ def make_tls_contexts(directory: Path) -> tuple[ssl.SSLContext, ssl.SSLContext]:
             critical=False,
         )
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(_key_usage(signing=True), critical=True)
         .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        # Python 3.13's default context verifies with VERIFY_X509_STRICT,
+        # which refuses an issued certificate without an authority key ID.
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(root_key.public_key()),
+            critical=False,
+        )
         .sign(root_key, hashes.SHA256())
     )
     cert_file = directory / "server-cert.pem"

@@ -42,8 +42,9 @@ from provenance_kit.audio._resample import resample
 from provenance_kit.audio.watermark.base import AudioScores, Samples
 from provenance_kit.bits import normalize_bits
 from provenance_kit.device import parse_device, resolve_device
-from provenance_kit.errors import ModelLoadError, UnsupportedMediaError
+from provenance_kit.errors import ModelLoadError, WatermarkBackendError
 from provenance_kit.modelfiles import (
+    DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     ModelFile,
     ensure_model_files,
     find_model_file,
@@ -145,34 +146,40 @@ _UPSTREAM_WARNINGS = (
 def download_audioseal_models(
     model_dir: StrPath | None = None,
     *,
-    timeout_seconds: float = 60.0,
-) -> tuple[Path, Path]:
-    """Downloads and verifies the AudioSeal generator and detector (opt-in).
+    timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+) -> Path:
+    """Downloads and verifies the AudioSeal generator and detector (explicit, opt-in).
 
     Valid files already present are only verified; missing or invalid ones
     are fetched from the pinned Hugging Face revision
-    (:func:`provenance_kit.modelfiles.ensure_model_files`).
+    (:func:`provenance_kit.modelfiles.ensure_model_files`). Same signature
+    and return value as ``download_trustmark_models`` and
+    ``download_videoseal_models``.
 
     Args:
         model_dir: Target directory. Defaults to
             :func:`provenance_kit.modelfiles.default_model_dir` for
             ``"audioseal"`` (``$PROVENANCE_KIT_MODEL_DIR/audioseal`` or the
-            per-user cache).
-        timeout_seconds: The network timeout of each read.
+            per-user cache). Created if needed.
+        timeout_seconds: The network timeout of each read (default
+            :data:`~provenance_kit.modelfiles.DEFAULT_DOWNLOAD_TIMEOUT_SECONDS`).
 
     Returns:
-        The paths of the generator and the detector.
+        The model directory (absolute), holding the verified
+        ``generator_base.pth`` and ``detector_base.pth``.
 
     Raises:
+        TypeError: If ``model_dir`` is not a path or ``timeout_seconds`` is
+            not a number.
         ValueError: If the directory is inside ``site-packages`` or the
             timeout is not positive.
         ModelLoadError: If a download fails or a file fails its SHA-256 check.
     """
     directory = model_directory(model_dir, _BACKEND)
-    generator, detector = ensure_model_files(
+    ensure_model_files(
         (AUDIOSEAL_GENERATOR, AUDIOSEAL_DETECTOR), directory, timeout_seconds=timeout_seconds
     )
-    return generator, detector
+    return directory
 
 
 class AudioSealBackend:
@@ -208,6 +215,12 @@ class AudioSealBackend:
     is module-global in audioseal, so other threads calling audioseal
     directly at the same time also run eagerly.
 
+    Model location: the same options as the TrustMark and VideoSeal backends
+    (``model_dir``, ``download``, ``download_timeout_seconds``), plus a
+    single-file override per checkpoint (``generator_path`` /
+    ``generator_sha256`` and ``detector_path`` / ``detector_sha256``) for
+    weights kept elsewhere.
+
     Args:
         model_dir: The directory holding ``generator_base.pth`` and
             ``detector_base.pth``. Defaults to
@@ -218,7 +231,10 @@ class AudioSealBackend:
         detector_path: An explicit detector file instead.
         download: Download missing files from the pinned Hugging Face
             revision. Off by default: the backend never touches the network
-            unless asked.
+            unless asked. A checkpoint given by an explicit path is never
+            downloaded.
+        download_timeout_seconds: The network timeout of each read during
+            that download.
         generator_sha256: The expected generator digest; defaults to the
             pinned one.
         detector_sha256: The expected detector digest; defaults to the
@@ -246,6 +262,7 @@ class AudioSealBackend:
         generator_path: StrPath | None = None,
         detector_path: StrPath | None = None,
         download: bool = False,
+        download_timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
         generator_sha256: str | None = None,
         detector_sha256: str | None = None,
         device: str = "cpu",
@@ -263,6 +280,12 @@ class AudioSealBackend:
         self._frame_threshold = check_number(
             "frame_threshold", frame_threshold, minimum=0.0, maximum=1.0
         )
+        check_number(
+            "download_timeout_seconds",
+            download_timeout_seconds,
+            minimum=0.0,
+            exclusive_minimum=True,
+        )
         feature = "AudioSeal watermarking"
         torch = import_optional("torch", extra="audio-watermark", feature=feature)
         with _quiet_upstream():
@@ -277,6 +300,7 @@ class AudioSealBackend:
             model_path=generator_path,
             sha256=generator_sha256,
             download=download and generator_path is None,
+            timeout_seconds=download_timeout_seconds,
         )
         detector_file = find_model_file(
             AUDIOSEAL_DETECTOR,
@@ -285,6 +309,7 @@ class AudioSealBackend:
             model_path=detector_path,
             sha256=detector_sha256,
             download=download and detector_path is None,
+            timeout_seconds=download_timeout_seconds,
         )
         try:
             with _quiet_upstream():
@@ -348,7 +373,7 @@ class AudioSealBackend:
         Raises:
             TypeError: If ``samples`` is not a NumPy float array.
             ValueError: If the shape, rate or bits are invalid.
-            UnsupportedMediaError: If the model cannot process the signal.
+            WatermarkBackendError: If the model fails on the signal.
         """
         audio = check_samples(samples)
         rate = check_int("sample_rate", sample_rate, minimum=1)
@@ -384,7 +409,8 @@ class AudioSealBackend:
         Raises:
             TypeError: If ``samples`` is not a NumPy float array.
             ValueError: If the shape or rate is invalid.
-            UnsupportedMediaError: If the model cannot process the signal.
+            WatermarkBackendError: If the model fails on the signal or
+                returns non-finite scores.
         """
         audio = check_samples(samples)
         rate = check_int("sample_rate", sample_rate, minimum=1)
@@ -404,6 +430,8 @@ class AudioSealBackend:
             frames += count
             logit_sum += logits * count
         mean_logits = logit_sum / max(frames, 1)
+        if not np.all(np.isfinite(mean_logits)):
+            raise WatermarkBackendError("the AudioSeal detector returned non-finite scores")
         bit_probabilities = tuple(float(1.0 / (1.0 + math.exp(-v))) for v in mean_logits)
         return AudioScores(
             detection_probability=positives / max(frames, 1),
@@ -462,8 +490,10 @@ class AudioSealBackend:
         try:
             with self._lock, self._torch.inference_mode(), self._no_compile():
                 yield
-        except RuntimeError as exc:
-            raise UnsupportedMediaError("AudioSeal could not process this signal") from exc
+        except MemoryError:
+            raise
+        except Exception as exc:
+            raise WatermarkBackendError("AudioSeal could not process this signal") from exc
 
 
 def torch_logit(values: Any) -> Any:

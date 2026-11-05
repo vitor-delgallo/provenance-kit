@@ -62,8 +62,8 @@ import numpy as np
 import numpy.typing as npt
 
 from provenance_kit._checks import check_int, check_number
+from provenance_kit._ffmpeg import FFMPEG_COMMON as _FFMPEG_COMMON
 from provenance_kit._ffmpeg import (
-    FFMPEG_COMMON,
     StagedInput,
     as_media_error,
     check_media_input,
@@ -83,7 +83,7 @@ from provenance_kit.errors import (
 from provenance_kit.limits import MediaLimits
 from provenance_kit.mediatype import MediaType
 from provenance_kit.tools import ExternalTools, Tool
-from provenance_kit.video.probe import VIDEO_CONTAINERS, VideoInfo, probe_staged
+from provenance_kit.video.probe import _VIDEO_CONTAINERS, VideoInfo, _probe_staged
 
 __all__ = [
     "MAX_SAMPLING_FPS",
@@ -252,7 +252,7 @@ def iter_frames(
         check_int("max_side", max_side, minimum=1)
     limits = MediaLimits() if limits is None else limits
     tools = ExternalTools.from_env() if tools is None else tools
-    media_type = check_media_input(data, limits, VIDEO_CONTAINERS)
+    media_type = check_media_input(data, limits, _VIDEO_CONTAINERS)
     return _generate(
         data,
         media_type=media_type,
@@ -346,7 +346,7 @@ def _generate(
     timeout_seconds: float | None,
 ) -> Iterator[VideoFrame]:
     with staged_input(data, media_type, temp_dir=temp_dir) as staged:
-        info = probe_staged(
+        info = _probe_staged(
             staged, media_type, tools=tools, limits=limits, timeout_seconds=timeout_seconds
         )
         width, height = output_size(info, size=size, max_side=max_side)
@@ -437,7 +437,7 @@ def _ffmpeg_args(
         filters += ["setpts=PTS-STARTPTS", f"fps={fps!r}:round=up"]
     filters += [f"scale={width}:{height}:flags=bicubic", "format=rgb24"]
     return [
-        *FFMPEG_COMMON,
+        *_FFMPEG_COMMON,
         *staged.input_args(*before_input),
         "-map",
         f"0:{info.stream_index}",

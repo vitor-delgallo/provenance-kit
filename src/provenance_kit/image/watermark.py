@@ -24,10 +24,22 @@ caller can publish anyway and flag the asset::
         return buffer.getvalue()
 
 
-    result = marker.embed_verified(image, identifier=123_456, encode=to_webp)
+    result = marker.embed_verified(image, identifier=123_456, encoder=to_webp)
     publish(result.encoded)
     if not result.verified:
         flag_for_review(...)
+
+**Shape of the API.** The video and audio watermark modules expose module
+functions over raw payload bits (``embed_verified(frames, bits, *,
+encoder=...)``), because their payload layout depends on choices made per
+call (a repetition code, a codec). Images use a class instead: the
+TrustMark capacity is fixed by the backend's BCH mode, so
+:class:`ImageWatermarker` binds a backend, a
+:class:`~provenance_kit.payload.PayloadCodec` and limits once, and its
+methods take integer identifiers (:meth:`~ImageWatermarker.embed_bits`
+takes raw bits). The encoder callable has the same keyword, ``encoder``,
+in all three, and backend failures raise the same
+:class:`~provenance_kit.errors.WatermarkBackendError`.
 
 **Payload and false positives.** The default codec is
 ``PayloadCodec(payload_bits, version_bits=4, check_bits=8)``: for TrustMark
@@ -60,6 +72,7 @@ from PIL import Image
 
 from provenance_kit.bits import BitsLike, normalize_bits
 from provenance_kit.detection import WatermarkDetection
+from provenance_kit.errors import WatermarkBackendError
 from provenance_kit.image import _modes
 from provenance_kit.image._trustmark import (
     MODEL_BASE_URL,
@@ -70,7 +83,6 @@ from provenance_kit.image._trustmark import (
     TrustMarkDetection,
     TrustMarkEncoding,
     TrustMarkVariant,
-    WatermarkBackendError,
     default_model_dir,
     download_trustmark_models,
 )
@@ -288,7 +300,8 @@ class ImageWatermarker:
             ValueError: If the identifier, version or strength is invalid.
             PayloadError: If the identifier does not fit.
             MediaLimitExceededError: If the image exceeds the limits.
-            WatermarkBackendError: If the model fails.
+            WatermarkBackendError: If the model fails or returns malformed
+                output.
         """
         return self.embed_bits(
             image, self._codec.encode(identifier, version=version), strength=strength
@@ -303,12 +316,13 @@ class ImageWatermarker:
             TypeError: If an argument has the wrong type.
             ValueError: If the bits or the strength are invalid.
             MediaLimitExceededError: If the image exceeds the limits.
-            WatermarkBackendError: If the model fails.
+            WatermarkBackendError: If the model fails or returns something
+                other than an image of the input's size.
         """
         self._check_image(image)
         text = normalize_bits(bits, length=self.payload_bits)
         level = self._strength if strength is None else _check_strength(strength)
-        return self._backend.embed(image, text, strength=level)
+        return self._embed(image, text, level)
 
     def detect(self, image: Image.Image) -> WatermarkDetection:
         """Looks for a mark and decodes its payload.
@@ -324,7 +338,8 @@ class ImageWatermarker:
         Raises:
             TypeError: If ``image`` is not a Pillow image.
             MediaLimitExceededError: If the image exceeds the limits.
-            WatermarkBackendError: If the model fails.
+            WatermarkBackendError: If the model fails, or the backend
+                returns a payload of the wrong length.
         """
         self._check_image(image)
         detection = self._backend.extract(image)
@@ -340,7 +355,8 @@ class ImageWatermarker:
         Raises:
             TypeError: If ``data`` is not bytes-like.
             MediaError: If the bytes cannot be decoded within the limits.
-            WatermarkBackendError: If the model fails.
+            WatermarkBackendError: If the model fails or returns malformed
+                output.
         """
         return self.detect(load_image(data, limits=self._limits, mode="rgb").image)
 
@@ -349,13 +365,13 @@ class ImageWatermarker:
         image: Image.Image,
         identifier: int,
         *,
-        encode: ImageEncoder,
+        encoder: ImageEncoder,
         version: int = 0,
         strengths: Sequence[float] = DEFAULT_STRENGTHS,
     ) -> VerifiedEmbedding:
         """Embeds, encodes and reads back, escalating the strength until it survives.
 
-        For each strength in order: embed, call ``encode`` on the result,
+        For each strength in order: embed, call ``encoder`` on the result,
         decode the bytes with :func:`~provenance_kit.image.loading.load_image`
         (as untrusted media, with this watermarker's limits), detect, and
         stop at the first read-back that returns exactly the embedded bits.
@@ -363,9 +379,10 @@ class ImageWatermarker:
         Args:
             image: The image to mark.
             identifier: The identifier to embed.
-            encode: The application's encoder: watermarked image in, encoded
+            encoder: The application's encoder: watermarked image in, encoded
                 bytes out (for example WebP at quality 80). Its exceptions
-                propagate unchanged.
+                propagate unchanged. Same keyword as the video and audio
+                ``embed_verified`` functions.
             version: The payload format version.
             strengths: Strengths to try, in order (usually increasing).
 
@@ -374,17 +391,18 @@ class ImageWatermarker:
             image and bytes of the last attempt are still returned).
 
         Raises:
-            TypeError: If an argument has the wrong type or ``encode`` does
+            TypeError: If an argument has the wrong type or ``encoder`` does
                 not return bytes.
             ValueError: If the identifier, version or a strength is invalid,
                 or ``strengths`` is empty.
             PayloadError: If the identifier does not fit.
             MediaLimitExceededError: If the image exceeds the limits.
             MediaError: If the encoder's output cannot be decoded.
-            WatermarkBackendError: If the model fails.
+            WatermarkBackendError: If the model fails or returns malformed
+                output.
         """
-        if not callable(encode):
-            raise TypeError("encode must be callable")
+        if not callable(encoder):
+            raise TypeError("encoder must be callable")
         levels = _check_strengths(strengths)
         bits = self._codec.encode(identifier, version=version)
         self._check_image(image)
@@ -392,10 +410,10 @@ class ImageWatermarker:
         marked = image
         encoded = b""
         for level in levels:
-            marked = self._backend.embed(image, bits, strength=level)
-            output = encode(marked)
+            marked = self._embed(image, bits, level)
+            output = encoder(marked)
             if not isinstance(output, (bytes, bytearray, memoryview)):
-                raise TypeError("encode must return bytes")
+                raise TypeError("encoder must return bytes")
             encoded = bytes(output)
             detection = self.detect_encoded(encoded)
             recovered = detection.found and detection.bits == bits
@@ -423,6 +441,14 @@ class ImageWatermarker:
             encoded=encoded,
             attempts=tuple(attempts),
         )
+
+    def _embed(self, image: Image.Image, bits: str, strength: float) -> Image.Image:
+        marked: object = self._backend.embed(image, bits, strength=strength)
+        if not isinstance(marked, Image.Image) or marked.size != image.size:
+            raise WatermarkBackendError(
+                "the backend returned something other than an image of the input's size"
+            )
+        return marked
 
     def _check_image(self, image: Image.Image) -> None:
         candidate: object = image

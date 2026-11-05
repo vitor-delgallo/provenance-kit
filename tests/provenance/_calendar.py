@@ -14,8 +14,8 @@
 
 The ``mode`` attribute switches to a hostile behavior (no python-opentimestamps
 needed for those): ``garbage``, ``trailing``, ``oversized``,
-``oversized_chunked``, ``huge_declared``, ``slow_body``, ``slow_headers``,
-``status_500``, ``redirect_other``, ``redirect_same``, ``redirect_loop`` and
+``oversized_chunked``, ``huge_declared``, ``truncated``, ``slow_body``,
+``slow_headers``, ``status_500``, ``redirect_other``, ``redirect_same``, ``redirect_loop`` and
 ``redirect_https``.
 """
 
@@ -239,6 +239,13 @@ class MockCalendar:
             for _ in range(10):
                 handler.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
             handler.wfile.write(b"0\r\n\r\n")
+        elif mode == "truncated":
+            handler.send_response(200)
+            handler.send_header("Content-Length", "1000")
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            handler.wfile.write(b"\x00" * 10)
+            handler.close_connection = True
         elif mode == "slow_body":
             handler.send_response(200)
             handler.send_header("Content-Length", "1000")

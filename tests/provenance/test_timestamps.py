@@ -276,8 +276,17 @@ def test_oversized_responses_are_refused(mode):
             fetch(f"{server.url}/digest", method="POST", cap=10_000)
 
 
+def test_a_body_shorter_than_declared_is_refused():
+    # http.client's read1 reports the early end of file as an empty read.
+    with MockCalendar(mode="truncated") as server, pytest.raises(_http.HttpFailure, match="trunc"):
+        fetch(f"{server.url}/digest", method="POST")
+
+
 @pytest.mark.parametrize("mode", ["slow_body", "slow_headers"])
 def test_slow_servers_hit_the_total_deadline(mode):
+    # On Linux, a read blocked on a socket that the watchdog shuts down returns
+    # end of file instead of raising: it must still be a timeout, not a
+    # (truncated) response.
     with MockCalendar(mode=mode) as server:
         started = time.monotonic()
         with pytest.raises(_http.HttpFailure, match="timeout"):

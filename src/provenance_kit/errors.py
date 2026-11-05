@@ -34,6 +34,7 @@ __all__ = [
     "PayloadError",
     "ProvenanceKitError",
     "UnsupportedMediaError",
+    "WatermarkBackendError",
 ]
 
 
@@ -261,7 +262,28 @@ class ModelLoadError(ProvenanceKitError):
 
     Raised, for example, when a downloaded checkpoint fails its checksum or
     when a model file cannot be deserialized. A *missing package* is a
-    :class:`BackendUnavailableError` instead.
+    :class:`BackendUnavailableError` instead, and a model that loaded but
+    fails while it runs is a :class:`WatermarkBackendError`.
+    """
+
+
+class WatermarkBackendError(ProvenanceKitError):
+    """A watermark model failed while it ran, or returned malformed output.
+
+    Raised by the image, video and audio watermark modules and by their
+    backends (TrustMark, VideoSeal, AudioSeal) in two cases:
+
+    * the model fails during embedding or detection (for example a PyTorch
+      device or runtime error); the original exception is chained as
+      ``__cause__`` and never named in the message;
+    * a backend returns output that breaks its Protocol: a payload or score
+      vector of the wrong length or with non-finite values, or an image,
+      frame or signal of another size or type than the input.
+
+    Problems before the model runs are reported differently: weights that
+    cannot be downloaded, verified or loaded raise :class:`ModelLoadError`, a
+    missing package :class:`BackendUnavailableError`, and bad arguments
+    ``TypeError`` or ``ValueError``. ``MemoryError`` propagates unchanged.
     """
 
 

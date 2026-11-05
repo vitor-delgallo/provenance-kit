@@ -16,11 +16,11 @@ from typing import Generic, TypeVar
 
 __all__ = ["HammingMatch", "hamming_matches"]
 
-K = TypeVar("K")
+_K = TypeVar("_K")
 
 
 @dataclass(frozen=True, slots=True)
-class HammingMatch(Generic[K]):
+class HammingMatch(Generic[_K]):
     """A reference hash within the distance threshold of a query.
 
     Attributes:
@@ -29,7 +29,7 @@ class HammingMatch(Generic[K]):
         bits: The hash width in bits.
     """
 
-    key: K
+    key: _K
     distance: int
     bits: int
 
@@ -41,12 +41,12 @@ class HammingMatch(Generic[K]):
 
 def hamming_matches(
     query: int,
-    references: Iterable[tuple[K, int]],
+    references: Iterable[tuple[_K, int]],
     *,
     bits: int,
     max_distance: int,
     limit: int | None = None,
-) -> list[HammingMatch[K]]:
+) -> list[HammingMatch[_K]]:
     """Finds the references within ``max_distance`` bits of ``query``.
 
     Args:
@@ -77,7 +77,7 @@ def hamming_matches(
             raise ValueError("limit must be at least 1")
     query_value = _check_hash("query", query, bits)
 
-    found: list[tuple[int, int, K]] = []
+    found: list[tuple[int, int, _K]] = []
     for index, (key, value) in enumerate(references):
         distance = (query_value ^ _check_hash("reference hash", value, bits)).bit_count()
         if distance <= max_distance:

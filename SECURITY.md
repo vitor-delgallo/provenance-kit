@@ -32,7 +32,9 @@ manifests, and OpenTimestamps proofs or calendar responses may be crafted.
 The library defends with:
 
 * resource limits (`MediaLimits`: bytes, pixels, dimensions, duration,
-  frames, channels, sample rate, subprocess time) checked before full
+  frames, channels, sample rate, decoded audio size
+  (`max_decoded_audio_bytes`: duration x rate x channels, checked before
+  decoding and while reading), subprocess time) checked before full
   decoding, to resist decompression bombs and resource exhaustion;
 * media type detection from content, never from names or extensions;
 * external tools (ffmpeg, ffprobe, fpcalc) run without a shell, from absolute

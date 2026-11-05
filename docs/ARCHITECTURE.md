@@ -190,6 +190,8 @@ ProvenanceKitError
   ExternalToolError            a subprocess failed (attributes: tool, returncode, stderr_tail)
     ExternalToolTimeoutError   ... or timed out and was killed
   ModelLoadError               weights could not be downloaded, verified or loaded
+  WatermarkBackendError        a watermark model failed while it ran, or a backend
+                               returned malformed output (image, video and audio alike)
   PayloadError                 identifier does not fit; invalid decoded payload on require_valid()
 ```
 
@@ -203,6 +205,14 @@ Rules:
   `SigningError(ProvenanceKitError)` or `CalendarError(ProvenanceKitError)`)
   and must subclass the closest class above. Do not add classes to
   `errors.py` from a module task.
+* **Watermark backends fail the same way in every module.** Once the model
+  is loaded, a failure while it runs (a PyTorch runtime or device error,
+  caught as broad `Exception` around the model call, `MemoryError` excepted)
+  and output that breaks the backend Protocol (a payload or score vector of
+  the wrong length, non-finite scores, an image, frame or signal of another
+  size or type) raise `WatermarkBackendError`, in the domain functions and in
+  the TrustMark, VideoSeal and AudioSeal adapters alike. `ModelLoadError` is
+  only for weights that cannot be downloaded, verified or loaded.
 * **Detection does not raise when nothing is found.** It returns a result
   (`found=False`, a confidence, no payload). Lookups return empty lists.
   Validation of a C2PA manifest returns a result with a status and the
@@ -235,7 +245,13 @@ decoding pixels or samples:
 * video and audio: probe with ffprobe first and check duration, dimensions,
   frame count, channels and sample rate; then decode with explicit caps
   (`-t`, `-frames:v`) and count frames and samples while reading, because
-  headers can lie.
+  headers can lie. Decoded audio held in memory is also bounded by
+  `MediaLimits.max_decoded_audio_bytes` (duration x output rate x output
+  channels x bytes per sample, `MediaLimits.decoded_audio_bytes`): check it
+  with `limits.check_decoded_audio_bytes` from the probe before decoding,
+  and again on the running byte count while reading, because the separate
+  duration, rate and channel limits multiply to far more than any process
+  should hold.
 
 **Type from bytes, not names.** Use `mediatype.require_media_type()` on the
 leading bytes (the whole content when it may start with an ID3v2 tag: FLAC
@@ -287,7 +303,16 @@ and raise `ModelLoadError` on mismatch. Accept a caller `model_dir` so
 production can pre-provision weights and run offline; never download during
 a request unless the caller allowed it (`download=True` or an explicit
 download function; downloads are HTTPS-only, size-capped, time-limited and
-written atomically). The default directory is the same for every backend:
+written atomically). Every backend takes the same model-location options,
+`model_dir`, `download` and `download_timeout_seconds`, and has one download
+function with one signature:
+`download_<backend>_models(model_dir: StrPath | None = None, *,
+timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS) -> Path`,
+returning the directory (backend-specific choices, such as TrustMark's
+`variant`, are keyword-only). A backend whose model is a single file may add
+a `model_path` / `sha256` override; one whose files must belong together
+(TrustMark: a configuration plus two checkpoints) does not. The default
+directory is the same for every backend:
 `$PROVENANCE_KIT_MODEL_DIR/<backend>`, or `provenance-kit/models/<backend>`
 in the per-user cache directory (`%LOCALAPPDATA%` on Windows,
 `~/Library/Caches` on macOS, `$XDG_CACHE_HOME` or `~/.cache` elsewhere)
@@ -354,7 +379,10 @@ signing is offline.
 
 * **Unit tests** (the default) use fakes for every Protocol and need no heavy
   dependency, binary, model or network. They run in CI on Linux and Windows,
-  Python 3.11 and 3.13: `pytest -m "not integration and not network"`.
+  Python 3.11 and 3.13: `pytest -m "not integration and not network"`. A
+  second CI job runs `pytest -m integration` on Linux with ffmpeg, ffprobe,
+  fpcalc and the extras that need no model weights; everything else skips
+  there with its reason.
 * **Integration tests** are marked `@pytest.mark.integration` (usually
   `pytestmark = pytest.mark.integration` in a `test_<module>_integration.py`
   file). They obtain dependencies through `tests.support.require_module(...)`,
@@ -403,6 +431,15 @@ specific than the sections above, they win.
    * Decoding helpers belong to the library: `video.frames` decodes frames and
      `audio.pcm` decodes PCM through ffmpeg pipes, with `MediaLimits` checks
      (section 6).
+   * The shapes differ on purpose (revised during consolidation): video and
+     audio expose module functions over raw payload bits, because their
+     payload layout is chosen per call (a repetition code, a codec); images
+     use a class, `ImageWatermarker`, because TrustMark's capacity is fixed
+     by the backend, so the class binds a backend, a `PayloadCodec` and the
+     limits once and takes integer identifiers. The parts a caller reuses
+     across media are the same: the encoder keyword is `encoder=`, the
+     errors are those of section 5, and the download functions follow
+     section 6.
 
 3. **PDQ has two backends behind one Protocol.**
    * `pdqhash`, when it is installed (C++ reference code, fast).

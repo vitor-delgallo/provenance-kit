@@ -16,7 +16,7 @@ from provenance_kit.errors import (
 from provenance_kit.limits import MediaLimits
 from provenance_kit.mediatype import MediaType
 from provenance_kit.video.frames import FrameSampling, extract_frames, iter_frames, output_size
-from provenance_kit.video.probe import parse_probe_output
+from provenance_kit.video.probe import _parse_probe_output
 from tests.video.fakes import MP4_MDAT_FIRST, MP4_MOOV_FIRST, FakeTools, probe_json
 
 W, H = 8, 6
@@ -202,7 +202,7 @@ def _matrix(a: int, b: int, c: int, d: int) -> str:
 )
 def test_rotation_is_applied_in_the_filter_graph(side_data, filters, shape):
     report = probe_json(side_data_list=[side_data])
-    info = parse_probe_output(report, MediaType.MP4, MediaLimits())
+    info = _parse_probe_output(report, MediaType.MP4, MediaLimits())
     width, height = output_size(info)
     tools = FakeTools(ffprobe=report, ffmpeg=frames_bytes(1, width, height))
     (frame,) = run(tools)
@@ -225,7 +225,7 @@ def test_seekable_media_is_read_from_a_private_temporary_file(tmp_path):
 
 
 def test_output_size_options():
-    info = parse_probe_output(probe_json(width=1920, height=1080), MediaType.MP4, MediaLimits())
+    info = _parse_probe_output(probe_json(width=1920, height=1080), MediaType.MP4, MediaLimits())
     assert output_size(info) == (1920, 1080)
     assert output_size(info, max_side=256) == (256, 144)
     assert output_size(info, max_side=4000) == (1920, 1080)

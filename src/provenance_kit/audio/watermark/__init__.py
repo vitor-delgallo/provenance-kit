@@ -46,6 +46,11 @@ only when it is corroborated (by the check bits; without them, only to
 refine a signal already found unshifted). Robustness numbers measured with
 real codecs are in ``docs/audio.md``.
 
+Errors: a model that fails while it runs, or a backend that returns
+malformed scores or PCM, raises
+:class:`~provenance_kit.errors.WatermarkBackendError` (re-exported here, as
+in the image and video watermark modules).
+
 Thread safety: :class:`AudioSealBackend` can be shared between threads
 (model calls are serialized); the functions are thread-safe given a
 thread-safe backend.
@@ -78,6 +83,7 @@ from provenance_kit.audio.watermark.base import (
     AudioWatermarkDetection,
     Samples,
 )
+from provenance_kit.errors import WatermarkBackendError
 from provenance_kit.modelfiles import MODEL_DIR_ENV, ModelFile
 
 __all__ = [
@@ -98,6 +104,7 @@ __all__ = [
     "ModelFile",
     "Samples",
     "VerifiedAudioEmbedding",
+    "WatermarkBackendError",
     "detect_watermark",
     "download_audioseal_models",
     "embed_verified",

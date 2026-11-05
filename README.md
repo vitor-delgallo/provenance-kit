@@ -1,7 +1,7 @@
 # provenance-kit
 
 [![CI](https://github.com/vitor-delgallo/provenance-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/vitor-delgallo/provenance-kit/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT AND BSD-3-Clause](https://img.shields.io/badge/license-MIT%20AND%20BSD--3--Clause-blue.svg)](#license)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 
 Building blocks for content provenance and media tracking in Python:
@@ -15,21 +15,69 @@ built for **untrusted media**: resource limits are checked before decoding,
 types are detected from content, external tools run without a shell under
 timeouts, and errors never leak media or secrets.
 
-> **Status: pre-alpha (0.1.0).** The foundation (errors, limits, tool runner,
-> payload codec, media type detection, hash matching, model files) and the
-> capability modules below (image, video, audio, C2PA, OpenTimestamps) are
-> implemented and tested, with measured results in [docs/](docs/). The API
-> may still change before 1.0; see [CHANGELOG.md](CHANGELOG.md).
+> **Status: 0.1.0, pre-alpha.** Every module below is implemented,
+> documented and tested (unit tests with fakes; integration tests against the
+> real models, codecs and binaries) and went through an adversarial review
+> before the release. Thresholds and measured results are in [docs/](docs/).
+> The API may still change before 1.0; see [CHANGELOG.md](CHANGELOG.md).
+> Releases are published on GitHub only (see [Install](#install)).
+
+What is in it:
+
+* **Image** ([docs/image.md](docs/image.md)): safe loading of untrusted
+  images; the TrustMark invisible watermark with read-back verification
+  through the application's own encoder and strength escalation; a tiled
+  visible watermark; PDQ (built-in NumPy port, or `pdqhash`), pHash and dHash
+  with hash-list matching. Comparing two images never reports a match on an
+  unreliable PDQ hash (blank canvases, flat gradients).
+* **Video** ([docs/video.md](docs/video.md)): probing and frame extraction
+  through ffprobe/ffmpeg pipes, with mirrored and rotated display matrices
+  applied; PDQ frame-hash fingerprints matched by **segment**, so the result
+  says where the shared clip is in both videos and a shared end card alone
+  is not a match; the VideoSeal watermark with a repetition code and a
+  calibrated detection p-value.
+* **Audio** ([docs/audio.md](docs/audio.md)): PCM decoding under a decoded-size
+  limit; Chromaprint fingerprints with offset alignment that refuses matches
+  on silence and on chance agreement; the AudioSeal watermark, where
+  `verified` (found **and** the payload's check bits match) is the evidence
+  and `found` alone is not.
+* **Provenance** ([docs/provenance.md](docs/provenance.md)): C2PA manifest
+  signing with a pluggable signer (KMS or HSM keys), reading and validation;
+  OpenTimestamps proofs (stamp, upgrade, inspect, verify offline).
 
 ## Install
 
-Requires Python 3.11 or later.
+Requires Python 3.11 or later. provenance-kit is released **on GitHub only**,
+as tags (`v0.1.0` is the first); it is **not published on PyPI**, so a plain
+`pip install provenance-kit` does not install this project (and would install
+someone else's package if that name were ever registered there). Install from
+the tag, naming the extras you need:
 
 ```sh
-pip install provenance-kit                      # core: NumPy and Pillow only
-pip install "provenance-kit[image-hash,c2pa]"   # pick the capabilities you need
-pip install "provenance-kit[all]"               # every capability (not pdq-native)
+# core: NumPy and Pillow only
+pip install "provenance-kit @ git+https://github.com/vitor-delgallo/provenance-kit@v0.1.0"
+# pick the capabilities you need
+pip install "provenance-kit[image-hash,c2pa] @ git+https://github.com/vitor-delgallo/provenance-kit@v0.1.0"
+# every capability (not pdq-native)
+pip install "provenance-kit[all] @ git+https://github.com/vitor-delgallo/provenance-kit@v0.1.0"
 ```
+
+The same requirement works in a `requirements.txt` file or in the
+`dependencies` of a `pyproject.toml`:
+
+```text
+provenance-kit[image-hash,c2pa] @ git+https://github.com/vitor-delgallo/provenance-kit@v0.1.0
+```
+
+With uv, in a project or in an environment:
+
+```sh
+uv add "provenance-kit[image-hash,c2pa] @ git+https://github.com/vitor-delgallo/provenance-kit@v0.1.0"
+uv pip install "provenance-kit[image-hash,c2pa] @ git+https://github.com/vitor-delgallo/provenance-kit@v0.1.0"
+```
+
+A tag can be moved; for reproducible deployments, pin the release commit
+instead (`...provenance-kit@<commit>`).
 
 | Extra | Provides | Installs |
 |---|---|---|
@@ -44,6 +92,24 @@ pip install "provenance-kit[all]"               # every capability (not pdq-nati
 | `timestamps` | OpenTimestamps stamping, upgrading and inspection | `opentimestamps` |
 | `all` | all of the above except `pdq-native` | |
 
+**Windows: `image-watermark` and `all`.** `trustmark` 0.9.2 is published as
+a source distribution only, and its build reads its README with the locale
+encoding, which fails under the Windows default code page
+(`UnicodeDecodeError: 'charmap' codec can't decode byte 0x90`). Turn on
+Python's UTF-8 mode for the install command:
+
+```bat
+rem cmd.exe
+set PYTHONUTF8=1
+pip install "provenance-kit[all] @ git+https://github.com/vitor-delgallo/provenance-kit@v0.1.0"
+```
+
+```powershell
+# PowerShell
+$env:PYTHONUTF8 = "1"
+pip install "provenance-kit[all] @ git+https://github.com/vitor-delgallo/provenance-kit@v0.1.0"
+```
+
 For CPU-only machines, install PyTorch from the
 [PyTorch CPU index](https://download.pytorch.org/whl/cpu) first. PDQ hashes
 work with the core install (a NumPy port of Meta's reference code);
@@ -56,10 +122,15 @@ Model weights (TrustMark, VideoSeal, AudioSeal) are pinned by size and
 SHA-256 and never downloaded implicitly. Each backend reads them from its
 `model_dir` argument, by default `$PROVENANCE_KIT_MODEL_DIR/<backend>` or,
 without the variable, `provenance-kit/models/<backend>` in the per-user cache
-directory (`provenance_kit.modelfiles`).
+directory (`provenance_kit.modelfiles`). Fetch them once, at deployment time,
+with `download_trustmark_models`, `download_videoseal_models` or
+`download_audioseal_models` (same signature: `model_dir`, then the keyword
+`timeout_seconds`; each returns the directory), or construct a backend with
+`download=True`.
 
 A missing extra or binary raises `BackendUnavailableError`, whose message says
-what to install or configure.
+what to install or configure; a model that fails while it runs, in any of the
+three watermark modules, raises `WatermarkBackendError`.
 
 ## Foundation
 
@@ -109,8 +180,12 @@ thresholds and measured results.
 
 ### Image
 
-The image module is available; [docs/image.md](docs/image.md) has the
-details and the measured results.
+Safe loading, perceptual hashes with hash-list matching, and the TrustMark
+and visible watermarks. Details, thresholds and measured robustness:
+[docs/image.md](docs/image.md). The image watermark is a class
+(`ImageWatermarker`) that takes integer identifiers, where video and audio
+expose functions over payload bits; the encoder keyword (`encoder=`) and the
+error types are the same in all three.
 
 ```python
 import io
@@ -134,7 +209,7 @@ known = HashList.from_hex(partner_hex_lines, keys=partner_ids)
 matches = known.match(pdq) if pdq.is_reliable() else []  # distance <= 31
 
 # Invisible watermark: models pinned by SHA-256, downloaded only on request.
-download_trustmark_models("Q", model_dir="/srv/models/trustmark")  # once, at deploy
+download_trustmark_models("/srv/models/trustmark")  # once, at deploy (variant Q)
 marker = ImageWatermarker(TrustMarkBackend(model_dir="/srv/models/trustmark"))
 
 
@@ -144,7 +219,7 @@ def to_webp(img):
     return buffer.getvalue()
 
 
-result = marker.embed_verified(image, 123_456, encode=to_webp)  # escalates strength
+result = marker.embed_verified(image, 123_456, encoder=to_webp)  # escalates strength
 publish(result.encoded)  # verified or not
 detection = marker.detect_encoded(result.encoded)
 assert detection.found and detection.payload.valid
@@ -160,8 +235,8 @@ application has chosen (see docs/image.md).
 ### Video: frames, fingerprints, watermark
 
 Probing and frame extraction through ffprobe/ffmpeg pipes, PDQ frame-hash
-fingerprints with temporal alignment, and the VideoSeal watermark on decoded
-frames. Details, thresholds and measured robustness:
+fingerprints with temporal alignment and segment matching, and the VideoSeal
+watermark on decoded frames. Details, thresholds and measured robustness:
 [docs/video.md](docs/video.md).
 
 ```python
@@ -171,7 +246,8 @@ from provenance_kit.video.frames import iter_frames
 from provenance_kit.video.watermark import RepetitionCode, VideoSealBackend, embed_verified
 
 fp = fingerprint_video(data, tools=tools)  # PDQ per second; fp.to_bytes() to store
-match = match_fingerprints(clip_fp, fp)  # is_match, offset_seconds, matched_frames
+# is_match, offset_seconds, matched segment (query/reference start and end)
+match = match_fingerprints(clip_fp, fp)
 
 backend = VideoSealBackend(model_dir="/srv/models/videoseal")  # strength 0.5 by default
 code = RepetitionCode(copies=4)  # 64-bit payload, majority vote
@@ -190,6 +266,7 @@ PCM. Details, thresholds and measured robustness:
 [docs/audio.md](docs/audio.md).
 
 ```python
+from provenance_kit import PayloadCodec
 from provenance_kit.audio.fingerprint import compare_fingerprints, fingerprint_audio
 from provenance_kit.audio.pcm import decode_pcm
 from provenance_kit.audio.watermark import AudioSealBackend, detect_watermark
@@ -197,9 +274,11 @@ from provenance_kit.audio.watermark import AudioSealBackend, detect_watermark
 fp = fingerprint_audio(data, tools=tools)  # fp.to_bytes() to store
 match = compare_fingerprints(clip_fp, fp)  # is_match, bit_error_rate, offset_seconds
 
-audio = decode_pcm(data, tools=tools)  # float32 (channels, samples)
+audio = decode_pcm(data, tools=tools)  # float32 (channels, samples), at most 1 GiB decoded
 backend = AudioSealBackend(model_dir="/srv/models/audioseal")
-detection = detect_watermark(audio.samples, audio.sample_rate, backend=backend)
+codec = PayloadCodec(16, version_bits=0, check_bits=4)
+detection = detect_watermark(audio.samples, audio.sample_rate, backend=backend, codec=codec)
+detection.verified  # found AND the check bits match; `found` alone is not evidence
 ```
 
 ### C2PA manifests
@@ -238,7 +317,7 @@ signed = sign_asset(jpeg_bytes, "image/jpeg", spec, signer=kms_signer)
 
 report = read_manifest(untrusted_bytes, trust_anchors_pem=trust_list)
 report.state  # UNSIGNED, INVALID, VALID or TRUSTED
-report.training_mining_not_allowed  # AI training, generative training, mining, inference
+report.training_mining_not_allowed  # no standard use permitted (constrained counts as notAllowed, per CAWG)
 ```
 
 Labels, specification sources and the signature encodings are documented in
@@ -250,10 +329,11 @@ Labels, specification sources and the signature encodings are documented in
 from provenance_kit.provenance.timestamps import OpenTimestamper, sha256_file
 
 ots = OpenTimestamper()  # the official client's calendars; 2 must answer
-proof = ots.stamp(sha256_file("master.mov"))  # only a nonced commitment is sent
+digest = sha256_file("master.mov")  # keep it with the proof: verify needs it
+proof = ots.stamp(digest)  # only a nonced commitment is sent
 proof = ots.upgrade(proof)  # hours later: Bitcoin attestations
 info = ots.info(proof)  # pending calendars, block heights
-result = ots.verify(proof, digest, block_source)  # offline, with your block headers
+result = ots.verify(proof, digest, block_source)  # offline; block_source: your BitcoinBlockSource
 open("master.mov.ots", "wb").write(proof.to_bytes())  # standard .ots format
 ```
 
@@ -276,5 +356,10 @@ size caps, same-origin redirects, an allow-list for upgrades).
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Optional dependencies, models and binaries have
-their own licenses: see [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).
+MIT ([LICENSE](LICENSE)), except `src/provenance_kit/image/_pdq_numpy.py`, a
+port of Meta's ThreatExchange PDQ reference code, which keeps its
+BSD-3-Clause license ([LICENSES/ThreatExchange-BSD-3-Clause.txt](LICENSES/ThreatExchange-BSD-3-Clause.txt)
+and the notice in the file). The package's license expression is therefore
+`MIT AND BSD-3-Clause`, and both texts ship in the wheel and the source
+distribution. Optional dependencies, models and binaries have their own
+licenses: see [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).

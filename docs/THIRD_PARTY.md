@@ -1,7 +1,11 @@
 # Third-party components and licenses
 
-provenance-kit itself is MIT-licensed. Its optional backends depend on
-third-party code, model weights and binaries with their own licenses. This
+provenance-kit itself is MIT-licensed, except one ported file under
+BSD-3-Clause (the PDQ NumPy port, below), so the package declares
+`License-Expression: MIT AND BSD-3-Clause` and ships both texts (`LICENSE`
+and `LICENSES/ThreatExchange-BSD-3-Clause.txt`) in the wheel and the source
+distribution. Its optional backends depend on third-party code, model weights
+and binaries with their own licenses. This
 page records, for each one, the license of the **code** and of the **model
 weights**, where that was verified, and what to watch for in a commercial
 application.
@@ -19,11 +23,11 @@ have counsel review anything marked as a risk before you distribute a product.
 | AudioSeal (`audioseal` 0.2.1) | `audio-watermark` | MIT | MIT (since 2024-04-02) | Low; use current weights only |
 | PDQ (`pdqhash` 0.2.8) | `pdq-native` | MIT bindings + BSD-3-Clause PDQ | none | Low; no Linux wheels |
 | imagehash (`ImageHash` 4.3.2) | `image-hash` | BSD-2-Clause | none | Low |
-| PDQ NumPy port (in `provenance_kit.image`) | core install | BSD-3-Clause (Meta ThreatExchange; notice kept) | none | Low |
+| PDQ NumPy port (in `provenance_kit.image`) | core install | BSD-3-Clause (Meta ThreatExchange; notice in the file, text in `LICENSES/`) | none | Low |
 | PDQ test vectors (ThreatExchange) | tests only | BSD-3-Clause; images downloaded at test time, not redistributed | none | None |
 | Aileron Regular (Pillow's default font) | core (`image.visible`) | CC0 (embedded in Pillow; not bundled by provenance-kit) | none | Low |
 | HEIC/HEIF decoders (`pillow-heif`, `pi-heif`) | **not a dependency** | `pillow-heif` wheels **GPL-2.0**; `pi-heif` LGPL-3.0, discontinued | none | **High if bundled; see below** |
-| c2pa-python (`c2pa-python` 0.38) | `c2pa` | MIT OR Apache-2.0 | none | Low |
+| c2pa-python (`c2pa-python` 0.38.0 to 0.38.2, per platform) | `c2pa` | MIT OR Apache-2.0 | none | Low |
 | OpenTimestamps (`opentimestamps` 0.5.0) | `timestamps` | **LGPL-3.0-or-later** | none | **Medium: weak copyleft** |
 | Chromaprint `fpcalc` 1.6.2 (binary) | `audio` | MIT source, **LGPL-2.1 as a whole** | none | **Medium if you ship the binary** |
 | FFmpeg (binaries) | `video`, `audio` | **LGPL-2.1+ / LGPL-3.0+ or GPL, per build** | none | **Medium if you ship the binary; codec patents** |
@@ -122,9 +126,10 @@ them on your own servers does not trigger the distribution conditions.
   ([faustomorales/pdqhash-python](https://github.com/faustomorales/pdqhash-python)).
 * Code: the Python bindings are MIT
   ([LICENSE](https://github.com/faustomorales/pdqhash-python/blob/master/LICENSE));
-  the vendored PDQ C++ implementation is Meta's ThreatExchange code under the
-  BSD-3-Clause "BSD License for ThreatExchange software"
-  ([LICENSE](https://github.com/meta/ThreatExchange/blob/main/LICENSE)). No
+  the vendored PDQ C++ implementation is Meta's ThreatExchange code under
+  ThreatExchange's BSD-3-Clause license, titled "BSD License" / "For
+  ThreatExchange software"
+  ([LICENSE](https://github.com/facebook/ThreatExchange/blob/main/LICENSE)). No
   patent clause or PATENTS file.
 * Weights: none (PDQ is a deterministic algorithm).
 * **Packaging gap:** wheels exist for Windows and macOS (CPython 3.10 to 3.13)
@@ -157,13 +162,20 @@ them on your own servers does not trigger the distribution conditions.
 
 * `src/provenance_kit/image/_pdq_numpy.py` is a port of
   `pdq/python/pdqhashing/hasher/pdq_hasher.py` and `utils/matrix.py` from
-  [meta/ThreatExchange](https://github.com/facebook/ThreatExchange) at commit
-  `a9a36d4552875c385c4b40f2be847db2b613ed44`, under the BSD-3-Clause "BSD
-  License for ThreatExchange software"
+  [facebook/ThreatExchange](https://github.com/facebook/ThreatExchange) at commit
+  `a9a36d4552875c385c4b40f2be847db2b613ed44`, under ThreatExchange's
+  BSD-3-Clause license, titled "BSD License" / "For ThreatExchange software"
   ([LICENSE](https://github.com/facebook/ThreatExchange/blob/main/LICENSE)).
   The full notice is kept in the module docstring, as the license requires
-  for source redistribution; binary redistributions (wheels) carry it in the
-  same file. Torben's median routine in that code is marked public domain.
+  for source redistribution. For binary redistribution, the license text is
+  also shipped verbatim as `LICENSES/ThreatExchange-BSD-3-Clause.txt`
+  (copied on 2026-11-05 from
+  <https://raw.githubusercontent.com/facebook/ThreatExchange/main/LICENSE>,
+  SHA-256 `68ecc6aafbd2a205a1077f86127030898f03091b7dae9d9017325a8702d8668f`),
+  listed in `license-files`, so the wheel carries it under
+  `.dist-info/licenses/` next to the MIT `LICENSE`, and the package's
+  license expression is `MIT AND BSD-3-Clause`. Torben's median routine in
+  that code is marked public domain.
 * `tests/image/pdq_vectors.py` holds hash values only: hashes computed with
   the unmodified reference on images the tests generate, and the expected
   hashes published in ThreatExchange's `pdq_test.py`. The ThreatExchange
@@ -215,9 +227,21 @@ them on your own servers does not trigger the distribution conditions.
   under different terms". Python dependencies: `cryptography`
   (Apache-2.0 OR BSD-3-Clause), `requests` (Apache-2.0), `toml` (MIT).
 * Weights: none.
-* Notes: 0.38.1 and 0.38.2 have no Windows wheels; the resolver picks 0.38.0
-  there. Signing certificates and trust lists come from your certificate
-  authority and carry their own terms.
+* Notes: the `c2pa` extra allows `>=0.38,<0.39`, and which release a
+  resolver installs depends on the platform, because the later releases have
+  fewer files (PyPI, checked 2026-11-05):
+
+  | Release | Uploaded | Files |
+  |---|---|---|
+  | 0.38.0 | 2026-09-29 | wheels for Linux (manylinux_2_28 x86_64, aarch64), macOS and Windows (x64, arm64), and an sdist |
+  | 0.38.1 | 2026-10-22 | wheels for Linux and macOS only; no Windows wheel, no sdist |
+  | 0.38.2 | 2026-10-26 | macOS wheels only (x86_64, universal2); no sdist |
+
+  So macOS resolves 0.38.2, Linux 0.38.1 and Windows 0.38.0. The module was
+  developed and measured against 0.38.0 (Windows); the Linux CI integration
+  job installs 0.38.1 and runs the C2PA integration tests against it.
+  Signing certificates and trust lists come from your certificate authority
+  and carry their own terms.
 * `cryptography` (installed 50.0.2) is also a direct dependency of the `c2pa`
   extra, for `LocalKeySigner`: Apache-2.0 OR BSD-3-Clause, no change in risk.
 * Data the module refers to but does not ship: the C2PA soft binding
@@ -233,8 +257,15 @@ them on your own servers does not trigger the distribution conditions.
 * Code: **LGPL-3.0-or-later**
   ([LICENSE](https://github.com/opentimestamps/python-opentimestamps/blob/master/LICENSE),
   PyPI `License-Expression`). Its dependency `python-bitcoinlib` 0.12.2 is also
-  LGPL-3.0-or-later (PyPI classifier); `pycryptodomex` is BSD-2-Clause and
-  public domain.
+  LGPL-3.0-or-later (PyPI classifier). `pycryptodomex` (3.24.1 installed;
+  3.24.2 released on 2026-11-05) is public domain (the code inherited from
+  PyCrypto) and BSD-2-Clause, per the `LICENSE.rst` in its wheels. The
+  repository's current
+  [LICENSE.rst](https://github.com/Legrandin/pycryptodome/blob/master/LICENSE.rst)
+  also has a "Third-party code" section: `src/mldsa-native` and
+  `src/mlkem-native` (from the pq-code-package projects) are under
+  "Apache-2.0 OR ISC OR MIT". That section is not in the 3.24.2 wheel yet;
+  either way the terms are permissive.
 * Weights: none.
 * **Watch (weak copyleft):** importing an unmodified LGPL library from
   proprietary Python code is the use the LGPL is designed to allow. If you
@@ -275,10 +306,13 @@ them on your own servers does not trigger the distribution conditions.
 ### FFmpeg
 
 * Binaries: `ffmpeg` and `ffprobe`. FFmpeg is LGPL-2.1-or-later by default,
-  GPL-2.0-or-later when built with `--enable-gpl` (for example with x264 or
-  x265), version 3 of either license with `--enable-version3`, and not
-  redistributable with `--enable-nonfree`
-  ([FFmpeg legal page](https://ffmpeg.org/legal.html)).
+  GPL-2.0-or-later when built with `--enable-gpl` (required, for example, to
+  link libx264 or libx265), version 3 of either license with
+  `--enable-version3` (also required to combine it with the Apache-2.0 or
+  LGPL-3.0 libraries the file lists), and "unredistributable" with
+  `--enable-nonfree`, as FFmpeg's own
+  [LICENSE.md](https://github.com/FFmpeg/FFmpeg/blob/master/LICENSE.md)
+  states (checked 2026-11-05).
 * The development binaries recorded in [DEVELOPMENT.md](DEVELOPMENT.md) are
   BtbN **LGPL** builds configured with `--enable-version3`, so they are
   LGPL-3.0-or-later (the bundled `LICENSE.txt` is the LGPL v3 text). Most Linux
@@ -290,8 +324,10 @@ them on your own servers does not trigger the distribution conditions.
   with the license of that particular build; prefer an LGPL build.
 * **Watch (patents):** decoding or encoding patented formats (H.264, HEVC, AAC
   and others) can require patent licenses in some jurisdictions,
-  independently of the copyright license. The FFmpeg legal page leaves that
-  responsibility to the user.
+  independently of the copyright license. The patent FAQ of the
+  [FFmpeg legal page](https://ffmpeg.org/legal.html) says the project cannot
+  tell which algorithms are patented and that the answer depends on the
+  jurisdiction.
 
 ### PyTorch
 

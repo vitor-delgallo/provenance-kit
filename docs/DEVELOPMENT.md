@@ -79,8 +79,14 @@ release branch and record its checksum. The LGPL variant is preferred over the
 GPL one so that the binaries used for development carry the least restrictive
 license (see [THIRD_PARTY.md](THIRD_PARTY.md)).
 
-On Linux, install the distribution packages (`ffmpeg`, `libchromaprint-tools`)
-or the static builds from the same projects.
+On Linux, use the static builds from the same projects, as CI does: BtbN's
+`ffmpeg-n8.1-latest-linux64-lgpl-8.1.tar.xz` and Chromaprint's
+`chromaprint-fpcalc-1.6.2-linux-x86_64.tar.gz` (SHA-256
+`c968ad4a0821592a79b158fb2e1f46cbe0a22a0a1dbc0743c67d68e75d15d2bb`), and
+point the `PROVENANCE_KIT_*` variables at them. Distribution packages
+(`ffmpeg`, `libchromaprint-tools`) also work but are often older releases,
+and distribution FFmpeg packages are usually GPL builds
+([THIRD_PARTY.md](THIRD_PARTY.md)).
 
 ## Model files and other downloaded test data
 
@@ -102,8 +108,10 @@ repository's git-ignored `.cache/models/` (`tests.support.model_dir`):
 Missing files make the tests skip with the reason; `pytest --run-network`
 downloads them once from the pinned URLs and verifies their size and
 SHA-256. To provision them by hand, call `download_trustmark_models`,
-`download_videoseal_model` and `download_audioseal_models` with
-`model_dir=".cache/models/<backend>"`. Never commit anything under `.cache/`.
+`download_videoseal_models` and `download_audioseal_models` with
+`".cache/models/<backend>"` as `model_dir` (same signature for the three;
+TrustMark's other variants with `variant="P"` and so on). Never commit
+anything under `.cache/`.
 
 ## Checks
 
@@ -130,8 +138,19 @@ pytest                                         # everything available offline
 * Warnings are errors (`filterwarnings = error`). If a third-party library
   emits a warning you cannot avoid, filter that specific warning in the test
   with `@pytest.mark.filterwarnings("ignore:...:DeprecationWarning")`.
-* CI (`.github/workflows/ci.yml`) runs ruff, mypy and the unit tests on
-  Ubuntu and Windows with Python 3.11 and 3.13.
+* CI (`.github/workflows/ci.yml`) has two jobs. `checks` runs ruff, mypy
+  and the unit tests on Ubuntu and Windows with Python 3.11 and 3.13, in an
+  environment with the core and the dev tools only (`pip install -e
+  ".[dev]"`): mypy must pass without the optional packages too, which is why
+  `pyproject.toml` ignores their missing imports (including the typed
+  `cryptography`; when it is installed, mypy still checks against its types).
+  `integration` runs `pytest -m integration` on Ubuntu with Python 3.11 and
+  3.13, with ffmpeg/ffprobe (BtbN's `linux64-lgpl` build of the 8.1 branch,
+  checked against the release's `checksums.sha256`), fpcalc 1.6.2 (the
+  `linux-x86_64` release asset, pinned by SHA-256) and the extras that need
+  no model weights (`image-hash,video,audio,c2pa,timestamps`). The
+  watermark tests skip there with their reason (no PyTorch, no weights), as
+  do the `network` tests; run them locally.
 
 ## Known quirks found while setting up
 
@@ -144,8 +163,9 @@ pytest                                         # everything available offline
   `https://cai-watermark.adobe.net/`, verified with MD5 only, and prints
   progress with `print()`. Read-only or offline deployments need the files
   provisioned in advance.
-* `c2pa-python` 0.38.1 and 0.38.2 were published without Windows wheels;
-  resolvers fall back to 0.38.0 on Windows.
+* `c2pa-python` 0.38.1 has no Windows wheel and 0.38.2 has macOS wheels
+  only, neither with an sdist: resolvers install 0.38.0 on Windows, 0.38.1
+  on Linux and 0.38.2 on macOS (see [THIRD_PARTY.md](THIRD_PARTY.md)).
 * `opentimestamps` 0.5.0 (the release that hardens proof parsing) requires
   Python 3.11, which is also this project's minimum.
 * `ffmpeg -nostdin` still reads media from `-i pipe:0`. ffprobe has no

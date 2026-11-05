@@ -7,8 +7,11 @@ name = "provenance-kit"
 dynamic = ["version"]
 description = "Building blocks for content provenance and media tracking: invisible watermarks, perceptual hashes, fingerprints, C2PA manifests and OpenTimestamps proofs."
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+# provenance-kit is MIT; src/provenance_kit/image/_pdq_numpy.py is a port of
+# Meta's ThreatExchange PDQ reference code under BSD-3-Clause (notice in that
+# file, licence text in LICENSES/). Both texts ship in the wheel and the sdist.
+license = "MIT AND BSD-3-Clause"
+license-files = ["LICENSE", "LICENSES/ThreatExchange-BSD-3-Clause.txt"]
 requires-python = ">=3.11"
 authors = [{ name = "Vitor Delgallo" }]
 keywords = [
@@ -123,6 +126,7 @@ include = [
     "/CHANGELOG.md",
     "/SECURITY.md",
     "/LICENSE",
+    "/LICENSES",
     "/pyproject.toml",
 ]
 
@@ -188,7 +192,11 @@ warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 # Optional heavy dependencies ship without type information. Backends import
-# them lazily and wrap them behind typed Protocols.
+# them lazily and wrap them behind typed Protocols. cryptography is typed, but
+# it is an optional dependency too (extra "c2pa"): CI type-checks the core +
+# dev install, where it is absent. ignore_missing_imports only applies when a
+# module cannot be found, so with cryptography installed (the full
+# environment) mypy still checks every use of it against its own types.
 [[tool.mypy.overrides]]
 module = [
     "trustmark.*",
@@ -197,6 +205,7 @@ module = [
     "videoseal.*",
     "audioseal.*",
     "c2pa.*",
+    "cryptography.*",
     "opentimestamps.*",
     "torch.*",
     "torchvision.*",

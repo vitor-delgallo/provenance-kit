@@ -25,14 +25,16 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from provenance_kit._checks import check_number
 from provenance_kit._logging import get_logger
 from provenance_kit._optional import import_optional
 from provenance_kit._typing import StrPath
 from provenance_kit.detection import WatermarkDetection
 from provenance_kit.device import parse_device, resolve_device
-from provenance_kit.errors import ModelLoadError, ProvenanceKitError
+from provenance_kit.errors import ModelLoadError, WatermarkBackendError
 from provenance_kit.image import _modes
 from provenance_kit.modelfiles import (
+    DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     MODEL_DIR_ENV,
     ModelFile,
     ensure_model_files,
@@ -50,7 +52,6 @@ __all__ = [
     "TrustMarkDetection",
     "TrustMarkEncoding",
     "TrustMarkVariant",
-    "WatermarkBackendError",
     "default_model_dir",
     "download_trustmark_models",
 ]
@@ -71,16 +72,6 @@ _BACKEND = "trustmark"
 _SECRET_LEN = 100  # bits the TrustMark models carry: data + BCH + 4 schema bits
 _ECC_BITS = 96  # data + BCH; the last 4 bits name the schema
 _MAX_STRENGTH = 10.0
-
-
-class WatermarkBackendError(ProvenanceKitError):
-    """The watermark model failed while processing an image.
-
-    Raised when the model itself fails (for example a device error); the
-    original exception is chained. Bad inputs raise ``TypeError`` or
-    ``ValueError``; a missing package raises
-    :class:`~provenance_kit.errors.BackendUnavailableError`.
-    """
 
 
 class TrustMarkVariant(enum.StrEnum):
@@ -261,12 +252,12 @@ def default_model_dir() -> Path:
 
 
 def download_trustmark_models(
-    variant: TrustMarkVariant | str = TrustMarkVariant.Q,
-    *,
     model_dir: StrPath | None = None,
-    timeout_seconds: float = 120.0,
+    *,
+    variant: TrustMarkVariant | str = TrustMarkVariant.Q,
+    timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
 ) -> Path:
-    """Downloads a variant's model files into the model directory.
+    """Downloads and verifies a variant's model files (explicit, opt-in).
 
     This is the only function in the image module that uses the network.
     Files already present with the right size and SHA-256 are kept; others
@@ -274,20 +265,24 @@ def download_trustmark_models(
     :data:`MODEL_FILES` and written atomically
     (:func:`provenance_kit.modelfiles.ensure_model_files`). Run it at
     deployment time (or provision the files by hand) and construct
-    :class:`TrustMarkBackend` offline.
+    :class:`TrustMarkBackend` offline. The signature is the one of
+    ``download_videoseal_models`` and ``download_audioseal_models``, plus
+    the keyword-only ``variant``.
 
     Args:
-        variant: The variant whose files to fetch (about 65 MB for Q, P and
-            B, 40 MB for C).
         model_dir: The target directory; ``None`` uses
             :func:`default_model_dir`. Created if needed.
-        timeout_seconds: Socket timeout for each read.
+        variant: The variant whose files to fetch (about 65 MB for Q, P and
+            B, 40 MB for C).
+        timeout_seconds: The network timeout of each read (default
+            :data:`~provenance_kit.modelfiles.DEFAULT_DOWNLOAD_TIMEOUT_SECONDS`).
 
     Returns:
         The model directory (absolute).
 
     Raises:
-        TypeError: If ``timeout_seconds`` is not a number.
+        TypeError: If ``model_dir`` is not a path or ``timeout_seconds`` is
+            not a number.
         ValueError: If the variant is unknown, the directory is inside
             ``site-packages`` or the timeout is not positive.
         ModelLoadError: If a download fails or a file fails its check.
@@ -340,7 +335,7 @@ class TrustMarkBackend:
     Example::
 
         # Once, at deployment time (network):
-        download_trustmark_models("Q", model_dir="/srv/models/trustmark")
+        download_trustmark_models("/srv/models/trustmark")  # variant Q
         # In the worker (offline):
         backend = TrustMarkBackend(model_dir="/srv/models/trustmark")
 
@@ -352,6 +347,13 @@ class TrustMarkBackend:
     files may only name classes in the ``trustmark`` package. Nothing is
     downloaded unless ``download=True`` (or
     :func:`download_trustmark_models` is called).
+
+    Unlike the VideoSeal and AudioSeal backends, there is no single-file
+    ``model_path`` / ``sha256`` override: a variant is three files that must
+    belong together (the configuration describes the encoder and decoder
+    that the two checkpoints fill, and names the Python classes to build),
+    so only the pinned set is accepted. To load the files from elsewhere,
+    put the three of them in one directory and pass it as ``model_dir``.
 
     Output: ``trustmark`` prints progress with ``print()``; the backend
     gives every loaded ``trustmark`` module its own module-global ``print``
@@ -382,9 +384,11 @@ class TrustMarkBackend:
         model_dir: Where the model files are; ``None`` uses
             :func:`default_model_dir`. Never inside ``site-packages``.
         download: Fetch missing or invalid files first (network).
-        download_timeout_seconds: Socket timeout for that download.
+        download_timeout_seconds: The network timeout of each read during
+            that download.
 
     Raises:
+        TypeError: If an argument has the wrong type.
         ValueError: If an argument is invalid or ``model_dir`` is inside
             ``site-packages``.
         BackendUnavailableError: If the ``image-watermark`` extra is missing,
@@ -401,12 +405,18 @@ class TrustMarkBackend:
         device: str = "cpu",
         model_dir: StrPath | None = None,
         download: bool = False,
-        download_timeout_seconds: float = 120.0,
+        download_timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     ) -> None:
         """Loads and verifies the models (see the class docstring)."""
         self._variant = TrustMarkVariant(variant)
         self._encoding = TrustMarkEncoding(encoding)
         requested_device = parse_device(device)
+        check_number(
+            "download_timeout_seconds",
+            download_timeout_seconds,
+            minimum=0.0,
+            exclusive_minimum=True,
+        )
         directory = model_directory(model_dir, _BACKEND)
         torch = import_optional("torch", extra=_EXTRA, feature=_FEATURE)
         tm_module = import_optional("trustmark.trustmark", extra=_EXTRA, feature=_FEATURE)
@@ -418,7 +428,7 @@ class TrustMarkBackend:
 
         if download:
             download_trustmark_models(
-                self._variant, model_dir=directory, timeout_seconds=download_timeout_seconds
+                directory, variant=self._variant, timeout_seconds=download_timeout_seconds
             )
         config_spec, encoder_spec, decoder_spec = MODEL_FILES[self._variant]
         config_text = read_model_file(config_spec, directory).decode("utf-8")
@@ -521,6 +531,8 @@ class TrustMarkBackend:
             raise
         except Exception as exc:
             raise WatermarkBackendError("TrustMark embedding failed") from exc
+        if not isinstance(marked, Image.Image) or marked.size != image.size:
+            raise WatermarkBackendError("TrustMark returned an image of an unexpected size")
         result: Image.Image = marked if marked.mode == "RGB" else marked.convert("RGB")
         if _modes.has_alpha(image):
             result.putalpha(_modes.to_rgba(image).getchannel("A"))
@@ -561,10 +573,17 @@ class TrustMarkBackend:
             raise WatermarkBackendError("TrustMark extraction failed") from exc
         if not detected or schema != self._encoding.schema:
             return TrustMarkDetection(found=False)
-        expected = self._datalayer.DataLayer(
-            _SECRET_LEN, verbose=False, encoding_mode=schema
-        ).encode_binary([decoded])[0]
-        corrected = int(np.count_nonzero(raw[0][:_ECC_BITS] != expected[:_ECC_BITS].astype(bool)))
+        try:
+            expected = self._datalayer.DataLayer(
+                _SECRET_LEN, verbose=False, encoding_mode=schema
+            ).encode_binary([decoded])[0]
+            corrected = int(
+                np.count_nonzero(raw[0][:_ECC_BITS] != expected[:_ECC_BITS].astype(bool))
+            )
+        except MemoryError:
+            raise
+        except Exception as exc:
+            raise WatermarkBackendError("TrustMark returned a malformed payload") from exc
         return TrustMarkDetection(
             found=True,
             bits=str(decoded),

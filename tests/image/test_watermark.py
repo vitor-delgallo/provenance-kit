@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from provenance_kit import modelfiles
+from provenance_kit import errors, modelfiles
 from provenance_kit.detection import WatermarkDetection
 from provenance_kit.errors import (
     BackendUnavailableError,
@@ -154,12 +154,36 @@ def test_wrong_length_bits_from_a_backend_are_an_error():
         ImageWatermarker(Broken()).detect(sample())
 
 
+def test_watermark_backend_error_is_the_shared_one():
+    assert WatermarkBackendError is errors.WatermarkBackendError
+    assert issubclass(WatermarkBackendError, errors.ProvenanceKitError)
+
+
+@pytest.mark.parametrize("returned", ["not an image", Image.new("RGB", (8, 8))])
+def test_malformed_embed_output_from_a_backend_is_an_error(returned):
+    class Broken(RowBackend):
+        def embed(self, image, bits, *, strength):
+            return returned
+
+    marker = ImageWatermarker(Broken())
+    with pytest.raises(WatermarkBackendError, match="size"):
+        marker.embed(sample(), 1)
+    with pytest.raises(WatermarkBackendError, match="size"):
+        marker.embed_verified(sample(), 1, encoder=lossy_png(0))
+
+
+def test_embed_verified_takes_the_same_encoder_keyword_as_video_and_audio():
+    marker = ImageWatermarker(RowBackend())
+    with pytest.raises(TypeError):
+        marker.embed_verified(sample(), 1, encode=lossy_png(0))  # type: ignore[call-arg]
+
+
 def test_embed_verified_escalates_until_the_mark_survives():
     backend = RowBackend()
     marker = ImageWatermarker(backend)
     # Pull 25: amplitude 20*s must exceed 35, so 1.0 and 1.5 fail and 2.0 works.
     result = marker.embed_verified(
-        sample(), 42, encode=lossy_png(25), strengths=(1.0, 1.5, 2.0, 3.0)
+        sample(), 42, encoder=lossy_png(25), strengths=(1.0, 1.5, 2.0, 3.0)
     )
     assert result.verified
     assert result.strength == 2.0
@@ -178,7 +202,7 @@ def test_embed_verified_escalates_until_the_mark_survives():
 
 def test_embed_verified_reports_failure_without_raising():
     marker = ImageWatermarker(RowBackend())
-    result = marker.embed_verified(sample(), 42, encode=lossy_png(80), strengths=(0.5, 1.0))
+    result = marker.embed_verified(sample(), 42, encoder=lossy_png(80), strengths=(0.5, 1.0))
     assert not result.verified
     assert result.strength is None
     assert [a.recovered for a in result.attempts] == [False, False]
@@ -187,7 +211,7 @@ def test_embed_verified_reports_failure_without_raising():
 
 
 def test_embed_verified_with_a_lossless_encoder_needs_one_attempt():
-    result = ImageWatermarker(RowBackend()).embed_verified(sample(), 7, encode=lossy_png(0))
+    result = ImageWatermarker(RowBackend()).embed_verified(sample(), 7, encoder=lossy_png(0))
     assert result.verified
     assert result.strength == DEFAULT_STRENGTHS[0]
     assert len(result.attempts) == 1
@@ -196,7 +220,9 @@ def test_embed_verified_with_a_lossless_encoder_needs_one_attempt():
 def test_verified_embedding_repr_leaves_out_the_media():
     # Like the video and audio results: a log line must not carry the encoded
     # bytes (139 KB for a 256 x 256 JPEG) or the image.
-    result = ImageWatermarker(RowBackend()).embed_verified(sample(256, 256), 7, encode=lossy_png(0))
+    result = ImageWatermarker(RowBackend()).embed_verified(
+        sample(256, 256), 7, encoder=lossy_png(0)
+    )
     text = repr(result)
     assert len(text) < 2000
     assert "encoded=" not in text
@@ -207,29 +233,29 @@ def test_verified_embedding_repr_leaves_out_the_media():
 def test_embed_verified_argument_and_encoder_errors():
     marker = ImageWatermarker(RowBackend())
     with pytest.raises(TypeError):
-        marker.embed_verified(sample(), 1, encode="webp")  # type: ignore[arg-type]
+        marker.embed_verified(sample(), 1, encoder="webp")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="bytes"):
-        marker.embed_verified(sample(), 1, encode=lambda image: image)
+        marker.embed_verified(sample(), 1, encoder=lambda image: image)
     with pytest.raises(UnsupportedMediaError):
-        marker.embed_verified(sample(), 1, encode=lambda image: b"not an image")
+        marker.embed_verified(sample(), 1, encoder=lambda image: b"not an image")
     with pytest.raises(ValueError):
-        marker.embed_verified(sample(), 1, encode=lossy_png(0), strengths=())
+        marker.embed_verified(sample(), 1, encoder=lossy_png(0), strengths=())
     with pytest.raises(ValueError):
-        marker.embed_verified(sample(), 1, encode=lossy_png(0), strengths=(1.0, -1.0))
+        marker.embed_verified(sample(), 1, encoder=lossy_png(0), strengths=(1.0, -1.0))
     with pytest.raises(TypeError):
-        marker.embed_verified(sample(), 1, encode=lossy_png(0), strengths="1")  # type: ignore[arg-type]
+        marker.embed_verified(sample(), 1, encoder=lossy_png(0), strengths="1")  # type: ignore[arg-type]
 
     def failing(image):
         raise RuntimeError("encoder bug")
 
     with pytest.raises(RuntimeError, match="encoder bug"):
-        marker.embed_verified(sample(), 1, encode=failing)
+        marker.embed_verified(sample(), 1, encoder=failing)
 
 
 def test_embed_verified_decodes_encoder_output_with_the_limits():
     marker = ImageWatermarker(RowBackend(), limits=MediaLimits(max_bytes=100))
     with pytest.raises(MediaLimitExceededError):
-        marker.embed_verified(sample(), 1, encode=lossy_png(0))
+        marker.embed_verified(sample(), 1, encoder=lossy_png(0))
 
 
 def test_psnr():
@@ -329,7 +355,7 @@ def fake_files(monkeypatch):
 
 def test_download_writes_verified_files_once(tmp_path, fake_files):
     content, cdn = fake_files
-    directory = download_trustmark_models(model_dir=tmp_path / "models")
+    directory = download_trustmark_models(tmp_path / "models")  # model_dir is positional
     assert directory == (tmp_path / "models").resolve()
     assert sorted(p.name for p in directory.iterdir()) == sorted(content)
     assert (directory / "enc.ckpt").read_bytes() == b"encoder"
@@ -347,7 +373,9 @@ def test_download_refuses_bad_content(tmp_path, fake_files):
 
 def test_download_argument_validation(tmp_path):
     with pytest.raises(ValueError):
-        download_trustmark_models("Z", model_dir=tmp_path)
+        download_trustmark_models(tmp_path, variant="Z")
+    with pytest.raises(TypeError):
+        download_trustmark_models(tmp_path, "Q")  # type: ignore[misc]
     with pytest.raises(ValueError):
         download_trustmark_models(model_dir=tmp_path, timeout_seconds=0)
     with pytest.raises(TypeError):
@@ -394,6 +422,8 @@ def test_missing_extra_is_reported(monkeypatch, tmp_path):
         ({"encoding": "bch_9"}, ValueError),
         ({"device": "tpu"}, ValueError),
         ({"device": 0}, TypeError),
+        ({"download_timeout_seconds": 0}, ValueError),
+        ({"download_timeout_seconds": "60"}, TypeError),
     ],
 )
 def test_backend_argument_validation_happens_before_imports(kwargs, error, tmp_path):

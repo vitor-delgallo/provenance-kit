@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from provenance_kit._checks import check_int, check_number
 from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.audio.pcm import decode_pcm
@@ -15,6 +17,7 @@ from provenance_kit.audio.watermark.base import (
     Samples,
 )
 from provenance_kit.bits import hamming_distance, normalize_bits
+from provenance_kit.errors import WatermarkBackendError
 from provenance_kit.limits import MediaLimits
 from provenance_kit.payload import PayloadCodec
 from provenance_kit.tools import ExternalTools
@@ -215,11 +218,22 @@ def embed_watermark(
         ValueError: If the shape, rate or bits are invalid.
         BackendUnavailableError: If the default backend cannot run.
         ModelLoadError: If the default backend's models cannot be loaded.
+        WatermarkBackendError: If the model fails, or the backend returns
+            something other than ``float32`` PCM of the input's shape.
     """
     backend = _default_backend() if backend is None else backend
     payload = normalize_bits(bits, length=backend.payload_bits)
     check_int("sample_rate", sample_rate, minimum=1)
-    return backend.embed(samples, sample_rate, payload)
+    marked: object = backend.embed(samples, sample_rate, payload)
+    if (
+        not isinstance(marked, np.ndarray)
+        or marked.dtype != np.float32
+        or marked.shape != getattr(samples, "shape", None)
+    ):
+        raise WatermarkBackendError(
+            "the backend returned something other than float32 PCM of the input's shape"
+        )
+    return marked
 
 
 def detect_watermark(
@@ -266,6 +280,9 @@ def detect_watermark(
         ValueError: If the shape, rate, codec or threshold is invalid.
         BackendUnavailableError: If the default backend cannot run.
         ModelLoadError: If the default backend's models cannot be loaded.
+        WatermarkBackendError: If the model fails, or the backend returns
+            scores that are not :class:`AudioScores` with
+            ``backend.payload_bits`` bit probabilities.
     """
     check_number("threshold", threshold, minimum=0.0, maximum=1.0)
     check_int("sample_rate", sample_rate, minimum=1)
@@ -292,8 +309,11 @@ def _detection(
     threshold: float,
     offset: int | None,
 ) -> AudioWatermarkDetection:
+    candidate: object = scores
+    if not isinstance(candidate, AudioScores):
+        raise WatermarkBackendError("the backend returned scores that are not AudioScores")
     if len(scores.bit_probabilities) != backend.payload_bits:
-        raise ValueError("the backend returned the wrong number of bit probabilities")
+        raise WatermarkBackendError("the backend returned the wrong number of bit probabilities")
     bits = "".join("1" if p > 0.5 else "0" for p in scores.bit_probabilities)
     found = scores.detection_probability >= threshold
     payload = codec.decode(bits) if codec is not None and found else None
@@ -352,6 +372,9 @@ def _best_offset(
         if offset >= length:
             break
         scores = backend.score(samples[:, offset : offset + window], sample_rate)
+        candidate: object = scores
+        if not isinstance(candidate, AudioScores):
+            raise WatermarkBackendError("the backend returned scores that are not AudioScores")
         key = (_bit_confidence(scores.bit_probabilities), scores.detection_probability, -offset)
         if best_key is None or key > best_key:
             best_key, best_offset = key, offset
@@ -409,6 +432,8 @@ def embed_verified(
         MediaError: If the encoder's output cannot be decoded.
         BackendUnavailableError: If a backend or binary is missing.
         ModelLoadError: If the default backend's models cannot be loaded.
+        WatermarkBackendError: If the model fails or returns malformed
+            output.
         Exception: Whatever ``encoder`` raises.
     """
     if not callable(encoder):

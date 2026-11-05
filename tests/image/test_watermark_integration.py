@@ -4,7 +4,7 @@ The model files live in ``tests.support.model_dir`` (the git-ignored
 ``.cache/models/trustmark/``, or ``$PROVENANCE_KIT_MODEL_DIR/trustmark``).
 ``pytest --run-network`` downloads the Q variant there once (65 MB, verified
 by SHA-256); later runs are offline. Tests for the P and C variants
-run when their files are present (``download_trustmark_models("P", ...)``).
+run when their files are present (``download_trustmark_models(..., variant="P")``).
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def model_dir(request):
                 f"TrustMark Q model files are not in {MODEL_DIR}: run "
                 "pytest --run-network once to download them"
             )
-        download_trustmark_models("Q", model_dir=MODEL_DIR)
+        download_trustmark_models(MODEL_DIR, variant="Q")
     return MODEL_DIR
 
 
@@ -126,7 +126,7 @@ def test_unmarked_images_give_no_valid_payload(marker):
 )
 def test_verified_embedding_through_real_encoders(marker, fmt, quality):
     image = _photo_like(seed=5)
-    result = marker.embed_verified(image, 31_337, encode=_encoder(fmt, quality))
+    result = marker.embed_verified(image, 31_337, encoder=_encoder(fmt, quality))
     assert result.verified, [(a.strength, a.recovered) for a in result.attempts]
     assert result.strength in DEFAULT_STRENGTHS
     assert result.attempts[-1].psnr > 30
@@ -134,7 +134,7 @@ def test_verified_embedding_through_real_encoders(marker, fmt, quality):
 
 
 def test_tiny_images_report_failure_instead_of_raising(marker):
-    result = marker.embed_verified(_photo_like(34, 42), 5, encode=_encoder("WEBP", 80))
+    result = marker.embed_verified(_photo_like(34, 42), 5, encoder=_encoder("WEBP", 80))
     assert not result.verified
     assert result.strength is None
     assert len(result.attempts) == len(DEFAULT_STRENGTHS)
@@ -200,4 +200,4 @@ def test_other_variants_when_provisioned(model_dir, variant):
 
 @pytest.mark.network
 def test_download_is_idempotent(model_dir):
-    assert download_trustmark_models("Q", model_dir=model_dir) == model_dir.resolve()
+    assert download_trustmark_models(model_dir, variant="Q") == model_dir.resolve()

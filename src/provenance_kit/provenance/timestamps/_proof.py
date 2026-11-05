@@ -50,8 +50,8 @@ class CalendarFailure:
         url: The calendar URL (a configured one when stamping; the URI named
             by the proof when upgrading, which is untrusted).
         reason: A short category such as ``"timeout"``, ``"http status 500"``,
-            ``"response too large"``, ``"malformed response"`` or
-            ``"not in the upgrade allow-list"``.
+            ``"response too large"``, ``"truncated response"``,
+            ``"malformed response"`` or ``"not in the upgrade allow-list"``.
     """
 
     url: str

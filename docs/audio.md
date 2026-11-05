@@ -76,7 +76,7 @@ from provenance_kit.audio.fingerprint import (
 reference = fingerprint_audio(track_bytes)
 stored = reference.to_bytes()  # 4 bytes per 0.124 s + 20-byte header
 match = compare_fingerprints(fingerprint_audio(clip_bytes), AudioFingerprint.from_bytes(stored))
-match.is_match, match.bit_error_rate, match.offset_seconds
+match.is_match, match.bit_error_rate, match.bit_error_threshold, match.offset_seconds
 ```
 
 The media is decoded by ffmpeg (limits enforced) to mono 16-bit PCM at
@@ -108,10 +108,19 @@ cross-correlations of the 32 bit planes. The decision rule:
    shorter, and **never fewer than 16** (`MIN_COMPARED_ITEMS`). 16 items span
    2 s of hops: a query needs at least 4.6 s of audio to match (Chromaprint's
    first item needs 2.7 s).
-3. An eligible offset **passes** when its BER is at most `max_bit_error_rate`
-   (0.20, `DEFAULT_MAX_BIT_ERROR_RATE`), **and** below half its chance error
+3. An eligible offset **passes** when its BER is at most the threshold for
+   its overlap, `overlap_threshold(compared_items)` (reported as
+   `AudioMatch.bit_error_threshold`), **and** below half its chance error
    rate (`MAX_CHANCE_ERROR_FRACTION`, 0.5), **and** each side of the compared
-   pairs holds at least 8 distinct values (`MIN_DISTINCT_VALUES`). The chance
+   pairs holds at least 8 distinct values (`MIN_DISTINCT_VALUES`). The
+   threshold depends on the compared span (compared items x 0.124 s):
+   `max_bit_error_rate` (default 0.20, `DEFAULT_MAX_BIT_ERROR_RATE`) from
+   20 s on (`LONG_OVERLAP_SECONDS`), 0.55 x that (0.11, `SHORT_OVERLAP_FACTOR`)
+   up to 5 s (`SHORT_OVERLAP_SECONDS`), linear in between (0.155 at 12.5 s).
+   Short windows of different signals that sound alike agree by chance far
+   more often than long ones, while long genuine overlaps need the room (see
+   the tables below). In clip terms: 0.110 for 5 s clips, 0.112 for 8 s,
+   0.124 for 10 s, 0.154 for 15 s and 0.20 from about 23 s. The chance
    error rate (`AudioMatch.chance_bit_error_rate`) is the BER that two
    unrelated signals with the same bit statistics would show: the mean over
    bits of `p_q (1 - p_r) + p_r (1 - p_q)`, with `p` how often the bit is 1 on
@@ -129,27 +138,98 @@ cross-correlations of the 32 bit planes. The decision rule:
    first and the threshold decided after: a genuine 7.3 s overlap at BER
    0.015 lost to a long unrelated overlap at 0.325, so no match).
 
-**Measured robustness** (60 s synthetic test songs, 44.1 kHz stereo, fpcalc
-1.6.2, LGPL ffmpeg 8.1; `tests/audio/test_fingerprint_integration.py`, plus
-120 s renders of the same generators for the clip rows):
+**Measured genuine matches** (fpcalc 1.6.2, LGPL ffmpeg 8.1, 2026-11-05).
+16 generated pieces of 75 s, 44.1 kHz stereo: four of the suite's songs
+(`tests.audio.media.song`, k = 4 to 7), four `music` pieces (seeds 300 to
+303), four bass-heavy `melody` pieces with bass line and drums (seeds 400 to
+403) and the same with white noise at 20 dB SNR (`melody`, seeds 500 to 503,
+`noise_snr_db=20`). Each degradation was applied to two clips of each length
+at random positions per piece, and to the whole piece; the clip is
+fingerprinted on its own and searched in the clean piece. Each cell is the
+highest BER at the true offset over the 32 clips (16 whole pieces), and how
+many were missed with the default rule:
 
-| Variant | Offset found | Bit error rate | Matched |
-|---|---|---|---|
-| MP3 64 kb/s | 0 s | 0.037 to 0.052 | all |
-| AAC 32 kb/s, mono, 22.05 kHz | 0 s | 0.065 to 0.088 | all |
-| Opus 24 kb/s, trimmed 17.3 s to 37.3 s | 17.33 s | 0.045 to 0.092 | all |
-| AAC 96 kb/s, trimmed 41.5 s to 49.5 s | 41.48 s | 0.001 to 0.007 | all |
-| Volume x0.3, low-pass 4 kHz, MP3 | 0 s | 0.037 to 0.046 | all |
-| AAC clips of 5, 6 and 8 s (3 positions x 7 songs each) | within 0.25 s | 0.039 to 0.094 | 63 of 63 |
-| AAC clips of 3 to 4.5 s (3 to 15 items) | none | | 0 of 84 (below 16 items) |
-| An upload made of the reference's last 10 s, then 120 s of another song | 79.98 s | 0.025 | yes (7.3 s overlap) |
+| Degradation | 5 s | 8 s | 10 s | 15 s | 30 s | whole (75 s) |
+|---|---|---|---|---|---|---|
+| MP3 64 kb/s | 0.081 | 0.078 | 0.073 | 0.076 | 0.080 | 0.042 |
+| MP3 96 kb/s | 0.076 | 0.078 | 0.072 | 0.070 | 0.085 | 0.044 |
+| AAC 64 kb/s (ADTS) | 0.090 | 0.075 | 0.090 | 0.115 | 0.080 | 0.050 |
+| Opus 32 kb/s | 0.112 (1 missed) | 0.129 (1 missed) | 0.097 | 0.145 | 0.097 | 0.048 |
+| Opus 48 kb/s | 0.192 (2 missed) | 0.128 (1 missed) | 0.164 (2 missed) | 0.084 | 0.092 | 0.038 |
+| Resampled to 22.05 kHz | 0.086 | 0.087 | 0.085 | 0.088 | 0.083 | 0.000 |
+| Volume +6 dB | 0.076 | 0.082 | 0.083 | 0.082 | 0.085 | 0.003 |
+| Volume -6 dB | 0.081 | 0.086 | 0.090 | 0.088 | 0.083 | 0.000 |
+| Treble shelf +6 dB | 0.097 | 0.107 | 0.103 | 0.093 | 0.083 | 0.045 |
+| Treble shelf -6 dB | 0.102 | 0.090 | 0.105 | 0.090 | 0.094 | 0.038 |
+| Bass shelf +6 dB | 0.174 (14 missed) | 0.158 (11 missed) | 0.168 (10 missed) | 0.152 | 0.144 | 0.138 |
+| Bass shelf -6 dB | 0.160 (6 missed) | 0.145 (6 missed) | 0.151 (4 missed) | 0.130 | 0.137 | 0.124 |
+| Mono downmix | 0.094 | 0.082 | 0.073 | 0.088 | 0.069 | 0.000 |
+| **Threshold at that length** | 0.110 | 0.112 | 0.124 | 0.154 | 0.200 | 0.200 |
 
-Genuine matches stayed at or below 0.43 of their chance error rate (0.29 with
-5 s of overlap or more).
+Found: 393 of 416 clips of 5 s, 397 of 8 s, 400 of 10 s, all 416 of 15 s and
+30 s, all 208 whole pieces. Every miss is one of two cases:
 
-**Measured false positives** (independent recordings; "before" is the rule
-of the first implementation: z-score choice, then the threshold, minimum
-overlap shrinking to the shorter fingerprint):
+* **Bass shelving of bass-heavy music** (50 of the 96 bass-shelved 5 to 10 s
+  clips of the `melody` pieces, 1 of the other pieces): Chromaprint's chroma
+  features shift when the bass line is boosted or cut, up to 0.17 on short
+  excerpts and 0.14 even on whole pieces. Long overlaps keep the room for it
+  (0.20 from 20 s of span).
+* **Opus on the suite's synthetic chirps** (7 clips, all `song` pieces).
+
+Without the bass shelving, the highest genuine BER is 0.097 on 30 s clips and
+whole pieces. The round-1 variants still match as before: MP3 64 kb/s (BER
+0.037 to 0.052), AAC 32 kb/s mono at 22.05 kHz (0.065 to 0.088), Opus 24 kb/s
+trimmed to 20 s (0.045 to 0.092), an 8 s AAC excerpt (0.001 to 0.007),
+volume x0.3 with a 4 kHz low-pass and MP3 (0.037 to 0.046), AAC clips of 5, 6
+and 8 s (63 of 63, BER 0.039 to 0.094), and an upload made of a reference's
+last 10 s followed by another song (BER 0.025 over a 7.3 s overlap, threshold
+0.124). Clips shorter than 4.6 s never match (below 16 items). Genuine matches
+stayed at or below 0.43 of their chance error rate.
+
+**Measured false matches: signals that are alike for a few seconds.** The
+suite's `song(k)` generator renders slow glissandos whose frequency
+modulation grows with time; after about 20 s the songs sweep through similar
+ranges and a window of one song resembles windows of another. A window taken
+anywhere in one of eight 120 s songs was compared with another whole song.
+"Span" windows have the given compared span (5 s = 40 items, the definition
+the earlier tables used); "clip" windows are what a clip of that length gives
+(5 s = 19 items). The mixed row takes 5 to 30 s clip windows of any of the
+16 measured pieces and 6 `music` pieces against an unrelated one.
+
+| Windows | Rule | 5 s | 8 s | 10 s | 15 s | 20 s | 30 s | 45 s |
+|---|---|---|---|---|---|---|---|---|
+| Span, 1,000 each | flat 0.20 (before) | 36.1 % | 20.8 % | 12.0 % | 2.4 % | 0.7 % | 0.6 % | 0.0 % |
+| | **length-aware (now)** | **0.2 %** | **0.0 %** | **0.0 %** | **0.3 %** | **0.1 %** | **0.0 %** | **0.0 %** |
+| Clip, 500 each | flat 0.20 (before) | 38.8 % | 35.4 % | 24.2 % | 7.4 % | 1.8 % | 0.6 % | 0.0 % |
+| | length-aware (now) | 7.2 % | 0.2 % | 0.0 % | 0.2 % | 0.6 % | 0.0 % | 0.0 % |
+| Mixed generators, 300 each | flat 0.20 (before) | 2.3 % | 0.3 % | 1.0 % | 0.7 % | | 0.0 % | |
+| | length-aware (now) | 0.3 % | 0.0 % | 0.0 % | 0.0 % | | 0.0 % | |
+
+**Why this rule.** A single lower threshold was measured first: 0.12
+everywhere keeps 5 s span windows at 1.0 % and longer ones at 0 %, but it
+misses bass-shelved whole pieces (BER up to 0.138) and Opus clips. A step
+(0.12 below 20 s of span, 0.20 above) had to sit at 20 s, because 0.20 lets
+2.4 % of 15 s windows and 12 % of 10 s windows through, and then it missed 20
+of the 416 15 s clips. The linear rise from 5 to 20 s finds every 15 s clip
+(the tightest: bass +6 dB at 0.152 against 0.154). The short threshold is 0.11
+rather than 0.12: at 0.12 the 5 s span windows reach 1.0 % (10 of 1,000),
+at 0.11 0.2 %, for 7 more missed 5 s clips and 8 more 8 to 10 s clips (bass
+shelving and Opus). Other checks that did not separate the two populations:
+the share of errors that hit both bits of one of Chromaprint's Gray-coded
+2-bit filter outputs (up to 0.36 for genuine clips, a median of 0.16 to 0.22
+for the unrelated windows), and whether short clips err more at their edges
+(they do not).
+
+**What remains.** 5 s clips (19 compared items) of content that is alike
+over a few seconds still match another piece 7 % of the time; nothing in the
+bit error rate separates them from genuine 5 s clips, so longer queries are
+the remedy. To match short excerpts that may have been equalized, raise
+`max_bit_error_rate`: the short threshold scales with it (0.32 gives 0.176
+up to 5 s of span), at false-match rates between the two rows above.
+
+**Measured false matches: unrelated audio** (independent recordings;
+"before" is the rule of the first implementation: z-score choice, then the
+threshold, minimum overlap shrinking to the shorter fingerprint):
 
 | Unrelated pair | Before | Now | BER / chance at the reported offset |
 |---|---|---|---|
@@ -165,26 +245,6 @@ overlap shrinking to the shorter fingerprint):
 
 Stationary noise stays at 0.82 or more of its chance error rate at every
 offset, against at most 0.43 for genuine matches.
-
-**Content that is alike for a few seconds.** The suite's `song(k)` generator
-renders slow glissandos whose frequency modulation grows with time; after
-about 20 s the songs sweep through similar ranges, and windows of one song
-resemble windows of another. Comparing a window taken anywhere in a 120 s
-song with another whole song (60 windows each), the share reported as a
-match was:
-
-| Window | 5 s | 8 s | 10 s | 15 s | 20 s | 30 s, 45 s |
-|---|---|---|---|---|---|---|
-| Before | 48 % | 43 % | 27 % | 18 % | 7 % | 0 % |
-| Now (threshold 0.20) | 38 % | 23 % | 13 % | 2 % | 2 % | 0 % |
-
-With a stricter threshold (100 windows each, the new rule): 0.15 gave 10, 1,
-2, 0 and 0 % for 5, 8, 10, 15 and 20 s windows, 0.12 gave 2 % for 5 s
-windows and 0 % from 8 s, and 0.10 gave 0 %; every genuine variant above
-(BER at most 0.094) still matched at 0.10. Chromaprint cannot tell apart
-signals that sound alike over the compared span: for short queries against
-content that may be similar (covers, loops, the same instrument and key),
-pass `max_bit_error_rate=0.12` or require a longer `min_overlap_seconds`.
 
 Offsets are found to within one sub-fingerprint (0.124 s). Not handled:
 tempo or pitch changes and heavy mixing with other audio.
@@ -227,8 +287,13 @@ were recomputed after download. The streaming checkpoints added in December
 2025 are not used. `model_dir` defaults to `$PROVENANCE_KIT_MODEL_DIR/audioseal`
 or, without the variable, `provenance-kit/models/audioseal` in the per-user
 cache directory (`provenance_kit.modelfiles`), and is refused inside
-`site-packages`; nothing is downloaded unless `download=True` is passed or
-`download_audioseal_models()` is called.
+`site-packages`; nothing is downloaded unless `download=True` is passed (with
+`download_timeout_seconds`, the per-read network timeout, 60 s by default) or
+`download_audioseal_models(model_dir, *, timeout_seconds=...)` is called,
+which keeps valid files, replaces missing or invalid ones and returns the
+model directory, like the TrustMark and VideoSeal download functions.
+`generator_path` / `generator_sha256` and `detector_path` / `detector_sha256`
+point the backend at single checkpoints kept elsewhere instead.
 
 **License check.** The weights were CC-BY-NC 4.0 (`LICENSE_weights` in the
 GitHub repository) until commit `2956515` of 2024-04-02 ("Re-update of
@@ -259,6 +324,14 @@ later mono downmix keeps it. Detection mixes down and resamples the same way.
 Long signals are processed in chunks of `chunk_seconds` (10 s). The models run
 in eager mode; the backend disables the `torch.compile` path of audioseal's
 vendored modules (which would need a C++ compiler).
+
+**Errors.** A model that fails while it runs (a PyTorch runtime or device
+error) raises `provenance_kit.errors.WatermarkBackendError` (also importable
+from `provenance_kit.audio.watermark`), as do non-finite detector scores,
+scores that are not `AudioScores` with `payload_bits` bit probabilities, and
+watermarked PCM that is not `float32` of the input's shape; the image and
+video modules raise the same type. `ModelLoadError` is reserved for
+checkpoints that cannot be downloaded, verified or loaded.
 
 **Error correction and evidence.** 16 bits leave no room for error
 correction (decision 8). `found` is the detector's decision (its probability

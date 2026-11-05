@@ -9,9 +9,12 @@ Two modules under `provenance_kit.provenance`:
   digests: stamp, upgrade, inspect, verify. Extra `timestamps`.
 
 Everything here was checked on 2026-11-05 against c2pa-python 0.38.0
-(c2pa-rs 0.91.0) and python-opentimestamps 0.5.0, by reading their source and
-by the tests in `tests/provenance/`. Sources are linked where a decision
-depends on them.
+(c2pa-rs 0.91.0) on Windows and python-opentimestamps 0.5.0, by reading their
+source and by the tests in `tests/provenance/`. Sources are linked where a
+decision depends on them. The `c2pa` extra resolves to a different 0.38
+release per platform (0.38.0 on Windows, 0.38.1 on Linux, 0.38.2 on macOS;
+see the table below); the Linux CI integration job runs the same tests
+against 0.38.1, and 0.38.2 has not been run.
 
 ## C2PA manifests
 
@@ -19,7 +22,7 @@ depends on them.
 
 | Component | Version | Notes |
 |---|---|---|
-| c2pa-python | 0.38.0 | 0.38.1 and 0.38.2 have no Windows wheels ([DEVELOPMENT.md](DEVELOPMENT.md)) |
+| c2pa-python | 0.38.0 (Windows); 0.38.1 in Linux CI | 0.38.1 has Linux and macOS wheels only, 0.38.2 macOS wheels only, neither an sdist ([THIRD_PARTY.md](THIRD_PARTY.md#c2pa-python)) |
 | c2pa-rs (bundled native library) | 0.91.0 | writes claim version 2; `spec_versions.rs`: generator 2.2.0, validator 2.4.0 |
 | C2PA specification cited | [2.3](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html) (December 2025) | section numbers below refer to it |
 | CAWG assertions | [Training and Data Mining 1.1](https://cawg.io/training-and-data-mining/1.1/), [Metadata 1.1](https://cawg.io/metadata/1.1/) | both DIF ratified, 16 May 2025 |
@@ -363,7 +366,10 @@ python-opentimestamps' `RemoteCalendar`, so that every limit is enforced:
   `ssl_context` (for a private CA), otherwise the system trust store;
 * one deadline for the whole exchange: socket timeouts bound each read and a
   watchdog shuts the socket down at the deadline, so a server that trickles
-  headers or body cannot hold the call (tested);
+  headers or body cannot hold the call (tested on Windows and Linux: there a
+  read blocked on a shut-down socket returns end of file instead of raising,
+  and an exchange the watchdog cut is still a `timeout`, never a short body);
+* a body shorter than its `Content-Length` is a `truncated response` failure;
 * response size cap, checked against `Content-Length` and while reading
   (chunked responses included);
 * redirects only within the same scheme, host and port, at most 3; proxy

@@ -11,6 +11,7 @@ import numpy.typing as npt
 from provenance_kit._checks import check_number
 from provenance_kit._typing import BytesLike, StrPath
 from provenance_kit.bits import hamming_distance, normalize_bits
+from provenance_kit.errors import WatermarkBackendError
 from provenance_kit.limits import MediaLimits
 from provenance_kit.payload import DecodedPayload, PayloadCodec
 from provenance_kit.tools import ExternalTools
@@ -111,6 +112,23 @@ def _check_codec(codec: PayloadCodec | None, payload_size: int) -> None:
         )
 
 
+def _checked_frames(source: Iterable[object]) -> Iterator[Frame]:
+    """Passes the backend's watermarked frames through, refusing malformed ones."""
+    for frame in source:
+        if (
+            not isinstance(frame, np.ndarray)
+            or frame.dtype != np.uint8
+            or frame.ndim != 3
+            or frame.shape[2] != 3
+            or frame.shape[0] < 1
+            or frame.shape[1] < 1
+        ):
+            raise WatermarkBackendError(
+                "the backend returned a frame that is not a uint8 (height, width, 3) array"
+            )
+        yield frame
+
+
 def embed_watermark(
     frames: Iterable[Frame],
     bits: str,
@@ -140,10 +158,12 @@ def embed_watermark(
             does not fit the backend.
         BackendUnavailableError: If the default backend cannot run.
         ModelLoadError: If the default backend's model cannot be loaded.
+        WatermarkBackendError: If the model fails or returns a malformed
+            frame (on iteration).
     """
     backend = _default_backend() if backend is None else backend
     _, channel = _payload_and_channel(bits, backend, repetition)
-    return backend.embed_frames(frames, channel)
+    return _checked_frames(backend.embed_frames(frames, channel))
 
 
 def detect_watermark(
@@ -187,6 +207,8 @@ def detect_watermark(
             threshold is out of range.
         BackendUnavailableError: If the default backend cannot run.
         ModelLoadError: If the default backend's model cannot be loaded.
+        WatermarkBackendError: If the model fails, or the backend returns
+            scores of the wrong length or non-finite scores.
     """
     check_number("max_p_value", max_p_value, minimum=0.0, maximum=1.0, exclusive_minimum=True)
     check_number("min_mean_abs_score", min_mean_abs_score, minimum=0.0)
@@ -199,9 +221,12 @@ def detect_watermark(
     total: npt.NDArray[np.float64] | None = None
     count = 0
     for scores in backend.score_frames(frames):
-        values = np.asarray(scores, dtype=np.float64).reshape(-1)
+        try:
+            values = np.asarray(scores, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError) as exc:
+            raise WatermarkBackendError("the backend returned malformed scores") from exc
         if values.size != backend.payload_bits or not np.all(np.isfinite(values)):
-            raise ValueError("the backend returned malformed scores")
+            raise WatermarkBackendError("the backend returned malformed scores")
         total = values if total is None else total + values
         count += 1
     if total is None:
@@ -293,6 +318,8 @@ def embed_verified(
         MediaError: If the encoder's output cannot be decoded.
         BackendUnavailableError: If a backend or binary is missing.
         ModelLoadError: If the default backend's model cannot be loaded.
+        WatermarkBackendError: If the model fails or returns malformed
+            output.
         Exception: Whatever ``encoder`` raises.
     """
     if not callable(encoder):
@@ -308,7 +335,7 @@ def embed_verified(
             counter[0] += 1
             yield frame
 
-    encoded = encoder(counted(backend.embed_frames(frames, channel)))
+    encoded = encoder(counted(_checked_frames(backend.embed_frames(frames, channel))))
     if not isinstance(encoded, (bytes, bytearray, memoryview)):
         raise TypeError("the encoder must return bytes")
     encoded_bytes = bytes(encoded)

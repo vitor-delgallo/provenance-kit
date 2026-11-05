@@ -14,7 +14,7 @@ from provenance_kit.errors import (
 )
 from provenance_kit.limits import MediaLimits
 from provenance_kit.mediatype import MediaType
-from provenance_kit.video.probe import MAX_STREAMS, VideoInfo, parse_probe_output, probe_video
+from provenance_kit.video.probe import MAX_STREAMS, VideoInfo, _parse_probe_output, probe_video
 from tests.support import assert_imports_lightly
 from tests.video.fakes import MP4_MDAT_FIRST, MP4_MOOV_FIRST, WEBM, FakeTools, probe_json
 
@@ -22,7 +22,7 @@ LIMITS = MediaLimits()
 
 
 def parse(raw: bytes, limits: MediaLimits = LIMITS) -> VideoInfo:
-    return parse_probe_output(raw, MediaType.MP4, limits)
+    return _parse_probe_output(raw, MediaType.MP4, limits)
 
 
 def test_video_modules_import_lightly():

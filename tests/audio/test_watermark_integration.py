@@ -112,9 +112,9 @@ def sources(tools) -> dict[str, np.ndarray]:
 @pytest.mark.network
 def test_download_verifies_the_pinned_checkpoints():
     require_audioseal()
-    generator, detector = download_audioseal_models(MODEL_DIR)
-    assert generator.stat().st_size == AUDIOSEAL_GENERATOR.size
-    assert detector.stat().st_size == AUDIOSEAL_DETECTOR.size
+    directory = download_audioseal_models(MODEL_DIR)
+    assert (directory / AUDIOSEAL_GENERATOR.name).stat().st_size == AUDIOSEAL_GENERATOR.size
+    assert (directory / AUDIOSEAL_DETECTOR.name).stat().st_size == AUDIOSEAL_DETECTOR.size
 
 
 def test_unmarked_audio_is_not_found(backend, sources):

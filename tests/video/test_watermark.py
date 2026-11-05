@@ -8,8 +8,8 @@ import types
 import numpy as np
 import pytest
 
-from provenance_kit import PayloadCodec
-from provenance_kit.errors import BackendUnavailableError, ModelLoadError
+from provenance_kit import PayloadCodec, modelfiles
+from provenance_kit.errors import BackendUnavailableError, ModelLoadError, WatermarkBackendError
 from provenance_kit.video.frames import VideoFrame
 from provenance_kit.video.watermark import (
     VIDEOSEAL_MODEL,
@@ -19,7 +19,7 @@ from provenance_kit.video.watermark import (
     _api,
     _videoseal,
     detect_watermark,
-    download_videoseal_model,
+    download_videoseal_models,
     embed_verified,
     embed_watermark,
 )
@@ -138,14 +138,43 @@ def test_argument_validation(rng):
         detect_watermark(blank_frames(1), backend=backend, repetition=4)  # type: ignore[arg-type]
 
 
-def test_malformed_backend_scores_are_refused():
+def test_backend_errors_are_the_shared_type():
+    from provenance_kit import errors
+    from provenance_kit.video import watermark
+
+    assert watermark.WatermarkBackendError is errors.WatermarkBackendError is WatermarkBackendError
+
+
+@pytest.mark.parametrize(
+    "scores",
+    [np.full(256, np.nan, dtype=np.float32), np.zeros(10, np.float32), "not scores"],
+)
+def test_malformed_backend_scores_are_refused(scores):
     class Broken(FakeBackend):
         def score_frames(self, frames):
             for _ in frames:
-                yield np.full(256, np.nan, dtype=np.float32)
+                yield scores
 
-    with pytest.raises(ValueError, match="malformed"):
+    with pytest.raises(WatermarkBackendError, match="malformed"):
         detect_watermark(blank_frames(1), backend=Broken())
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [np.zeros((4, WIDTH), np.uint8), np.zeros((4, WIDTH, 3), np.float32), "frame"],
+)
+def test_malformed_backend_frames_are_refused(frame, monkeypatch):
+    class Broken(FakeBackend):
+        def embed_frames(self, frames, bits):
+            for _ in frames:
+                yield frame
+
+    marked = embed_watermark(blank_frames(1), "0" * 256, backend=Broken())
+    with pytest.raises(WatermarkBackendError, match="frame"):
+        list(marked)
+    encoder = fake_codec_round_trip(monkeypatch)
+    with pytest.raises(WatermarkBackendError, match="frame"):
+        embed_verified(blank_frames(1), "0" * 256, encoder=encoder, backend=Broken())
 
 
 def fake_codec_round_trip(monkeypatch, *, damage: int = 0):
@@ -236,6 +265,7 @@ def test_videoseal_backend_reports_missing_torch(monkeypatch):
         {"batch_frames": 0},
         {"step_size": 4, "batch_frames": 6},
         {"device": "tpu"},
+        {"download_timeout_seconds": 0},
     ],
 )
 def test_videoseal_backend_validates_arguments_before_loading(kwargs, monkeypatch):
@@ -251,7 +281,7 @@ def test_videoseal_constants():
     assert _videoseal.VIDEOSEAL_PAYLOAD_BITS == 256
 
 
-def test_download_videoseal_model_fetches_the_pinned_file(tmp_path, monkeypatch):
+def test_download_videoseal_models_fetches_the_pinned_file(tmp_path, monkeypatch):
     calls = []
 
     def ensure(specs, directory, *, timeout_seconds):
@@ -259,15 +289,32 @@ def test_download_videoseal_model_fetches_the_pinned_file(tmp_path, monkeypatch)
         return tuple(directory / spec.name for spec in specs)
 
     monkeypatch.setattr(_videoseal, "ensure_model_files", ensure)
-    path = download_videoseal_model(tmp_path, timeout_seconds=9)
-    assert path == tmp_path.resolve() / VIDEOSEAL_MODEL.name
+    directory = download_videoseal_models(tmp_path, timeout_seconds=9)
+    assert directory == tmp_path.resolve()  # the directory, like the other backends
     assert calls == [((VIDEOSEAL_MODEL,), tmp_path.resolve(), 9)]
+    download_videoseal_models(tmp_path)
+    assert calls[-1][2] == modelfiles.DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+
+
+def test_backend_passes_the_download_timeout(tmp_path, monkeypatch):
+    seen = {}
+
+    def find(spec, **kwargs):
+        seen.update(kwargs)
+        raise ModelLoadError("stop here")
+
+    monkeypatch.setattr(_videoseal, "import_optional", lambda *a, **k: fake_torch())
+    monkeypatch.setattr(_videoseal, "find_model_file", find)
+    with pytest.raises(ModelLoadError, match="stop here"):
+        VideoSealBackend(model_dir=tmp_path, download=True, download_timeout_seconds=7)
+    assert seen["download"] is True
+    assert seen["timeout_seconds"] == 7
 
 
 def test_model_dir_inside_site_packages_is_refused(monkeypatch):
     inside = sysconfig.get_paths()["purelib"] + "/videoseal"
     with pytest.raises(ValueError, match="site-packages"):
-        download_videoseal_model(inside)
+        download_videoseal_models(inside)
     monkeypatch.setattr(_videoseal, "import_optional", lambda *a, **k: fake_torch())
     with pytest.raises(ValueError, match="site-packages"):
         VideoSealBackend(model_dir=inside)
