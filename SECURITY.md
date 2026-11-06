@@ -45,12 +45,26 @@ The library defends with:
 * messages and logs (INFO and above) that never contain media, payloads,
   keys or caller file paths;
 * temporary files only when unavoidable, private, in a caller-chosen
-  directory, and always deleted.
+  directory, and always deleted;
+* network exchanges (calendar requests, opt-in model downloads) bounded by a
+  total deadline that a server trickling bytes cannot extend: calendar
+  requests cover name resolution, connect, TLS, headers and body; model
+  downloads allow `max(10 x timeout, size / 64 KiB/s)` per file;
+* C2PA signing chains parsed strictly (only `CERTIFICATE` PEM blocks) and
+  handed to the C2PA library re-encoded, so the leaf whose key usage is
+  checked is the leaf that signs;
+* `decode_pcm` holds at most about `max_decoded_audio_bytes` plus a few MiB
+  of read buffers. It decodes into one buffer sized from the declared
+  duration; media that declares none, or holds more than it declares (that
+  buffer is then released), is counted by a separate decode under the same
+  limits before a buffer of the exact size is allocated.
 
 **Trusted inputs.** The application's configuration (tool paths, limits,
 calendar URLs, signer implementation, model files it provisions) and the
 Python environment are trusted. Model weights are loaded only from pinned
-sources and verified by hash.
+sources and verified by hash; TrustMark, VideoSeal and AudioSeal load the
+very bytes whose hash was checked (AudioSeal checkpoints are unpickled from
+those bytes), so a file replaced after the check is never loaded.
 
 **Secrets.** C2PA signing goes through a pluggable signer so that private keys
 can stay in a KMS or HSM; the library never logs or returns key material.

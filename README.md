@@ -28,14 +28,16 @@ What is in it:
   images; the TrustMark invisible watermark with read-back verification
   through the application's own encoder and strength escalation; a tiled
   visible watermark; PDQ (built-in NumPy port, or `pdqhash`), pHash and dHash
-  with hash-list matching. Comparing two images never reports a match on an
-  unreliable PDQ hash (blank canvases, flat gradients).
+  with hash-list matching. Comparing two images uses PDQ when its quality
+  allows; for low-quality artwork (night scenes, light sketches) pHash
+  decides, confirmed by PDQ and flagged as weaker evidence, and blank
+  canvases or flat gradients are never reported as the same image.
 * **Video** ([docs/video.md](docs/video.md)): probing and frame extraction
   through ffprobe/ffmpeg pipes, with mirrored and rotated display matrices
   applied; PDQ frame-hash fingerprints matched by **segment**, so the result
-  says where the shared clip is in both videos and a shared end card alone
-  is not a match; the VideoSeal watermark with a repetition code and a
-  calibrated detection p-value.
+  says where the shared clip is in both videos, and shared end cards (still,
+  grainy or blinking) and black-padded stings are not a match; the VideoSeal
+  watermark with a repetition code and a calibrated detection p-value.
 * **Audio** ([docs/audio.md](docs/audio.md)): PCM decoding under a decoded-size
   limit; Chromaprint fingerprints with offset alignment that refuses matches
   on silence and on chance agreement; the AudioSeal watermark, where
@@ -125,8 +127,9 @@ without the variable, `provenance-kit/models/<backend>` in the per-user cache
 directory (`provenance_kit.modelfiles`). Fetch them once, at deployment time,
 with `download_trustmark_models`, `download_videoseal_models` or
 `download_audioseal_models` (same signature: `model_dir`, then the keyword
-`timeout_seconds`; each returns the directory), or construct a backend with
-`download=True`.
+`timeout_seconds`; each returns the directory; besides the read timeout, each
+file has a total deadline: 64 KiB/s minimum, at least ten timeouts), or
+construct a backend with `download=True`.
 
 A missing extra or binary raises `BackendUnavailableError`, whose message says
 what to install or configure; a model that fails while it runs, in any of the
@@ -276,10 +279,14 @@ match = compare_fingerprints(clip_fp, fp)  # is_match, bit_error_rate, offset_se
 
 audio = decode_pcm(data, tools=tools)  # float32 (channels, samples), at most 1 GiB decoded
 backend = AudioSealBackend(model_dir="/srv/models/audioseal")
-codec = PayloadCodec(16, version_bits=0, check_bits=4)
+codec = PayloadCodec(16, version_bits=0, check_bits=8)  # 256 identifiers
 detection = detect_watermark(audio.samples, audio.sample_rate, backend=backend, codec=codec)
 detection.verified  # found AND the check bits match; `found` alone is not evidence
 ```
+
+The check bits set how often an unmarked signal that the detector finds
+still verifies: with 4 check bits about 1 in 16 (2 in 16 with
+`AlignmentSearch`); with 8, 1 in 256 (2 in 256 with the search).
 
 ### C2PA manifests
 

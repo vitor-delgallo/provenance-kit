@@ -67,7 +67,8 @@ class MediaLimits:
       46 minutes of 48 kHz stereo, 3 hours of 16 kHz mono (what the
       AudioSeal models use) and is in line with the ~770 MB that
       ``max_pixels`` allows for an image tensor. Decode long media at a
-      lower rate or channel count, or raise the limit.
+      lower rate or channel count, or raise the limit. ``decode_pcm``'s
+      peak is this plus a few MiB of read buffers.
     * ``subprocess_timeout_seconds`` = 600 (10 minutes). Bounds one external
       tool invocation (ffmpeg, ffprobe, fpcalc) so that a hung or pathological
       decode is killed. Long videos processed in one call may need more.
@@ -233,5 +234,9 @@ def _check_positive_int(name: str, value: object) -> None:
 def _check_positive_float(name: str, value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"MediaLimits.{name} must be a number, got {type(value).__name__}")
-    if not math.isfinite(value) or value <= 0:
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:  # an int beyond the float range: too long to quote
+        raise ValueError(f"MediaLimits.{name} must be positive and finite") from None
+    if not finite or value <= 0:
         raise ValueError(f"MediaLimits.{name} must be positive and finite, got {value}")

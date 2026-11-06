@@ -52,7 +52,7 @@ src/provenance_kit/
   video/           owner: video agents
     frames         ffprobe probing, frame extraction via ffmpeg pipes
                                                             binaries: ffmpeg, ffprobe
-    fingerprint    frame-hash sequences, temporal alignment extra: video (no packages)
+    fingerprint    frame-hash sequences, segment matching   extra: video (no packages)
     watermark      Meta VideoSeal invisible watermark       extra: video-watermark
   audio/           owner: audio agents
     fingerprint    Chromaprint via fpcalc, comparison       extra: audio (binary: fpcalc)
@@ -299,13 +299,18 @@ RAM disk), and never keep them past the call.
 **Model weights.** Load weights only from pinned sources, through
 `provenance_kit.modelfiles`: pin the HTTPS URL, size and SHA-256 of every
 file your adapter downloads or accepts (`ModelFile`), verify before loading,
+and load what was verified: read the file once, check those bytes and build
+the model from them (`read_model_file`, `torch.jit.load(io.BytesIO(...))`,
+`torch.load(io.BytesIO(...))`), never re-open the path after the check,
 and raise `ModelLoadError` on mismatch. Accept a caller `model_dir` so
 production can pre-provision weights and run offline; never download during
 a request unless the caller allowed it (`download=True` or an explicit
-download function; downloads are HTTPS-only, size-capped, time-limited and
-written atomically). Every backend takes the same model-location options,
-`model_dir`, `download` and `download_timeout_seconds`, and has one download
-function with one signature:
+download function). Downloads are HTTPS-only, size-capped, time-limited (a
+read timeout plus a total deadline per file,
+`modelfiles.DOWNLOAD_MIN_BYTES_PER_SECOND`) and written atomically. Every
+backend takes the same model-location options, `model_dir`, `download` and
+`download_timeout_seconds`, and has one download function with one
+signature:
 `download_<backend>_models(model_dir: StrPath | None = None, *,
 timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS) -> Path`,
 returning the directory (backend-specific choices, such as TrustMark's
@@ -380,15 +385,18 @@ signing is offline.
 * **Unit tests** (the default) use fakes for every Protocol and need no heavy
   dependency, binary, model or network. They run in CI on Linux and Windows,
   Python 3.11 and 3.13: `pytest -m "not integration and not network"`. A
-  second CI job runs `pytest -m integration` on Linux with ffmpeg, ffprobe,
-  fpcalc and the extras that need no model weights; everything else skips
-  there with its reason.
+  second CI job runs `pytest -m "not network"` on Linux with ffmpeg,
+  ffprobe, fpcalc and the extras that need no model weights, with
+  `PROVENANCE_KIT_TEST_REQUIRE` listing those extras so that a missing or
+  broken one fails instead of skipping; everything else skips there with its
+  reason.
 * **Integration tests** are marked `@pytest.mark.integration` (usually
   `pytestmark = pytest.mark.integration` in a `test_<module>_integration.py`
   file). They obtain dependencies through `tests.support.require_module(...)`,
   `tests.support.require_tool(...)` or the `ffmpeg_path` / `ffprobe_path` /
   `fpcalc_path` fixtures, which **skip with a clear reason** when something is
-  missing.
+  missing. Module-level guards call `require_module` too, never
+  `try: import ... except Exception: pytest.skip(...)`.
 * **Network tests** are marked `@pytest.mark.network` and run only with
   `--run-network`. A test that downloads model weights is both `integration`
   and `network`.
@@ -488,7 +496,12 @@ specific than the sections above, they win.
 
 8. **Error correction.**
    * AudioSeal (16 bits) has no room for error correction: rely on the
-     detector's confidence plus the optional `PayloadCodec` check-bit field.
+     `PayloadCodec` check bits, not on the detector's confidence (revised
+     during consolidation: unmarked click trains score up to 0.97).
+     `AudioWatermarkDetection.verified` (found **and** the check bits match)
+     is the evidence; with `c` check bits a found unmarked signal verifies
+     with probability `2**-c` (up to `2 * 2**-c` with an `AlignmentSearch`),
+     so the module recommends `PayloadCodec(16, version_bits=0, check_bits=8)`.
    * VideoSeal (256 bits): the video module may add a simple, documented
      repetition code with majority vote over the payload bits, and must
      measure the resulting bit accuracy in an integration test.

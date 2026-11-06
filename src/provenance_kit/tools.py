@@ -1060,7 +1060,11 @@ def _timeout(timeout_seconds: float | None) -> float:
         return MediaLimits().subprocess_timeout_seconds
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
         raise TypeError("timeout_seconds must be a number")
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+    try:
+        finite = math.isfinite(timeout_seconds)
+    except OverflowError:  # an int beyond the float range
+        finite = False
+    if not finite or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive and finite")
     return float(timeout_seconds)
 
