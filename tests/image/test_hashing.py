@@ -56,6 +56,8 @@ def test_thresholds_follow_meta_guidance():
         ({"min_bit_balance": float("nan")}, ValueError),
         ({"min_bit_balance": "0.1"}, TypeError),
         ({"min_bit_balance": True}, TypeError),
+        ({"allow_phash_fallback": 1}, TypeError),
+        ({"allow_phash_fallback": None}, TypeError),
     ],
 )
 def test_thresholds_validation(kwargs, error):
@@ -203,19 +205,91 @@ BALANCED = 0xF0F0F0F0F0F0F0F0
 BALANCED_NEAR = BALANCED ^ 0b111  # 3 bits away, still balanced
 
 
-def test_unreliable_pdq_decides_nothing_even_when_phash_and_dhash_agree():
+@pytest.mark.parametrize("phash_value", [0, 1, 0b111])
+def test_unreliable_pdq_with_uninformative_phashes_decides_nothing(phash_value):
     # A white and a black canvas: PDQ says "featureless" (quality 0), and the
-    # pHash / dHash of both are all zeros. Falling back to them would call
-    # any two flat images the same picture.
-    a = ImageFingerprint(pdq=GOOD_A, phash=BinaryHash(BALANCED, 64), dhash=BinaryHash(0, 64))
-    b = ImageFingerprint(pdq=POOR_B, phash=BinaryHash(BALANCED, 64), dhash=BinaryHash(0, 64))
+    # pHash / dHash of both are (nearly) all zeros. Falling back to them would
+    # call any two flat images the same picture.
+    a = ImageFingerprint(pdq=GOOD_A, phash=BinaryHash(0, 64), dhash=BinaryHash(0, 64))
+    b = ImageFingerprint(
+        pdq=POOR_B, phash=BinaryHash(phash_value, 64), dhash=BinaryHash(BALANCED, 64)
+    )
     result = compare_fingerprints(a, b)
     assert result.pdq_reliable is False
-    assert result.phash_distance == 0
-    assert result.dhash_distance == 0
+    assert result.phash_distance is not None
+    assert result.phash_distance <= 3
     assert result.decided_by is None
     assert result.undecided_reason is UndecidedReason.LOW_QUALITY
+    assert not result.low_quality_fallback
     assert not result.matched
+
+
+def test_an_unreliable_pdq_match_confirmed_by_phash_is_a_match():
+    # Night scenes, sketches, dark paintings: copies have PDQ quality 13 to
+    # 49, but informative pHashes within a few bits, and PDQ agrees.
+    a = ImageFingerprint(pdq=GOOD_A, phash=BinaryHash(BALANCED, 64))
+    b = ImageFingerprint(pdq=POOR_B, phash=BinaryHash(BALANCED_NEAR, 64))
+    result = compare_fingerprints(a, b)
+    assert result == FingerprintComparison(
+        pdq_distance=16,
+        pdq_reliable=False,
+        phash_distance=3,
+        dhash_distance=None,
+        decided_by=HashAlgorithm.PHASH,
+        matched=True,
+        undecided_reason=None,
+        low_quality_fallback=True,  # weaker evidence than a reliable PDQ match
+    )
+
+
+def test_a_distant_phash_decides_an_unreliable_pdq_pair_is_no_match():
+    a = ImageFingerprint(pdq=GOOD_A, phash=BinaryHash(BALANCED, 64))
+    b = ImageFingerprint(pdq=POOR_B, phash=BinaryHash(BALANCED ^ 0xFFF, 64))  # 12 bits
+    result = compare_fingerprints(a, b)
+    assert result.decided_by is HashAlgorithm.PHASH
+    assert result.low_quality_fallback
+    assert not result.matched
+    assert result.undecided_reason is None
+
+
+def test_a_phash_match_that_pdq_contradicts_stays_undecided():
+    # Unrelated minimal images (one shape on a plain background) can have
+    # identical pHashes; PDQ, even unreliable, must agree for a match.
+    far = PdqHash(b"\xff" * 5 + b"\x00" * 27, 20)  # 40 bits from GOOD_A
+    a = ImageFingerprint(pdq=GOOD_A, phash=BinaryHash(BALANCED, 64))
+    b = ImageFingerprint(pdq=far, phash=BinaryHash(BALANCED, 64))
+    result = compare_fingerprints(a, b)
+    assert (result.pdq_distance, result.phash_distance) == (40, 0)
+    assert result.decided_by is None
+    assert result.undecided_reason is UndecidedReason.LOW_QUALITY
+    assert not result.low_quality_fallback
+    assert not result.matched
+    lenient = compare_fingerprints(a, b, thresholds=MatchThresholds(pdq_max_distance=40))
+    assert lenient.matched
+
+
+def test_the_phash_fallback_can_be_disabled_and_dhash_never_falls_back():
+    a = ImageFingerprint(pdq=GOOD_A, phash=BinaryHash(BALANCED, 64))
+    b = ImageFingerprint(pdq=POOR_B, phash=BinaryHash(BALANCED_NEAR, 64))
+    off = compare_fingerprints(a, b, thresholds=MatchThresholds(allow_phash_fallback=False))
+    assert off.decided_by is None
+    assert off.undecided_reason is UndecidedReason.LOW_QUALITY
+    assert not off.matched
+    only_dhash = compare_fingerprints(
+        ImageFingerprint(pdq=GOOD_A, dhash=BinaryHash(BALANCED, 64)),
+        ImageFingerprint(pdq=POOR_B, dhash=BinaryHash(BALANCED, 64)),
+    )
+    assert only_dhash.decided_by is None
+    assert only_dhash.undecided_reason is UndecidedReason.LOW_QUALITY
+
+
+def test_a_reliable_pdq_decision_is_never_a_fallback():
+    result = compare_fingerprints(
+        ImageFingerprint(pdq=GOOD_A, phash=BinaryHash(BALANCED, 64)),
+        ImageFingerprint(pdq=GOOD_B, phash=BinaryHash(BALANCED, 64)),
+    )
+    assert result.decided_by is HashAlgorithm.PDQ
+    assert not result.low_quality_fallback
 
 
 def test_phash_then_dhash_decide_only_without_pdq():

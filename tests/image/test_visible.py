@@ -6,7 +6,7 @@ import hashlib
 
 import numpy as np
 import pytest
-from PIL import Image, ImageFont
+from PIL import Image, ImageFont, features
 
 from provenance_kit.image import visible
 from provenance_kit.image.visible import MAX_TEXT_LENGTH, tile_text
@@ -174,17 +174,54 @@ def test_multiline_text():
     assert marked.size == (320, 200)
 
 
-def test_custom_font_file(tmp_path):
-    # The truetype loader accepts any font path; reuse Pillow's default font bytes.
-    font = ImageFont.load_default(size=20)
-    data = font.font_bytes if hasattr(font, "font_bytes") else None
+def _default_font_file(tmp_path):
+    """Pillow's embedded default font, written to a file (skips without FreeType)."""
+    data = getattr(ImageFont.load_default(size=20), "font_bytes", None)
     if not data:
         pytest.skip("this Pillow build has no FreeType default font")
     path = tmp_path / "font.ttf"
     path.write_bytes(data)
+    return path
+
+
+def test_custom_font_file_is_loaded_and_drawn(tmp_path, monkeypatch):
+    # Pillow renders its default font with the basic layout, but a font file
+    # loaded with truetype() with Raqm when libraqm is available (Linux
+    # wheels), so the same font file can give other pixels than the default
+    # font depending on the platform. Pin the basic layout here to compare
+    # like with like: then the file's glyphs must be exactly the default's.
+    path = _default_font_file(tmp_path)
+    via_default = tile_text(_gradient(), "viewer 42")  # before the spy: it uses truetype too
+    real_truetype = ImageFont.truetype
+    calls = []
+
+    def basic_layout(font, size=10, *args, **kwargs):
+        calls.append((font, size, kwargs))
+        return real_truetype(font, size, *args, layout_engine=ImageFont.Layout.BASIC)
+
+    monkeypatch.setattr(visible.ImageFont, "truetype", basic_layout)
     via_path = tile_text(_gradient(), "viewer 42", font=path)
-    via_default = tile_text(_gradient(), "viewer 42")
+    assert calls == [(str(path), visible.MIN_FONT_PX, {})]  # the file, at the computed size
     assert _digest(via_path) == _digest(via_default)
+    # The font object loaded from the file is the one drawn: another size
+    # from the same file changes the pixels.
+    calls.clear()
+    larger = tile_text(_gradient(), "viewer 42", font=path, size=0.2)
+    assert calls == [(str(path), 40, {})]
+    assert _digest(larger) != _digest(via_default)
+
+
+def test_custom_fonts_keep_pillows_layout_engine(tmp_path):
+    # The library must not force the basic layout on custom fonts: Raqm
+    # shapes complex scripts (Arabic, Devanagari) correctly where available.
+    path = _default_font_file(tmp_path)
+    font, scale = visible._load_font(path, 24)
+    expected = ImageFont.Layout.RAQM if features.check_feature("raqm") else ImageFont.Layout.BASIC
+    assert isinstance(font, ImageFont.FreeTypeFont)
+    assert font.layout_engine == expected
+    assert scale == 1.0
+    marked = tile_text(_gradient(), "viewer 42", font=path)
+    assert _digest(marked) == _digest(tile_text(_gradient(), "viewer 42", font=path))
 
 
 def test_bad_font_file_is_a_value_error(tmp_path):
@@ -225,6 +262,8 @@ def test_bitmap_font_fallback_scales(monkeypatch):
         ({"size": 2}, ValueError),
         ({"spacing": -1}, ValueError),
         ({"angle": float("inf")}, ValueError),
+        ({"angle": 10**400}, ValueError),  # an int beyond the float range
+        ({"spacing": -(10**400)}, ValueError),
         ({"color": (255, 255)}, TypeError),
         ({"color": (255, 255, 256)}, ValueError),
         ({"color": "white"}, TypeError),

@@ -15,7 +15,7 @@ import urllib.request
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from provenance_kit.image import hashing
 from provenance_kit.image.hashing import (
@@ -283,6 +283,95 @@ def test_different_featureless_images_never_match(name, algorithms):
         UndecidedReason.LOW_QUALITY if "pdq" in algorithms else UndecidedReason.LOW_INFORMATION
     )
     assert result.undecided_reason is expected
+
+
+def _night_scene(rng: np.random.Generator) -> Image.Image:
+    """A dark sky gradient, a moon and black silhouettes: PDQ quality 13 to 40."""
+    width, height = 1200, 900
+    sky = np.linspace(rng.uniform(5, 20), rng.uniform(25, 55), height)[:, None] * np.ones(width)
+    image = Image.fromarray(np.dstack([sky * 0.7, sky * 0.8, sky * 1.2]).astype(np.uint8))
+    draw = ImageDraw.Draw(image)
+    x, y, r = rng.uniform(100, width - 100), rng.uniform(60, 300), rng.uniform(20, 50)
+    draw.ellipse([x - r, y - r, x + r, y + r], fill=(int(rng.integers(150, 220)),) * 3)
+    for layer in range(3):
+        level = height * rng.uniform(0.55, 0.8)
+        hills = [(x, level + rng.uniform(-80, 80)) for x in range(0, width + 1, 60)]
+        draw.polygon([(0, height), *hills, (width, height)], fill=(4 + 6 * layer,) * 3)
+    for _ in range(int(rng.integers(3, 9))):
+        x, base, h = rng.uniform(0, width), height * rng.uniform(0.7, 0.9), rng.uniform(80, 260)
+        draw.polygon([(x, base - h), (x - h / 4, base), (x + h / 4, base)], fill=(2, 2, 4))
+    return image
+
+
+def _light_sketch(rng: np.random.Generator) -> Image.Image:
+    """A few light pencil lines on paper: PDQ quality 12 to 60."""
+    width, height = 1200, 900
+    paper = 238 + rng.normal(0, 2.0, (height, width))
+    image = Image.fromarray(np.dstack([paper, paper - 2, paper - 6]).clip(0, 255).astype(np.uint8))
+    draw = ImageDraw.Draw(image)
+    for _ in range(int(rng.integers(6, 14))):
+        grey = int(rng.integers(150, 190))
+        points = [(rng.uniform(0, width), rng.uniform(0, height)) for _ in range(4)]
+        draw.line(points, fill=(grey,) * 3, width=int(rng.integers(1, 3)))
+    return image
+
+
+def _minimal_logo(rng: np.random.Generator) -> Image.Image:
+    """One shape on a plain background: unrelated ones can share a pHash."""
+    image = Image.new("RGB", (1200, 900), tuple(int(c) for c in rng.integers(200, 250, 3)))
+    x, y, r = rng.uniform(360, 840), rng.uniform(270, 630), rng.uniform(40, 140)
+    colour = tuple(int(c) for c in rng.integers(20, 120, 3))
+    ImageDraw.Draw(image).ellipse([x - r, y - r, x + r, y + r], fill=colour)
+    return image
+
+
+def _copies(image: Image.Image) -> list[Image.Image]:
+    def encoded(img: Image.Image, fmt: str, quality: int) -> Image.Image:
+        buffer = io.BytesIO()
+        img.save(buffer, fmt, quality=quality)
+        return load_image(buffer.getvalue()).image
+
+    half = image.resize((image.width // 2, image.height // 2), Image.Resampling.LANCZOS)
+    return [encoded(image, "JPEG", 80), encoded(image, "WEBP", 75), encoded(half, "JPEG", 85)]
+
+
+@pytest.mark.parametrize(("style", "make"), [("night", _night_scene), ("sketch", _light_sketch)])
+def test_copies_of_low_quality_artwork_match_through_the_phash_fallback(style, make):
+    # PDQ quality below 50 left every such pair undecided; pHash separates
+    # copies from unrelated images of the same style (docs/image.md).
+    require_module("imagehash", extra="image-hash")
+    rng = np.random.default_rng(SEED)
+    hasher = PdqHasher("numpy")
+    originals = [make(rng) for _ in range(8)]
+    prints = [fingerprint_image(image, pdq_hasher=hasher) for image in originals]
+    fallback = 0
+    for image, original in zip(originals, prints, strict=True):
+        for copy in _copies(image):
+            result = compare_fingerprints(original, fingerprint_image(copy, pdq_hasher=hasher))
+            assert result.matched, (style, result)
+            fallback += result.low_quality_fallback
+            if result.low_quality_fallback:
+                assert result.decided_by is HashAlgorithm.PHASH
+                assert result.pdq_reliable is False
+    assert fallback >= 12  # most of the 24 copies needed the fallback
+    for i in range(len(prints)):
+        for j in range(i + 1, len(prints)):
+            assert not compare_fingerprints(prints[i], prints[j]).matched, (style, i, j)
+
+
+def test_unrelated_minimal_images_sharing_a_phash_do_not_match():
+    require_module("imagehash", extra="image-hash")
+    rng = np.random.default_rng(SEED)
+    hasher = PdqHasher("numpy")
+    prints = [fingerprint_image(_minimal_logo(rng), pdq_hasher=hasher) for _ in range(40)]
+    same_phash = matched = 0
+    for i in range(len(prints)):
+        for j in range(i + 1, len(prints)):
+            result = compare_fingerprints(prints[i], prints[j])
+            same_phash += result.phash_distance <= 10 and result.pdq_reliable is False
+            matched += result.matched
+    assert same_phash >= 5  # pHash alone would have matched these
+    assert matched == 0
 
 
 def test_phash_still_matches_a_re_encoded_copy_without_pdq():

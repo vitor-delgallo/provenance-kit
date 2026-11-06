@@ -10,16 +10,20 @@ Measured on the reference machine (2026-11-05; 40 s of the LIFE source,
 ===============================  =======  ==================  ========  ==========
 Variant                          Offset   Matched / compared  Distinct  Similarity
 ===============================  =======  ==================  ========  ==========
-VP9 at 150 kb/s                  0 s      40 / 40             40        0.967
-Scaled to 320x180, 300 kb/s      0 s      40 / 40             40        0.971
-15 fps instead of 30             0 s      39 / 40             39        0.956
-Trim 12.4 s to 27.4 s            12 s     15 / 15             15        0.902
+VP9 at 150 kb/s                  0 s      40 / 40             38        0.967
+Scaled to 320x180, 300 kb/s      0 s      40 / 40             39        0.971
+15 fps instead of 30             0 s      39 / 40             38        0.956
+Trim 12.4 s to 27.4 s            12 s     15 / 15             14        0.902
 Trim 5 s to 20 s, VP9 480x270    5 s      15 / 15             15        0.977
 Unrelated (testsrc2)             n/a      0 matched           0         0.539
 15 s excerpt, then 25 s other    0 s      15 / 15             15        0.981
 25 s other, then 15 s excerpt    -25 s    15 / 15             15        0.975
 Shared 3 s end card only         n/a      3 / 3 (the card)    1         0.995
 Shared 8 s end card only         n/a      8 / 8 (the card)    1         0.993
+Shared grainy card, sigma 8      n/a      8 / 8 (the card)    1         0.897
+Shared grainy card, sigma 16     n/a      5 / 5 (the card)    2         0.850
+Shared blinking card             n/a      8 / 8 (the card)    1         0.995
+Shared sting, 2 s black fades    n/a      3 / 3 over 7 s      3         0.997
 ===============================  =======  ==================  ========  ==========
 
 The 12.4 s trim is the worst case by design: its samples fall 0.4 s off the
@@ -33,6 +37,7 @@ the numbers.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
@@ -44,7 +49,15 @@ from provenance_kit.video.fingerprint import (
     match_fingerprints,
 )
 from tests.support import find_tools, require_module, require_tool
-from tests.video.media import LIFE, MANDELBROT, TESTSRC2, ffmpeg, lavfi
+from tests.video.media import (
+    LIFE,
+    MANDELBROT,
+    TESTSRC2,
+    encode_frames,
+    ffmpeg,
+    lavfi,
+    raw_frames,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -297,6 +310,91 @@ def test_unrelated_videos_sharing_only_an_end_card_do_not_match(tools, tmp_path,
     assert match.distinct_frames == 1  # the card, counted once
     assert match.matched_frames >= card_seconds - 1
     assert match.reference_start_seconds == pytest.approx(20, abs=1)
+
+
+TAIL_RATE = 10  # frames per second of the generated tails (enough at 1 sample per second)
+
+
+def _card_picture(kind: str, size=(480, 270)) -> np.ndarray:
+    card = Image.new("RGB", (640, 360), (20, 20, 30))
+    draw = ImageDraw.Draw(card)
+    if kind in ("end", "banner"):
+        draw.ellipse([250, 70, 390, 210], fill=(240, 60, 90))
+        draw.rectangle([300, 120, 340, 260], fill=(250, 250, 250))
+        draw.text((230, 290), "made with ExampleApp", fill=(230, 230, 230))
+    if kind == "banner":
+        draw.rectangle([0, 0, 640, 60], fill=(250, 210, 40))
+        draw.rectangle([20, 280, 620, 350], fill=(220, 30, 30))
+    elif kind == "sting-1":
+        draw.rectangle([80, 60, 300, 300], fill=(60, 140, 240))
+        draw.ellipse([360, 80, 560, 280], fill=(250, 250, 250))
+    elif kind == "sting-2":
+        draw.polygon([(320, 30), (600, 330), (40, 330)], fill=(240, 200, 60))
+        draw.rectangle([260, 200, 380, 320], fill=(30, 30, 30))
+    elif kind == "sting-3":
+        for i in range(8):
+            draw.rectangle([i * 80, 0, i * 80 + 40, 360], fill=(200, 60 + 20 * i, 90))
+        draw.ellipse([220, 100, 420, 300], fill=(20, 220, 120))
+    return np.asarray(card.resize(size, Image.Resampling.BICUBIC))
+
+
+def _shared_tail(name: str, size, seed: int) -> list[np.ndarray]:
+    """The boilerplate both unrelated videos end with, frame by frame."""
+    height, width = size[1], size[0]
+    rng = np.random.default_rng(seed)
+    if name.startswith("grain-"):  # a still end card with film grain of its own
+        sigma = int(name.split("-")[1])
+        card = _card_picture("end", size).astype(np.float32)
+        frames = []
+        for _ in range(8 * TAIL_RATE):
+            grain = rng.normal(0, sigma, (height // 2, width // 2, 1)).repeat(2, 0).repeat(2, 1)
+            frames.append(np.clip(card + grain, 0, 255).astype(np.uint8))
+        return frames
+    if name == "blinking":  # two pictures alternating every second
+        states = [_card_picture("end", size), _card_picture("banner", size)]
+        return [states[k // TAIL_RATE % 2] for k in range(8 * TAIL_RATE)]
+    if name == "sting-with-fades":  # 3 pictures of 1 s with 2 s of black between them
+        black = np.zeros((height, width, 3), np.uint8)
+        frames = []
+        for index, kind in enumerate(("sting-1", "sting-2", "sting-3")):
+            frames += [_card_picture(kind, size)] * TAIL_RATE
+            if index < 2:
+                frames += [black] * (2 * TAIL_RATE)
+        return frames
+    raise AssertionError(name)
+
+
+@pytest.mark.parametrize(
+    "boilerplate", ["grain-8", "grain-12", "grain-16", "blinking", "sting-with-fades"]
+)
+def test_unrelated_videos_sharing_animated_looking_boilerplate_do_not_match(tools, boilerplate):
+    # Round-2 findings: a grainy still card counted as many distinct frames
+    # (consecutive samples 17 to 40 bits apart), a blinking card counted each
+    # re-appearance, and black fades padded a 3 s sting into a 7 s segment.
+    long_frames = raw_frames(tools, LIFE, width=480, height=270, rate=TAIL_RATE, count=100)
+    short_frames = raw_frames(tools, MANDELBROT, width=320, height=180, rate=TAIL_RATE, count=30)
+    reference = encode_frames(
+        tools,
+        long_frames + _shared_tail(boilerplate, (480, 270), seed=1),
+        ["-c:v", "mpeg4", "-q:v", "4", *MP4],
+        rate=TAIL_RATE,
+    )
+    clip = encode_frames(
+        tools,
+        short_frames + _shared_tail(boilerplate, (320, 180), seed=2),
+        ["-c:v", "libvpx-vp9", "-b:v", "200k", "-deadline", "realtime", "-f", "webm"],
+        rate=TAIL_RATE,
+    )
+    match = match_fingerprints(
+        fingerprint_video(clip, hasher=HASHER, tools=tools),
+        fingerprint_video(reference, hasher=HASHER, tools=tools),
+    )
+    print(f"\n{boilerplate}: {match}")
+    assert not match.is_match
+    assert match.distinct_frames <= (3 if boilerplate == "sting-with-fades" else 2)
+    # The segment reported is the boilerplate (reference seconds 10 to 18).
+    assert match.matched_frames >= 3
+    assert 9 <= match.reference_start_seconds < match.reference_end_seconds <= 19
 
 
 def test_fingerprints_survive_serialization(reference_fp):

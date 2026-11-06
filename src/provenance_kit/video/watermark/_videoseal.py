@@ -8,9 +8,12 @@ the ``videoseal`` PyPI package is not used (ARCHITECTURE.md, decision 4).
 
 from __future__ import annotations
 
+import hashlib
+import io
 import threading
 import warnings
 from collections.abc import Iterable, Iterator
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -33,8 +36,6 @@ from provenance_kit.modelfiles import (
 from provenance_kit.video.watermark.base import Frame
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from provenance_kit.payload import PayloadCodec
     from provenance_kit.video.watermark.base import VideoWatermarkDetection
     from provenance_kit.video.watermark.repetition import RepetitionCode
@@ -73,6 +74,10 @@ VIDEOSEAL_DEFAULT_STRENGTH = 0.5
 
 _BACKEND = "videoseal"
 _JIT_WARNING = r".*torch\.jit\.load.* is deprecated"
+
+#: The largest model file accepted with a custom ``sha256`` (the pinned file
+#: must have its pinned size).
+_MAX_CUSTOM_MODEL_BYTES = 1 << 30
 
 
 def download_videoseal_models(
@@ -148,7 +153,10 @@ class VideoSealBackend:
             asked. Not combinable with ``model_path``.
         download_timeout_seconds: The network timeout of each read during
             that download.
-        sha256: The expected model digest; defaults to the pinned one.
+        sha256: The expected model digest; defaults to the pinned one. A
+            file with another digest may be at most 1 GiB. The model is
+            loaded from the bytes whose digest was checked, never re-read
+            from the path.
         device: ``"cpu"`` (default), ``"cuda"``, ``"cuda:<n>"`` or ``"auto"``.
         strength: The blending factor of the watermark (the model's
             ``scaling_w``), at most 4. The default,
@@ -211,12 +219,16 @@ class VideoSealBackend:
             download=download,
             timeout_seconds=download_timeout_seconds,
         )
+        # Load from the bytes that are hashed here, not from the path, so the
+        # file cannot be replaced between the check and the load.
+        archive = _read_verified(path, sha256)
         try:
             with warnings.catch_warnings():
                 # torch 2.10+ deprecates TorchScript; the official model ships
                 # only in that format.
                 warnings.filterwarnings("ignore", message=_JIT_WARNING, category=FutureWarning)
-                model = torch.jit.load(str(path), map_location=self._device)
+                model = torch.jit.load(io.BytesIO(archive), map_location=self._device)
+            del archive
             model.eval()
             if strength is not None:
                 model.blender.scaling_w = float(strength)
@@ -369,6 +381,31 @@ class VideoSealBackend:
                     "the VideoSeal model returned an unexpected output shape"
                 )
             yield from scores.astype(np.float32, copy=False)
+
+
+def _read_verified(path: Path, sha256: str | None) -> bytes:
+    """Reads the model file once and checks the SHA-256 of the bytes read.
+
+    ``find_model_file`` has verified the file already; this second check is
+    on the bytes that are then loaded, which closes the window in which the
+    file could be replaced. The pinned file must have its pinned size; a
+    custom one (``sha256`` given) at most :data:`_MAX_CUSTOM_MODEL_BYTES`.
+    """
+    expected = VIDEOSEAL_MODEL.sha256 if sha256 is None else sha256.strip().lower()
+    pinned = expected == VIDEOSEAL_MODEL.sha256
+    limit = VIDEOSEAL_MODEL.size if pinned else _MAX_CUSTOM_MODEL_BYTES
+    try:
+        with Path(path).open("rb") as handle:
+            data = handle.read(limit + 1)
+    except OSError as exc:
+        raise ModelLoadError(f"model file {VIDEOSEAL_MODEL.name} could not be read") from exc
+    if (
+        len(data) > limit
+        or (pinned and len(data) != VIDEOSEAL_MODEL.size)
+        or hashlib.sha256(data).hexdigest() != expected
+    ):
+        raise ModelLoadError(f"model file {VIDEOSEAL_MODEL.name} failed its SHA-256 check")
+    return data
 
 
 def _batches(frames: Iterable[Frame], size: int) -> Iterator[list[Frame]]:

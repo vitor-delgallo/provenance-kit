@@ -109,39 +109,65 @@ raises `ValueError` on anything else. (Unchanged by the segment rule below:
 it only changes how fingerprints are compared.)
 
 **Matching: the matched segment.** For every temporal offset, the aligned
-frame pairs are walked in time order; a pair *matches* when its Hamming
-distance is at most `max_distance`, and frames with PDQ quality below
-`min_quality` (flat or black frames) are skipped. A *segment* is a run of
-matched pairs that may step over at most `max_gap_seconds` of unmatched pairs
-at a time. Its *distinct frames* are its matched frames after collapsing
-runs of near-identical consecutive samples (each within `static_distance`
-bits of the first sample of its run) into one, on each side, keeping the
-smaller count: a still end card is one distinct frame however long it is
-shown. A segment is a match when it has at least `min_distinct_frames`
-distinct frames, spans at least `min_matched_seconds` (first to last matched
-sample, inclusive) and at least `min_match_fraction` of its compared pairs
-match. The result is the best segment over all offsets (qualifying first,
-then more distinct frames, more matched pairs, a higher fraction, a lower
-mean distance, a smaller offset), with its position in both videos.
+frame pairs are walked in time order; a pair *matches* when both hashes are
+usable (PDQ quality at least `min_quality`; black and flat frames are not)
+and their Hamming distance is at most `max_distance`. A *segment* is a run
+of matched pairs in which each match follows the previous one by at most
+`max_gap_seconds`, whatever lies between them: unmatched pairs, black or flat
+frames; a longer gap of any kind ends the segment. Its duration runs from its
+first to its last matched sample, inclusive (`span` samples), and its
+`match_fraction` is its matched pairs over `span`, so black or flat samples
+inside a segment count against it.
 
-None of these thresholds depends on the length of either video, which fixes
-two failures of the previous rule (best offset by matched frames, then "at
+Its *distinct pictures* are counted on each side, keeping the smaller count.
+Each fingerprint is split into runs of near-identical consecutive samples,
+each within `static_distance` bits of the run's first sample (its anchor);
+`static_distance` defaults to `max_distance`, because samples the matcher
+cannot tell apart are one picture to it. Along the segment's matched pairs,
+a run is a new picture unless its anchor is within `static_distance` of the
+anchor of a run already counted in the segment. So a still end card is one
+picture however long it is shown, a still with film grain is one picture
+although its consecutive samples differ by 17 to 40 bits, and a picture that
+comes back (a blinking end card, two alternating slides) is not counted
+again.
+
+A segment is a match when it has at least `min_distinct_frames` distinct
+pictures, spans at least `min_matched_seconds` and has
+`matched_frames >= ceil(span * min_match_fraction)`. The result is the best
+segment over all offsets (qualifying first, then more distinct pictures
+counted up to 16, more matched pairs, a higher fraction, a lower mean
+distance, a smaller offset), with its position in both videos and its exact
+number of distinct pictures.
+
+None of these thresholds depends on the length of either video, which fixed
+two failures of the first rule (best offset by matched frames, then "at
 least 3 matched and half of the whole overlap"): 3 seconds of a shared end
 card made two unrelated videos match (3 of 6 frames), and an exact 15-second
 excerpt was missed when the query's other content overlapped the reference
-at that offset (15 of 40). Cost: one Hamming distance per pair of frames,
-computed one row at a time (memory proportional to the longer fingerprint);
-`max_offset_seconds` restricts the offsets considered.
+at that offset (15 of 40). A second review then found three ways to inflate
+a segment, all fixed: a still card with film grain counted as many distinct
+frames (its samples were more than the old 16-bit static distance apart,
+yet within the 40-bit match threshold of the other video's card); a blinking
+card counted each re-appearance; and black or flat samples neither ended a
+segment nor counted against it, so a 3 s sting with 2 s fades through black
+became a 7 s segment (43 s with black on one side only). Cost: one Hamming
+distance per pair of frames, computed one row at a time (memory
+proportional to the longer fingerprint; 3 h against 3 h at 1 fps: 5 to 13 s
+on one core); `max_offset_seconds` restricts the offsets considered.
 
 | Threshold | Default | Why |
 |---|---|---|
 | `max_distance` | 40 of 256 bits | re-encodes measure 6 to 10 (median); a trimmed clip off the sampling grid up to 34; unrelated frames about 128 (minimum 102) |
 | `min_quality` | 50 | PDQ's guidance for featureless frames |
-| `min_distinct_frames` | 3 | a still picture (end card, title, frozen frame) is one frame |
+| `min_distinct_frames` | 3 (at most 100) | a still picture (end card, title, frozen frame) is one picture |
 | `min_matched_seconds` | 5.0 | longer than typical platform end cards and logo stings |
-| `min_match_fraction` | 0.5 | at least half of the segment's compared pairs match |
-| `max_gap_seconds` | 2.0 | an occasional noisy sample or scene cut does not split a segment |
-| `static_distance` | 16 bits | consecutive samples of a still within one encode: 0 to 2 bits (a still with heavy grain 4 to 14); moving content 40 or more |
+| `min_match_fraction` | 0.5 | at least half of the segment's sampling instants are matched pairs |
+| `max_gap_seconds` | 2.0 | an occasional noisy sample, a scene cut or a short fade through black does not split a segment |
+| `static_distance` | `None`: `max_distance` | samples the matcher cannot tell apart are one picture (a still within one encode: 0 to 2 bits; with film grain of 8 to 16 of 255: 17 to 40) |
+
+Time arguments are at most `MAX_MATCH_SECONDS` (1e9 s, more than any
+fingerprint spans) and a fingerprint's `fps` is between
+`MIN_FINGERPRINT_FPS` (0.001) and 240; anything else raises `ValueError`.
 
 **Measured robustness** (2026-11-05: 40 s of a fast-changing synthetic
 source, 640x360, 1 frame per second, PDQ via the NumPy port, LGPL ffmpeg 8.1
@@ -149,31 +175,66 @@ encoders; `tests/video/test_fingerprint_integration.py`, run with `-s`):
 
 | Variant | Offset found | Matched / compared | Distinct | Similarity | Match |
 |---|---|---|---|---|---|
-| VP9 at 150 kb/s | 0 s | 40 / 40 | 40 | 0.967 | yes |
-| Scaled to 320x180, H.264 300 kb/s | 0 s | 40 / 40 | 40 | 0.971 | yes |
-| 15 fps instead of 30 | 0 s | 39 / 40 | 39 | 0.956 | yes |
-| Trimmed 12.4 s to 27.4 s | 12 s | 15 / 15 | 15 | 0.902 | yes |
+| VP9 at 150 kb/s | 0 s | 40 / 40 | 38 | 0.967 | yes |
+| Scaled to 320x180, H.264 300 kb/s | 0 s | 40 / 40 | 39 | 0.971 | yes |
+| 15 fps instead of 30 | 0 s | 39 / 40 | 38 | 0.956 | yes |
+| Trimmed 12.4 s to 27.4 s | 12 s | 15 / 15 | 14 | 0.902 | yes |
 | Trimmed 5 s to 20 s, VP9 480x270 | 5 s | 15 / 15 | 15 | 0.977 | yes |
 | The first 15 s, then 25 s of other content (VP9) | 0 s | 15 / 15 | 15 | 0.981 | yes |
 | 25 s of other content, then the first 15 s | -25 s | 15 / 15 | 15 | 0.975 | yes |
 | Unrelated video | none | 0 matched | 0 | 0.539 | no |
 | Unrelated videos sharing a 3 s still end card | the card | 3 / 3 | 1 | 0.995 | no |
 | Same with an 8 s end card | the card | 8 / 8 | 1 | 0.993 | no |
+| Same with an 8 s end card with film grain (sigma 8 / 12 / 16 of 255, each video its own) | the card | 8 / 8, 6 / 6, 5 / 5 | 1, 1, 2 | 0.85 to 0.90 | no |
+| Same with an 8 s card blinking between two states every second | the card | 8 / 8 | 1 | 0.995 | no |
+| Same with a 3-picture sting, 2 s of black between pictures | the sting | 3 / 3 over 7 s | 3 | 0.997 | no (fraction 0.43) |
+
+Distinct counts are a little below the matched counts on the LIFE source:
+some samples one second apart are within 40 bits of an earlier picture of
+the segment.
 
 False positives and negatives of the default rule, measured on 2026-11-05
-with nine ffmpeg test sources (`life` with two seeds, `mandelbrot`,
-`testsrc2`, `cellauto`, `gradients`, `sierpinski`, `zoneplate`, noisy
-`smptehdbars`), MPEG-4 and VP9 at 250 kb/s:
+(640x360, 25 fps, PDQ NumPy port, LGPL ffmpeg 8.1). Unrelated pairs: nine
+ffmpeg test sources (`life` with two seeds, `mandelbrot`, `testsrc2`,
+`cellauto`, `gradients`, `sierpinski`, `zoneplate`, noisy `smptehdbars`), 30 s
+each, VP9 against MPEG-4 at 250 kb/s. Shared boilerplate: 20 s of `life` plus
+the boilerplate (MPEG-4) against 3 s of `mandelbrot` plus the same
+boilerplate (VP9, 480x270). The "first rule" column is the round-1 rule
+(runs within 16 bits, re-appearances counted, black samples skipped) on the
+same fingerprints:
 
-| Case | Result |
-|---|---|
-| Unrelated 30 s videos, every ordered pair (72) | no match; not a single matched pair |
-| Unrelated videos sharing a still end card of 3, 5, 10 or 30 s | no match (1 distinct frame) |
-| Unrelated videos sharing an animated intro of 3 or 4 s | no match (shorter than 5 s) |
-| Unrelated videos sharing an animated intro of 5 or 8 s | **match**, the segment is the intro |
-| Excerpt of a 60 s video between 10 s of other content on each side, re-encoded, cut at a random 0.1 s position (8 trials each): 3 s / 4 s | not found (0/8, by design) |
-| Same, 5 s | found 7/8 (one cut lost a sample to the sampling phase) |
-| Same, 6, 8, 10 and 15 s | found 8/8, at the right offset |
+| Case | Result | First rule |
+|---|---|---|
+| Unrelated 30 s videos, every ordered pair (72) | no match; not a single matched pair | same |
+| Shared still end card of 3, 5, 10 or 30 s | no match (1 picture) | same |
+| Shared still end card with film grain, 8 or 20 s, sigma 4 to 16 of 255, the same grain in both or each video its own | no match (1 picture) | **match** from sigma 8 (5 to 18 distinct frames) |
+| Same, sigma 24 | no match (1 or 2 pictures) | **match** (5 to 16 distinct frames) |
+| Same, sigma 32 (heavy grain): each video its own / the same grain footage in both | no match (2 pictures) / **match** (4 pictures: identical moving noise is shared moving footage) | match at 20 s / match |
+| Shared 8 s end card blinking between two pictures every 1 or 2 s | no match (2 pictures) | **match** (4 or 8 distinct frames) |
+| Shared 3-picture sting (1 s each) with 2 or 3 s of black between pictures | no match (fraction 0.43; or split by the gap) | **match** (7 or 9 s from 3 frames) |
+| Same with 1 s of black between pictures | **match**: 5 s of shared boilerplate, 3 of 5 instants matched | match |
+| Shared animated intro of 3 or 4 s (`testsrc2` footage) | no match (shorter than 5 s) | same |
+| Shared animated intro of 5 or 8 s | **match**, the segment is the intro (5 and 8 pictures) | same |
+
+Excerpts of a 60 s video between 10 s of other content on each side,
+re-encoded (VP9 480x270), cut at a random 0.1 s position, 8 trials per row
+(found = a match at the right offset):
+
+| Source | 4 s | 5 s | 6 s | 8 s | 15 s | First rule |
+|---|---|---|---|---|---|---|
+| `life` | 0/8 (by design) | 8/8 | 8/8 | 8/8 | 8/8 | same |
+| `mandelbrot` (fast zoom) | 0/8 | 3/8 | 3/8 | 5/8 | 7/8 | same |
+| `testsrc2` (fast motion) | 0/8 | 0/8 | 0/8 | 1/8 | 0/8 | same |
+| Pan over a photo, 16 px/s of a 1920 px wide image | | 8/8 | | 8/8 | 8/8 | same |
+| Same, 8 px/s | | 8/8 (3 pictures) | | 8/8 | 8/8 | same |
+| Slow zoom into a photo, 2 %/s | | 6/8 (2 or 3 pictures) | | 8/8 | 8/8 | 8/8 at 5 s |
+| Talking head: a presenter swaying in front of a still photo, slight camera shake | | 0/8 | | 0/8 | 0/8 | 2/8 |
+| Same with hand gestures | | 1/8 | | 1/8 | 1/8 | 1 to 3/8 |
+
+The `mandelbrot` and `testsrc2` misses are the sampling phase, not the
+segment rule (both rules agree): a cut 0.5 s off the reference's grid moves
+fast content by 45 bits or more, past `max_distance`, so no pair matches.
+Sample at `fps=2` for such content.
 
 * **Re-encoding and resizing**: robust (frames are hashed at a fixed size).
 * **Frame-rate changes**: robust by construction, because sampling is by time.
@@ -184,15 +245,25 @@ with nine ffmpeg test sources (`life` with two seeds, `mandelbrot`,
   row), which the default threshold allows for. Use `fps=2` for very fast
   content, or lower `min_matched_seconds` for shorter clips.
 * **Shared boilerplate**: still cards (end screens, title cards, frozen
-  frames) never make a match on their own, whatever their length. Moving
-  boilerplate of 5 s or more (an animated logo sting, a channel intro) is
-  identical footage and is reported as a match; the segment's times show
-  where it is, so applications that see shared intros can require a longer
+  frames), with or without film grain, blinking between two states or not,
+  never make a match on their own, whatever their length. Moving
+  boilerplate of 5 s or more with 3 distinct pictures (an animated logo
+  sting, a channel intro), black fades included, is identical footage and
+  is reported as a match; the segment's times show where it is, so
+  applications that see shared intros can require a longer
   `matched_seconds`, a minimum `query_coverage`, or ignore segments at the
   very start or end of both videos.
-* **Slow content**: a segment needs 3 distinct pictures, so a near-static
-  excerpt (a slideshow with fewer than 3 slides, a still interview shot that
-  changes less than `static_distance` bits) is not a match on its own.
+* **Slow content**: a segment needs 3 distinct pictures, and frames within
+  `max_distance` of a picture already counted are that picture. A slideshow
+  with fewer than 3 slides is not a match on its own, and neither is a
+  single shot that stays within 40 bits of itself: a talking head in front
+  of a still background (consecutive samples 16 to 34 bits apart) is one
+  picture, so its excerpts are not found (the first rule found 2 of 8 at
+  the right offset: when every frame looks alike, so does every offset). A
+  slow zoom of 2 % per second gives 2 or 3 pictures in 5 s. For such
+  content, lower `static_distance` (for example to 16, the first rule's
+  value) and accept that a grainy still card then counts as several
+  pictures too.
 * **Not handled**: speed changes (a clip played at another speed matches only
   briefly), mirroring, rotation by an uploader, cropping, letterboxing,
   picture-in-picture and heavy overlays.

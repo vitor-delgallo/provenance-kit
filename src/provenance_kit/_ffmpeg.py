@@ -390,13 +390,17 @@ def json_float(value: object) -> float | None:
 
     Returns:
         The finite number, or ``None`` for a missing, ``bool``, non-finite or
-        unusable value.
+        unusable value (including an integer too large for a ``float``:
+        ``json.loads`` returns integers of any size).
     """
     if isinstance(value, bool):
         return None
     number: float
     if isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
     elif isinstance(value, str) and 0 < len(value) <= _MAX_NUMBER_CHARS:
         try:
             number = float(value.strip())

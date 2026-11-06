@@ -1,7 +1,8 @@
 """Perceptual image hashes (PDQ, pHash, dHash) and known-hash-list matching.
 
 Three hashes, for finding copies of an image after re-encoding, resizing or
-small edits:
+small edits (not crops: removing 2 % of each side already moves PDQ past its
+threshold on most images, see ``docs/image.md``):
 
 * **PDQ** (Meta), 256 bits plus a quality score. :class:`PdqHasher` runs one
   of two backends behind :class:`PdqBackend`: a NumPy port of Meta's
@@ -72,10 +73,14 @@ distance ``<= 31`` as matching and discarding hashes with quality ``<= 49``
 and :data:`PDQ_MIN_QUALITY`. The pHash and dHash defaults
 (:data:`PHASH_MATCH_DISTANCE`, :data:`DHASH_MATCH_DISTANCE`) are this
 library's conservative starting points, not an external standard: calibrate
-them on your own content. :func:`compare_fingerprints` never lets pHash or
-dHash overrule a low-quality PDQ pair (featureless images look alike to
-every perceptual hash), and uses them only with enough set and clear bits
-(:attr:`MatchThresholds.min_bit_balance`).
+them on your own content. :func:`compare_fingerprints` uses pHash and dHash
+only with enough set and clear bits (:attr:`MatchThresholds.min_bit_balance`;
+flat images look alike to every perceptual hash). When PDQ is unreliable
+(quality below 50 on a side: night scenes, light sketches, dark paintings),
+pHash decides instead, and a match also needs PDQ to agree, because
+unrelated minimal images (one shape on a plain background) can have
+identical pHashes; such decisions are flagged as weaker evidence
+(:attr:`FingerprintComparison.low_quality_fallback`).
 
 Thread safety: hashing functions, :class:`PdqHasher` and :class:`HashList`
 queries are thread-safe (they keep no mutable state after construction).
@@ -746,6 +751,10 @@ class MatchThresholds:
             all-one hashes that are close to each other whatever the picture;
             ``imagehash``'s pHash of an image without ties always has half its
             bits set. 0 disables the check; at most 0.5.
+        allow_phash_fallback: When both fingerprints have PDQ hashes but one
+            is below ``pdq_min_quality``, let informative pHashes decide
+            (see :func:`compare_fingerprints`). ``False`` leaves every such
+            pair undecided (:attr:`UndecidedReason.LOW_QUALITY`).
 
     Raises:
         TypeError: If a field has the wrong type.
@@ -758,6 +767,7 @@ class MatchThresholds:
     phash_max_distance: int = PHASH_MATCH_DISTANCE
     dhash_max_distance: int = DHASH_MATCH_DISTANCE
     min_bit_balance: float = BINARY_MIN_BALANCE
+    allow_phash_fallback: bool = True
 
     def __post_init__(self) -> None:
         """Validates the fields."""
@@ -779,14 +789,18 @@ class MatchThresholds:
             raise TypeError("min_bit_balance must be a number")
         if not 0.0 <= balance <= 0.5:  # also false for NaN
             raise ValueError("min_bit_balance must be between 0 and 0.5")
+        if not isinstance(self.allow_phash_fallback, bool):
+            raise TypeError("allow_phash_fallback must be a bool")
 
 
 class UndecidedReason(enum.StrEnum):
     """Why :func:`compare_fingerprints` made no decision (``decided_by is None``)."""
 
     #: Both fingerprints have PDQ hashes and at least one is below
-    #: ``pdq_min_quality``: the image is too featureless for a perceptual hash
-    #: to tell a copy from a look-alike, so pHash and dHash are not consulted.
+    #: ``pdq_min_quality``, and pHash could not decide in its place: a pHash
+    #: is missing or uninformative (``min_bit_balance``: a flat or smoothly
+    #: shaded image), the fallback is disabled, or the pHashes match while
+    #: the PDQ hashes do not (unrelated minimal images can share a pHash).
     LOW_QUALITY = "low-quality"
     #: There is no PDQ pair, and every pHash / dHash pair has a hash below
     #: ``min_bit_balance`` (a flat or smoothly shaded image).
@@ -809,14 +823,22 @@ class FingerprintComparison:
         decided_by: The hash that decided :attr:`matched`, or ``None`` when
             there was no decision (see :attr:`undecided_reason`).
         matched: The decision; ``False`` when there was none. When both
-            fingerprints have PDQ hashes, PDQ alone decides, and only if both
-            hashes are reliable: an unreliable PDQ pair means "featureless
-            image", for which pHash and dHash are no better. Only when a side
-            has no PDQ hash do pHash, then dHash decide, and only with
-            informative hashes on both sides (``min_bit_balance``).
-            Applications with another policy use the distances.
+            fingerprints have PDQ hashes and both are reliable, PDQ decides.
+            When they are not, pHash decides if both pHashes are informative
+            (``min_bit_balance``): a pHash distance above
+            ``phash_max_distance`` is no match, and a closer pHash is a
+            match only if the PDQ distance is also within
+            ``pdq_max_distance`` (otherwise there is no decision). Only when
+            a side has no PDQ hash do pHash, then dHash decide, each only
+            with informative hashes on both sides. Applications with another
+            policy use the distances.
         undecided_reason: Why there was no decision, or ``None`` when there
             was one.
+        low_quality_fallback: ``True`` when the PDQ pair was unreliable and
+            pHash decided in its place (``decided_by`` is
+            :attr:`HashAlgorithm.PHASH`, ``pdq_reliable`` is ``False``). This
+            is weaker evidence than a reliable PDQ decision; applications
+            that need PDQ-grade evidence treat it as undecided.
     """
 
     pdq_distance: int | None
@@ -826,6 +848,7 @@ class FingerprintComparison:
     decided_by: HashAlgorithm | None
     matched: bool
     undecided_reason: UndecidedReason | None = None
+    low_quality_fallback: bool = False
 
 
 def compare_fingerprints(
@@ -836,11 +859,23 @@ def compare_fingerprints(
 ) -> FingerprintComparison:
     """Compares two fingerprints hash by hash.
 
-    The decision rule (see :class:`FingerprintComparison`): with PDQ hashes
-    on both sides, PDQ decides if both are reliable and nothing decides
-    otherwise (:attr:`UndecidedReason.LOW_QUALITY`); without a PDQ pair,
-    pHash and then dHash decide, each only if both of its hashes pass the
-    ``min_bit_balance`` information check.
+    The decision rule (see :class:`FingerprintComparison`):
+
+    * with PDQ hashes on both sides, both reliable: PDQ decides;
+    * with PDQ hashes on both sides, one unreliable (quality below
+      ``pdq_min_quality``): pHash decides if both pHashes pass the
+      ``min_bit_balance`` information check (and ``allow_phash_fallback``):
+      no match above ``phash_max_distance``; a match at or below it if the
+      PDQ distance is within ``pdq_max_distance`` as well, else no decision.
+      The result is flagged ``low_quality_fallback``. Otherwise nothing
+      decides (:attr:`UndecidedReason.LOW_QUALITY`). Measured on artwork-like
+      images whose PDQ quality is below 50 (``docs/image.md``): JPEG, WebP
+      and resized copies match (night scenes 100 %, light pencil sketches
+      98 %, dark paintings 88 %, the rest undecided), while unrelated images
+      of the same style match in at most 0.06 % of pairs (pHash alone: up to
+      6 %);
+    * without a PDQ pair: pHash and then dHash decide, each only if both of
+      its hashes pass the information check.
 
     Args:
         a: One fingerprint.
@@ -871,11 +906,24 @@ def compare_fingerprints(
         a.dhash.distance(b.dhash) if a.dhash is not None and b.dhash is not None else None
     )
     decided_by: HashAlgorithm | None = None
-    matched = False
+    matched = fallback = False
     reason: UndecidedReason | None = None
     if pdq_distance is not None:
         if pdq_reliable:
             decided_by, matched = HashAlgorithm.PDQ, pdq_distance <= limits.pdq_max_distance
+        elif (
+            limits.allow_phash_fallback
+            and phash_distance is not None
+            and _informative(a.phash, b.phash, limits)
+            and (
+                phash_distance > limits.phash_max_distance
+                or pdq_distance <= limits.pdq_max_distance
+            )
+        ):
+            # pHash decides for the unreliable PDQ pair; a pHash match must
+            # not be contradicted by PDQ (minimal images share pHashes).
+            decided_by, fallback = HashAlgorithm.PHASH, True
+            matched = phash_distance <= limits.phash_max_distance
         else:
             reason = UndecidedReason.LOW_QUALITY
     elif phash_distance is not None and _informative(a.phash, b.phash, limits):
@@ -894,6 +942,7 @@ def compare_fingerprints(
         decided_by=decided_by,
         matched=matched,
         undecided_reason=reason,
+        low_quality_fallback=fallback,
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import struct
 from dataclasses import dataclass
 
@@ -13,6 +14,8 @@ from provenance_kit.errors import BackendUnavailableError
 from provenance_kit.video import fingerprint as fp_module
 from provenance_kit.video.fingerprint import (
     FORMAT_VERSION,
+    MAX_DISTINCT_FRAMES,
+    MIN_FINGERPRINT_FPS,
     VideoFingerprint,
     default_frame_hasher,
     fingerprint_frames,
@@ -98,6 +101,8 @@ def header(*, magic=b"PKVF", version=1, hash_bytes=32, reserved=0, fps=1.0, coun
         header(fps=float("nan")),
         header(fps=0.0),
         header(fps=1e9),
+        header(fps=1e-9),  # below MIN_FINGERPRINT_FPS
+        header(fps=5e-324),
         header(count=1),
         header(count=1) + b"\x00" * 33 + b"\x00",
         header(count=1) + b"\x00" * 32 + b"\x65",  # quality 101
@@ -118,6 +123,10 @@ def test_from_bytes_rejects_non_bytes():
     "kwargs",
     [
         {"fps": 0.0},
+        {"fps": 5e-324},  # gave an infinite duration
+        {"fps": MIN_FINGERPRINT_FPS / 2},
+        {"fps": 10**400},  # beyond the float range
+        {"fps": float("inf")},
         {"hash_bits": 12},
         {"hash_bits": 1024},
         {"hashes": (2**256,), "qualities": (1,)},
@@ -253,9 +262,27 @@ def test_matching_validates_its_arguments(rng):
         {"static_distance": 257},
         {"static_distance": -1},
         {"max_offset_seconds": -1.0},
+        {"min_distinct_frames": MAX_DISTINCT_FRAMES + 1},
+        # Finite but huge: the products with fps overflowed math.floor/ceil.
+        {"max_gap_seconds": 1e308},
+        {"min_matched_seconds": 1e308},
+        {"max_offset_seconds": 1e308},
+        {"max_gap_seconds": 10**400},
+        {"max_offset_seconds": 10**400},
     ):
         with pytest.raises(ValueError):
             match_fingerprints(fp, fp, **kwargs)
+
+
+def test_the_lowest_and_highest_sampling_rates_are_accepted(rng):
+    for fps in (MIN_FINGERPRINT_FPS, 240):
+        fp = random_fingerprint(rng, 10, fps=fps)
+        assert fp.duration_seconds == 10 / fps
+        match = match_fingerprints(fp, fp, max_gap_seconds=1e9, max_offset_seconds=1e9)
+        assert match.is_match == (10 / fps >= 5)  # at 240 fps, 10 samples last 0.04 s
+        assert match.query_end_seconds == 10 / fps
+    with pytest.raises(ValueError, match="fps"):
+        fingerprint_frames([], fps=MIN_FINGERPRINT_FPS / 2, hasher=FakeHasher())
 
 
 # ------------------------------------------------------------ segments (boilerplate, excerpts)
@@ -396,66 +423,193 @@ def test_still_runs_count_once_on_each_side(rng):
     assert match_fingerprints(query, reference, static_distance=0).distinct_frames == 15
 
 
-def test_low_quality_samples_inside_a_segment_are_skipped(rng):
+def test_a_short_fade_through_black_stays_in_the_segment_and_counts_against_it(rng):
     reference = random_fingerprint(rng, 30)
     qualities = [100] * 30
-    qualities[10:20] = [10] * 10  # a fade to black in the query
+    qualities[10:12] = [10] * 2  # two black samples in the query: within max_gap
     match = match_fingerprints(make_fingerprint(reference.hashes, qualities), reference)
     assert match.is_match
-    assert (match.matched_frames, match.compared_frames) == (20, 20)
+    assert (match.matched_frames, match.compared_frames) == (28, 28)
     assert match.matched_seconds == 30.0
+    assert match.match_fraction == pytest.approx(28 / 30)  # black samples are not matches
+
+
+def test_a_long_fade_through_black_ends_the_segment(rng):
+    # Unusable samples used to be neither matches nor misses, so a segment
+    # stretched over any amount of black; now a gap of more than
+    # max_gap_seconds of any kind ends it. Both halves still qualify.
+    reference = random_fingerprint(rng, 30)
+    qualities = [100] * 30
+    qualities[10:20] = [10] * 10
+    match = match_fingerprints(make_fingerprint(reference.hashes, qualities), reference)
+    assert match.is_match
+    assert (match.matched_frames, match.compared_frames) == (10, 10)
+    assert (match.query_start_seconds, match.query_end_seconds) == (0.0, 10.0)
+    assert match.matched_seconds == 10.0
+
+
+@pytest.mark.parametrize("side", ["both", "query", "reference"])
+def test_black_or_flat_samples_do_not_pad_a_short_shared_sting(rng, side):
+    # Three shared pictures (a 3 s sting) separated by 10 s fades through
+    # black: matched_seconds was 23 from 3 matched frames (43 with black on
+    # one side only, whatever the other video showed there).
+    sting = random_hashes(rng, 3)
+    black = [0] * 10
+
+    def video(with_black: bool) -> tuple[list[int], list[int]]:
+        hashes, qualities = [], []
+        for picture in sting:
+            hashes.append(picture)
+            qualities.append(100)
+            filler = black if with_black else random_hashes(rng, 10)
+            hashes += filler
+            qualities += [0 if with_black else 100] * 10
+        return hashes + random_hashes(rng, 30), qualities + [100] * 30
+
+    query = make_fingerprint(*video(side in ("both", "query")))
+    reference = make_fingerprint(*video(side in ("both", "reference")))
+    match = match_fingerprints(query, reference)
+    assert not match.is_match
+    assert match.matched_frames == 1
+    assert match.matched_seconds == 1.0
+
+
+def test_a_sting_with_fades_shorter_than_the_gap_is_still_too_sparse(rng):
+    # s1 x x s2 x x s3: one segment of 7 samples with 3 matches (< half).
+    sting = random_hashes(rng, 3)
+    layout = [sting[0], 0, 0, sting[1], 0, 0, sting[2]]
+    qualities = [100, 0, 0, 100, 0, 0, 100]
+    query = make_fingerprint(layout + random_hashes(rng, 20), qualities + [100] * 20)
+    reference = make_fingerprint(random_hashes(rng, 20) + layout, [100] * 20 + qualities)
+    match = match_fingerprints(query, reference)
+    assert not match.is_match
+    assert (match.matched_frames, match.matched_seconds) == (3, 7.0)
+    assert match.match_fraction == pytest.approx(3 / 7)
+    assert match.distinct_frames == 3
+    assert match_fingerprints(query, reference, min_match_fraction=0.4).is_match
+
+
+def grainy_still(rng, picture: int, seconds: int, grain_bits: int) -> list[int]:
+    """A still picture with film grain: every sample ``grain_bits`` bits off the picture."""
+    return [flip_bits(picture, rng, grain_bits) for _ in range(seconds)]
+
+
+@pytest.mark.parametrize("grain_bits", [12, 14, 18])
+def test_a_grainy_still_card_is_one_picture(rng, grain_bits):
+    # Consecutive samples of a still with grain differ by 17 to 40 bits:
+    # above the old 16-bit static distance, within the 40-bit match
+    # threshold, so a grainy end card counted as many pictures and made two
+    # unrelated videos match. Each video has grain of its own.
+    card = random_hashes(rng, 1)[0]
+    reference = make_fingerprint(random_hashes(rng, 30) + grainy_still(rng, card, 8, grain_bits))
+    query = make_fingerprint(random_hashes(rng, 3) + grainy_still(rng, card, 8, grain_bits))
+    consecutive = [
+        (x ^ y).bit_count() for x, y in zip(query.hashes[3:], query.hashes[4:], strict=False)
+    ]
+    assert min(consecutive) > 16
+    match = match_fingerprints(query, reference)
+    assert not match.is_match
+    assert match.matched_frames == 8
+    assert match.distinct_frames == 1
+    # The old behaviour, for comparison: a lower static distance splits it.
+    assert match_fingerprints(query, reference, static_distance=16).is_match
+
+
+@pytest.mark.parametrize(
+    "pattern", ["ABABAB", "AABBAABB", "ABABABABABAB", "AAABBBAAABBB", "ABBA" * 3]
+)
+def test_alternating_stills_are_two_pictures(rng, pattern):
+    # Two pictures shown alternately (a blinking end card, a 2-slide loop):
+    # each re-appearance was counted as another distinct frame.
+    pictures = {"A": random_hashes(rng, 1)[0], "B": random_hashes(rng, 1)[0]}
+
+    def card() -> list[int]:
+        return [flip_bits(pictures[c], rng, int(rng.integers(0, 3))) for c in pattern]
+
+    reference = make_fingerprint(random_hashes(rng, 40) + card())
+    query = make_fingerprint(random_hashes(rng, 40) + card())
+    match = match_fingerprints(query, reference)
+    assert not match.is_match
+    assert match.distinct_frames == 2
+    assert match.matched_frames == len(pattern)
+
+
+def test_three_alternating_pictures_count_three_times_at_most(rng):
+    pictures = random_hashes(rng, 3)
+    card = [pictures[k % 3] for k in range(12)]
+    match = match_fingerprints(
+        make_fingerprint(random_hashes(rng, 5) + card),
+        make_fingerprint(card + random_hashes(rng, 5)),
+    )
+    assert match.is_match
+    assert (match.matched_frames, match.distinct_frames) == (12, 3)
+    assert not match_fingerprints(
+        make_fingerprint(card), make_fingerprint(card), min_distinct_frames=4
+    ).is_match
+
+
+def test_distinct_pictures_are_counted_exactly_beyond_the_ranking_cap(rng):
+    reference = random_fingerprint(rng, 60)
+    match = match_fingerprints(sub_clip(reference, 5, 45, rng, noise_bits=8), reference)
+    assert (match.matched_frames, match.distinct_frames) == (40, 40)
 
 
 # ------------------------------------------------------------ brute-force reference
 
 
-def _runs(fp: VideoFingerprint, min_quality: int, static_distance: int) -> list[int]:
-    runs, run, anchor = [], -1, None
-    for value, quality in zip(fp.hashes, fp.qualities, strict=True):
+def _anchors(fp: VideoFingerprint, min_quality: int, static_distance: int) -> list[int]:
+    """The index of each sample's run anchor (-1 for unusable samples)."""
+    anchors, anchor = [], None
+    for index, (value, quality) in enumerate(zip(fp.hashes, fp.qualities, strict=True)):
         if quality < min_quality:
-            runs.append(-1)
+            anchors.append(-1)
             continue
-        if anchor is None or (value ^ anchor).bit_count() > static_distance:
-            run, anchor = run + 1, value
-        runs.append(run)
-    return runs
+        if anchor is None or (value ^ fp.hashes[anchor]).bit_count() > static_distance:
+            anchor = index
+        anchors.append(anchor)
+    return anchors
 
 
-def _brute_segments(pairs, max_distance, max_gap):
-    """Splits the aligned pairs of one offset into segments (trailing misses dropped)."""
-    segments, current, gap = [], None, 0
-    for pair in pairs:
-        if pair[2] <= max_distance:
-            current = [pair] if current is None else [*current, pair]
-            gap = 0
-        elif current is not None:
-            gap += 1
-            if gap > max_gap:
-                segments.append(current)
-                current, gap = None, 0
-            else:
-                current = [*current, pair]
-    if current is not None:
-        segments.append(current)
-    trimmed = []
-    for segment in segments:
-        end = max(k for k, pair in enumerate(segment) if pair[2] <= max_distance)
-        trimmed.append(segment[: end + 1])
-    return trimmed
+def _brute_pictures(fp: VideoFingerprint, samples, anchors, static_distance: int) -> int:
+    """Greedy picture count along matched samples: a run is new unless close to a kept one."""
+    kept, previous = [], None
+    for sample in samples:
+        if anchors[sample] == previous:
+            continue  # same run as the previous match
+        previous = anchors[sample]
+        if all((fp.hashes[previous] ^ fp.hashes[k]).bit_count() > static_distance for k in kept):
+            kept.append(previous)
+    return len(kept)
 
 
-def _brute_describe(segment, q_runs, r_runs, rule):
-    hits = [p for p in segment if p[2] <= rule["max_distance"]]
-    distinct = min(len({q_runs[p[0]] for p in hits}), len({r_runs[p[1]] for p in hits}))
-    span = segment[-1][0] - segment[0][0] + 1
-    fraction = len(hits) / len(segment)
-    mean = sum(p[2] for p in segment) / len(segment)
-    passes = (
-        distinct >= rule["min_distinct"]
-        and span >= rule["min_span"]
-        and fraction >= rule["min_fraction"] - 1e-9
+def _brute_segments(hits, max_gap):
+    """Splits the matched pairs of one offset where consecutive matches are too far apart."""
+    segments = []
+    for pair in hits:
+        if segments and pair[0] - segments[-1][-1][0] - 1 <= max_gap:
+            segments[-1].append(pair)
+        else:
+            segments.append([pair])
+    return segments
+
+
+def _brute_describe(segment, usable_pairs, *, q, r, anchors, rule):
+    first, last = segment[0][0], segment[-1][0]
+    span = last - first + 1
+    compared = [p for p in usable_pairs if first <= p[0] <= last]
+    exact = min(
+        _brute_pictures(q, [p[0] for p in segment], anchors[0], rule["static_distance"]),
+        _brute_pictures(r, [p[1] for p in segment], anchors[1], rule["static_distance"]),
     )
-    return (passes, distinct, len(hits), fraction, -mean)
+    capped = min(exact, max(rule["min_distinct"], 16))
+    matched = len(segment)
+    passes = (
+        exact >= rule["min_distinct"]
+        and span >= rule["min_span"]
+        and matched >= math.ceil(span * rule["min_fraction"] - 1e-9)
+    )
+    mean = sum(p[2] for p in compared) / len(compared)
+    return (passes, capped, matched, matched / span, -mean), (exact, len(compared), first, last)
 
 
 BRUTE_RULE = {
@@ -465,15 +619,17 @@ BRUTE_RULE = {
     "min_span": 5,
     "min_fraction": 0.5,
     "max_gap": 2,
-    "static_distance": 16,
+    "static_distance": 40,
 }
 
 
 def brute_force(q, r, *, max_offset=None, rule=BRUTE_RULE):
     """A direct, slow transcription of match_fingerprints' documented rule."""
-    q_runs = _runs(q, rule["min_quality"], rule["static_distance"])
-    r_runs = _runs(r, rule["min_quality"], rule["static_distance"])
-    best = None  # (key, offset, segment, distinct)
+    anchors = (
+        _anchors(q, rule["min_quality"], rule["static_distance"]),
+        _anchors(r, rule["min_quality"], rule["static_distance"]),
+    )
+    best = None  # (key, offset, details)
     overlap = None  # (key, offset, compared): the result when nothing matches
     for d in range(-(len(q) - 1), len(r)):
         if max_offset is not None and abs(d) > max_offset:
@@ -488,11 +644,12 @@ def brute_force(q, r, *, max_offset=None, rule=BRUTE_RULE):
             key = (-sum(p[2] for p in pairs) / len(pairs), -abs(d), -d)
             if overlap is None or key > overlap[0]:
                 overlap = (key, d, len(pairs))
+        hits = [p for p in pairs if p[2] <= rule["max_distance"]]
         diagonal_best = None  # the earliest of equal segments wins
-        for segment in _brute_segments(pairs, rule["max_distance"], rule["max_gap"]):
-            key = _brute_describe(segment, q_runs, r_runs, rule)
+        for segment in _brute_segments(hits, rule["max_gap"]):
+            key, details = _brute_describe(segment, pairs, q=q, r=r, anchors=anchors, rule=rule)
             if diagonal_best is None or key > diagonal_best[0]:
-                diagonal_best = (key, segment)
+                diagonal_best = (key, details)
         if diagonal_best is not None:
             key = (*diagonal_best[0], -abs(d), -d)
             if best is None or key > best[0]:
@@ -503,19 +660,23 @@ def brute_force(q, r, *, max_offset=None, rule=BRUTE_RULE):
             if overlap is None
             else (False, overlap[1], 0, 0, overlap[2], 0.0, 0.0)
         )
-    key, d, segment = best
-    first, last = float(segment[0][0]), float(segment[-1][0] + 1)
-    return (key[0], d, key[2], key[1], len(segment), first, last)
+    key, d, (exact, compared, first, last) = best
+    return (key[0], d, key[2], exact, compared, float(first), float(last + 1))
 
 
 def test_the_scan_agrees_with_a_brute_force_transcription_of_the_rule(rng):
     disagreements = []
-    for trial in range(250):
+    for trial in range(300):
         n_ref, n_query = int(rng.integers(1, 45)), int(rng.integers(1, 45))
+        palette = random_hashes(rng, int(rng.integers(1, 6)))  # pictures that come back
         base = random_hashes(rng, n_ref)
-        for position in range(1, n_ref):  # some stills
-            if rng.random() < 0.3:
-                base[position] = flip_bits(base[position - 1], rng, int(rng.integers(0, 20)))
+        for position in range(n_ref):
+            draw = rng.random()
+            if position and draw < 0.3:  # a still: close to the previous sample
+                base[position] = flip_bits(base[position - 1], rng, int(rng.integers(0, 30)))
+            elif draw < 0.5:  # a re-appearing picture
+                picture = palette[int(rng.integers(0, len(palette)))]
+                base[position] = flip_bits(picture, rng, int(rng.integers(0, 25)))
         start = int(rng.integers(-8, max(n_ref, 1)))
         hashes = []
         for i in range(n_query):
@@ -524,13 +685,28 @@ def test_the_scan_agrees_with_a_brute_force_transcription_of_the_rule(rng):
                 hashes.append(flip_bits(base[j], rng, int(rng.integers(0, 60))))
             else:
                 hashes.append(random_hashes(rng, 1)[0])
-        query = make_fingerprint(hashes, [int(x) for x in rng.integers(30, 101, n_query)])
-        reference = make_fingerprint(base, [int(x) for x in rng.integers(30, 101, n_ref)])
+        # Qualities from 0: runs of unusable samples (black frames) included.
+        query = make_fingerprint(hashes, [int(x) for x in rng.integers(0, 101, n_query)])
+        reference = make_fingerprint(base, [int(x) for x in rng.integers(0, 101, n_ref)])
         max_offset = None if rng.random() < 0.7 else int(rng.integers(0, 10))
+        rule = dict(BRUTE_RULE)
+        if trial % 2:  # other settings on every other trial
+            rule["min_distinct"] = int(rng.integers(1, 6))
+            rule["min_span"] = int(rng.integers(1, 8))
+            rule["min_fraction"] = float(rng.choice([0.0, 0.3, 0.5, 0.75, 1.0]))
+            rule["max_gap"] = int(rng.integers(0, 5))
+            rule["static_distance"] = int(rng.choice([0, 16, 40, 60]))
         got = match_fingerprints(
-            query, reference, max_offset_seconds=None if max_offset is None else float(max_offset)
+            query,
+            reference,
+            min_distinct_frames=rule["min_distinct"],
+            min_matched_seconds=float(rule["min_span"]),
+            min_match_fraction=rule["min_fraction"],
+            max_gap_seconds=float(rule["max_gap"]),
+            static_distance=rule["static_distance"],
+            max_offset_seconds=None if max_offset is None else float(max_offset),
         )
-        expected = brute_force(query, reference, max_offset=max_offset)
+        expected = brute_force(query, reference, max_offset=max_offset, rule=rule)
         actual = (
             got.is_match,
             got.offset_frames,

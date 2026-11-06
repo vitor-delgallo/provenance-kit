@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sysconfig
 import types
 
@@ -309,6 +310,63 @@ def test_backend_passes_the_download_timeout(tmp_path, monkeypatch):
         VideoSealBackend(model_dir=tmp_path, download=True, download_timeout_seconds=7)
     assert seen["download"] is True
     assert seen["timeout_seconds"] == 7
+
+
+class _FakeScriptModel:
+    def __init__(self) -> None:
+        self.blender = types.SimpleNamespace(scaling_w=0.2)
+        self.step_size = 4
+
+    def eval(self) -> _FakeScriptModel:
+        return self
+
+
+def _torch_loading(record: list) -> types.SimpleNamespace:
+    def jit_load(source, map_location=None):
+        # TorchScript must come from the verified bytes, never from the path.
+        assert not isinstance(source, (str, bytes))
+        assert hasattr(source, "read")
+        record.append((source.read(), map_location))
+        return _FakeScriptModel()
+
+    torch = fake_torch()
+    torch.jit = types.SimpleNamespace(load=jit_load)
+    return torch
+
+
+def _custom_model(tmp_path) -> tuple[object, str]:
+    content = b"pretend TorchScript archive"
+    path = tmp_path / "converted.jit"
+    path.write_bytes(content)
+    return path, hashlib.sha256(content).hexdigest()
+
+
+def test_videoseal_loads_the_bytes_it_verified(tmp_path, monkeypatch):
+    path, digest = _custom_model(tmp_path)
+    loaded: list = []
+    monkeypatch.setattr(_videoseal, "import_optional", lambda *a, **k: _torch_loading(loaded))
+    backend = VideoSealBackend(model_path=path, sha256=digest, strength=0.5)
+    assert loaded == [(b"pretend TorchScript archive", "cpu")]
+    assert (backend.strength, backend.step_size) == (0.5, 4)
+
+
+def test_a_model_file_replaced_after_verification_is_never_loaded(tmp_path, monkeypatch):
+    # The file is hashed, then swapped before it is read again: the bytes
+    # loaded must be the bytes checked (time-of-check to time-of-use).
+    path, digest = _custom_model(tmp_path)
+    real_find = _videoseal.find_model_file
+
+    def find_then_swap(spec, **kwargs):
+        verified = real_find(spec, **kwargs)
+        verified.write_bytes(b"something else entirely")
+        return verified
+
+    loaded: list = []
+    monkeypatch.setattr(_videoseal, "find_model_file", find_then_swap)
+    monkeypatch.setattr(_videoseal, "import_optional", lambda *a, **k: _torch_loading(loaded))
+    with pytest.raises(ModelLoadError, match="SHA-256"):
+        VideoSealBackend(model_path=path, sha256=digest)
+    assert loaded == []
 
 
 def test_model_dir_inside_site_packages_is_refused(monkeypatch):

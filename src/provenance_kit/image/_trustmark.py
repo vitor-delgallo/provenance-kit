@@ -647,7 +647,11 @@ def _check_bits(bits: object, length: int) -> None:
 def _check_strength(strength: object) -> float:
     if isinstance(strength, bool) or not isinstance(strength, (int, float)):
         raise TypeError("strength must be a number")
-    value = float(strength)
+    message = f"strength must be greater than 0 and at most {_MAX_STRENGTH:g}"
+    try:
+        value = float(strength)
+    except OverflowError:  # an int beyond the float range
+        raise ValueError(message) from None
     if not math.isfinite(value) or not 0.0 < value <= _MAX_STRENGTH:
-        raise ValueError(f"strength must be greater than 0 and at most {_MAX_STRENGTH:g}")
+        raise ValueError(message)
     return value

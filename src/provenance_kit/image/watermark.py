@@ -460,9 +460,13 @@ class ImageWatermarker:
 def _check_strength(strength: object) -> float:
     if isinstance(strength, bool) or not isinstance(strength, (int, float)):
         raise TypeError("strength must be a number")
-    value = float(strength)
+    message = "strength must be a positive finite number"
+    try:
+        value = float(strength)
+    except OverflowError:  # an int beyond the float range
+        raise ValueError(message) from None
     if not math.isfinite(value) or value <= 0:
-        raise ValueError("strength must be a positive finite number")
+        raise ValueError(message)
     return value
 
 

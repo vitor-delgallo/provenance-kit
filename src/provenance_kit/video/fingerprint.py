@@ -12,18 +12,23 @@ second); :meth:`VideoFingerprint.from_bytes` validates it strictly.
 **matched segment**: a stretch of time over which the aligned frames match.
 For every temporal offset it walks the aligned frame pairs in order; a pair
 matches when its Hamming distance is at most ``max_distance``, and a segment
-is a run of matched pairs that may skip at most ``max_gap_seconds`` of
-unmatched pairs at a time. The decision depends on the segment only, never on
+is a run of matched pairs in which consecutive matches are at most
+``max_gap_seconds`` apart, whatever lies between them (unmatched pairs,
+black or flat frames). The decision depends on the segment only, never on
 the length of either video:
 
-* **duration**: the segment spans at least ``min_matched_seconds`` (5 s);
-* **distinct frames**: at least ``min_distinct_frames`` (3) of its matched
-  frames are distinct pictures. Consecutive near-identical samples (a still
-  image, an end card, a frozen frame: each within ``static_distance`` bits of
-  the first sample of its run) count as one, on both sides, so a static
-  card shared by two unrelated videos is one matched frame, not three;
+* **duration**: the segment spans at least ``min_matched_seconds`` (5 s),
+  from its first to its last matched sample;
+* **distinct pictures**: at least ``min_distinct_frames`` (3) of its matched
+  frames are distinct pictures, on both sides. Samples within
+  ``max_distance`` bits of each other are the same picture to the matcher,
+  so consecutive near-identical samples (a still image, an end card, a
+  frozen frame, a still with film grain) are one picture, and a picture that
+  comes back (a blinking card, two alternating slides) is not counted again.
+  A static card shared by two unrelated videos is one picture, not three;
 * **density**: at least ``min_match_fraction`` (half) of the segment's
-  compared pairs match.
+  sampling instants are matched pairs (black, flat or unmatched samples
+  count against it).
 
 So a 15-second excerpt is found whatever surrounds it in either video (an
 intro, an outro, a compilation), and a few seconds of shared boilerplate are
@@ -94,9 +99,11 @@ __all__ = [
     "DEFAULT_MIN_MATCHED_SECONDS",
     "DEFAULT_MIN_MATCH_FRACTION",
     "DEFAULT_MIN_QUALITY",
-    "DEFAULT_STATIC_DISTANCE",
     "FORMAT_VERSION",
+    "MAX_DISTINCT_FRAMES",
     "MAX_FINGERPRINT_FRAMES",
+    "MAX_MATCH_SECONDS",
+    "MIN_FINGERPRINT_FPS",
     "FrameHash",
     "FrameHasher",
     "VideoFingerprint",
@@ -131,29 +138,40 @@ DEFAULT_MAX_DISTANCE = 40
 #: black or flat frames, which match each other spuriously).
 DEFAULT_MIN_QUALITY = 50
 
-#: A match needs a segment with at least this many distinct matched frames
-#: (static runs counted once) ...
+#: A match needs a segment with at least this many distinct matched pictures
+#: on both sides (samples within ``max_distance`` bits of a picture already
+#: counted are that picture) ...
 DEFAULT_MIN_DISTINCT_FRAMES = 3
 
 #: ... spanning at least this many seconds (first to last matched sample,
 #: inclusive: 5 samples at 1 fps) ...
 DEFAULT_MIN_MATCHED_SECONDS = 5.0
 
-#: ... in which at least this fraction of the compared pairs matched.
+#: ... in which at least this fraction of the sampling instants are matched
+#: pairs (unmatched and unusable samples count against it).
 DEFAULT_MIN_MATCH_FRACTION = 0.5
 
-#: A segment survives at most this many seconds of consecutive unmatched
-#: pairs (an occasional noisy sample, a scene cut sampled off the grid).
+#: Consecutive matched samples of a segment are at most this many seconds
+#: apart (an occasional noisy sample, a scene cut sampled off the grid, a
+#: short fade through black); a longer gap of any kind ends the segment.
 DEFAULT_MAX_GAP_SECONDS = 2.0
 
-#: Consecutive samples within this many bits of the first sample of their run
-#: are one static picture (measured within one encode: 0 to 2 bits for a still
-#: end card, 4 to 14 for a still scene with heavy grain; moving content 40 or
-#: more between samples one second apart).
-DEFAULT_STATIC_DISTANCE = 16
+#: The lowest sampling rate a fingerprint may have (one frame per 1,000 s).
+MIN_FINGERPRINT_FPS = 0.001
+
+#: The largest ``min_distinct_frames`` :func:`match_fingerprints` accepts.
+MAX_DISTINCT_FRAMES = 100
 
 #: The longest fingerprint :meth:`VideoFingerprint.from_bytes` accepts.
 MAX_FINGERPRINT_FRAMES = 1_000_000
+
+#: The largest time argument :func:`match_fingerprints` accepts, in seconds:
+#: more than any fingerprint can span (1,000,000 frames at the lowest rate).
+MAX_MATCH_SECONDS = 1e9
+
+#: Segments are ranked by their distinct pictures counted up to this number
+#: (or ``min_distinct_frames`` if larger); the reported count is exact.
+_DISTINCT_RANK_CAP = 16
 
 _MAGIC = b"PKVF"
 _HEADER = struct.Struct(">4sBBHdI")  # magic, version, hash bytes, reserved, fps, count
@@ -223,8 +241,10 @@ class VideoFingerprint:
     """Perceptual hashes of frames sampled at a fixed rate.
 
     Attributes:
-        fps: The sampling rate in frames per second; frame ``k`` was sampled
-            at ``k / fps`` seconds.
+        fps: The sampling rate in frames per second, from
+            :data:`MIN_FINGERPRINT_FPS` to
+            :data:`~provenance_kit.video.frames.MAX_SAMPLING_FPS`; frame ``k``
+            was sampled at ``k / fps`` seconds.
         hash_bits: The width of each hash in bits (256 for PDQ), a multiple
             of 8.
         hashes: The hashes as non-negative integers below ``2**hash_bits``.
@@ -243,11 +263,7 @@ class VideoFingerprint:
 
     def __post_init__(self) -> None:
         """Validates the fields."""
-        if isinstance(self.fps, bool) or not isinstance(self.fps, (int, float)):
-            raise TypeError("fps must be a number")
-        if not math.isfinite(self.fps) or not 0 < self.fps <= _MAX_SAMPLING_FPS:
-            raise ValueError(f"fps must be positive and at most {_MAX_SAMPLING_FPS:g}")
-        object.__setattr__(self, "fps", float(self.fps))
+        object.__setattr__(self, "fps", _check_fps(self.fps))
         if isinstance(self.hash_bits, bool) or not isinstance(self.hash_bits, int):
             raise TypeError("hash_bits must be an int")
         if not 8 <= self.hash_bits <= 8 * _MAX_HASH_BYTES or self.hash_bits % 8:
@@ -361,7 +377,7 @@ class VideoMatch:
 
     Attributes:
         is_match: The decision: the segment has at least
-            ``min_distinct_frames`` distinct matched frames, spans at least
+            ``min_distinct_frames`` distinct matched pictures, spans at least
             ``min_matched_seconds`` and has a ``match_fraction`` of at least
             ``min_match_fraction``.
         similarity: Mean of ``1 - distance / hash_bits`` over the compared
@@ -372,12 +388,15 @@ class VideoMatch:
             the query starts before the reference.
         offset_frames: The same offset in sampled frames.
         matched_frames: Matched pairs in the segment.
-        distinct_frames: Matched frames in the segment after counting each
-            run of near-identical samples once, on each side; the smaller of
-            the two counts.
+        distinct_frames: The distinct pictures among the segment's matched
+            frames, counted on each side (a frame within the static distance
+            of a picture already counted is that picture, wherever it
+            appears in the segment); the smaller of the two counts.
         compared_frames: Pairs in the segment (from its first to its last
             matched pair) where both hashes had usable quality.
-        match_fraction: ``matched_frames / compared_frames`` (0.0 if none).
+        match_fraction: ``matched_frames`` over the segment's sampling
+            instants, ``matched_seconds * fps`` (0.0 if there is no segment):
+            unusable and unmatched samples count against it.
         matched_seconds: The segment's duration, from its first to its last
             matched sample inclusive: ``(last - first + 1) / fps``.
         query_start_seconds: Where the segment starts in the query.
@@ -418,7 +437,9 @@ def fingerprint_frames(
         frames: Frames sampled at ``fps`` from the start of the video, as
             :class:`~provenance_kit.video.frames.VideoFrame` objects or RGB
             ``uint8`` arrays shaped ``(height, width, 3)``.
-        fps: The rate at which the frames were sampled.
+        fps: The rate at which the frames were sampled
+            (:data:`MIN_FINGERPRINT_FPS` to
+            :data:`~provenance_kit.video.frames.MAX_SAMPLING_FPS`).
         hasher: The frame hasher. Defaults to :func:`default_frame_hasher`.
         frame_size: Frames are resized to ``frame_size`` x ``frame_size``
             before hashing (only when they have another size).
@@ -428,12 +449,14 @@ def fingerprint_frames(
 
     Raises:
         TypeError: If a frame or argument has the wrong type.
-        ValueError: If a frame has the wrong shape, or the hasher returns
-            hashes of inconsistent size or an invalid quality.
+        ValueError: If ``fps`` is out of range, a frame has the wrong shape,
+            or the hasher returns hashes of inconsistent size or an invalid
+            quality.
         BackendUnavailableError: If the default hasher is not available.
     """
     from PIL import Image  # noqa: PLC0415 - Pillow is a core dependency
 
+    _check_fps(fps)
     check_int("frame_size", frame_size, minimum=8, maximum=4096)
     hasher = default_frame_hasher() if hasher is None else hasher
     hashes: list[int] = []
@@ -481,7 +504,9 @@ def fingerprint_video(
 
     Args:
         data: The encoded video (untrusted).
-        fps: The sampling rate. Compare only fingerprints with the same rate.
+        fps: The sampling rate (:data:`MIN_FINGERPRINT_FPS` to
+            :data:`~provenance_kit.video.frames.MAX_SAMPLING_FPS`). Compare
+            only fingerprints with the same rate.
         hasher: The frame hasher. Defaults to :func:`default_frame_hasher`.
         frame_size: The square size frames are scaled to before hashing.
         tools: Where the binaries are. Defaults to ``ExternalTools.from_env()``.
@@ -495,13 +520,15 @@ def fingerprint_video(
 
     Raises:
         TypeError: See :func:`~provenance_kit.video.frames.iter_frames`.
-        ValueError: See :func:`~provenance_kit.video.frames.iter_frames`.
+        ValueError: If ``fps`` is out of range; see
+            :func:`~provenance_kit.video.frames.iter_frames` for the others.
         MediaLimitExceededError: If the media exceeds ``limits``.
         UnsupportedMediaError: If the media is not a supported video.
         MediaDecodeError: If the media cannot be decoded.
         BackendUnavailableError: If a binary or the default hasher is missing.
         ExternalToolTimeoutError: If a tool times out.
     """
+    _check_fps(fps)
     check_int("frame_size", frame_size, minimum=8, maximum=4096)
     hasher = default_frame_hasher() if hasher is None else hasher
     frames = iter_frames(
@@ -527,37 +554,43 @@ def match_fingerprints(
     min_matched_seconds: float = DEFAULT_MIN_MATCHED_SECONDS,
     min_match_fraction: float = DEFAULT_MIN_MATCH_FRACTION,
     max_gap_seconds: float = DEFAULT_MAX_GAP_SECONDS,
-    static_distance: int = DEFAULT_STATIC_DISTANCE,
+    static_distance: int | None = None,
     max_offset_seconds: float | None = None,
 ) -> VideoMatch:
     """Finds the best matched segment of ``query`` in ``reference``.
 
     For every temporal offset (``reference_time = query_time + offset``), the
-    aligned pairs of usable frames (quality at least ``min_quality`` on both
-    sides) are walked in time order. A pair matches when its Hamming distance
-    is at most ``max_distance``. A **segment** starts at a matched pair and
-    extends over the following pairs until more than ``max_gap_seconds`` of
-    consecutive pairs fail to match; it ends at its last matched pair. Each
-    segment is described by:
+    aligned pairs are walked in time order. A pair **matches** when both
+    hashes are usable (quality at least ``min_quality``) and their Hamming
+    distance is at most ``max_distance``. A **segment** is a run of matched
+    pairs in which each match follows the previous one by at most
+    ``max_gap_seconds`` (``floor(max_gap_seconds * fps)`` samples in
+    between, whatever they are: unmatched pairs, black or flat frames); a
+    longer gap ends it. Each segment is described by:
 
-    * its matched pairs and its compared pairs (from its first to its last
-      matched pair), whose ratio is its ``match_fraction``;
-    * its duration, from the first to the last matched sample inclusive;
-    * its distinct frames: each fingerprint is split into runs of
-      near-identical consecutive samples (each within ``static_distance``
-      bits of the run's first sample; low-quality samples are skipped), and
-      the segment's matched pairs are counted once per run on each side; the
-      smaller count is kept. A still end card is one distinct frame however
-      many seconds it lasts.
+    * its duration, from its first to its last matched sample inclusive
+      (``span`` samples);
+    * its density, ``match_fraction``: matched pairs over ``span``;
+    * its distinct pictures. Each fingerprint is split into runs of
+      near-identical consecutive samples, each within ``static_distance``
+      bits of the run's first sample (its anchor; unusable samples are
+      skipped). Along the segment's matched pairs, in time order, a run
+      counts as a new picture unless its anchor is within
+      ``static_distance`` bits of the anchor of a run already counted in
+      the segment. This is done on each side and the smaller count is kept.
+      A still end card is one picture however long it lasts, and a picture
+      that comes back (a blinking card, alternating slides) is not counted
+      again.
 
     A segment **qualifies** when it has at least ``min_distinct_frames``
-    distinct frames, lasts at least ``min_matched_seconds`` and has a
-    ``match_fraction`` of at least ``min_match_fraction``. None of this
+    distinct pictures, lasts at least ``min_matched_seconds`` and has
+    ``matched_frames >= ceil(span * min_match_fraction)``. None of this
     depends on the length of either fingerprint, so an excerpt is found
     whatever surrounds it. The result is the best segment over all offsets,
-    ranked by: qualifying first, then more distinct frames, more matched
-    pairs, a higher match fraction, a lower mean distance, a smaller absolute
-    offset; on one offset, the earliest of equal segments.
+    ranked by: qualifying first, then more distinct pictures (counted up to
+    16, or ``min_distinct_frames`` if larger; the reported count is exact),
+    more matched pairs, a higher match fraction, a lower mean distance, a
+    smaller absolute offset; on one offset, the earliest of equal segments.
 
     Cost: one Hamming distance per pair of frames (``len(query) *
     len(reference)``), computed one row at a time (memory proportional to
@@ -569,18 +602,24 @@ def match_fingerprints(
         reference: The fingerprint to search in.
         max_distance: The per-frame Hamming threshold, 0 to ``hash_bits``.
         min_quality: Frames with a lower hash quality are ignored.
-        min_distinct_frames: Distinct matched frames required for
-            ``is_match`` (at least 1).
-        min_matched_seconds: Segment duration required for ``is_match``.
-        min_match_fraction: Fraction of the segment's compared pairs that
-            must match, 0 to 1.
-        max_gap_seconds: The longest run of unmatched pairs a segment may
-            skip, in seconds (``floor(max_gap_seconds * fps)`` samples).
-        static_distance: Consecutive samples within this many bits of the
-            first sample of their run count as one picture, 0 to
-            ``hash_bits``. 0 counts only bit-identical samples as static.
+        min_distinct_frames: Distinct matched pictures required for
+            ``is_match``, 1 to :data:`MAX_DISTINCT_FRAMES`.
+        min_matched_seconds: Segment duration required for ``is_match``, 0
+            to :data:`MAX_MATCH_SECONDS`.
+        min_match_fraction: Fraction of the segment's sampling instants that
+            must be matched pairs, 0 to 1.
+        max_gap_seconds: The longest time between two consecutive matches
+            of a segment, 0 to :data:`MAX_MATCH_SECONDS`.
+        static_distance: Samples within this many bits of a run's anchor are
+            one picture, 0 to ``hash_bits``. ``None`` (the default) uses
+            ``max_distance``: frames the matcher cannot tell apart are one
+            picture, so a still with film grain is one picture. A lower
+            value counts slowly changing shots (a talking head in front of a
+            still background) as several pictures, at the cost of counting
+            a grainy still as several too.
         max_offset_seconds: If given, only offsets with
-            ``abs(offset_seconds) <= max_offset_seconds`` are considered.
+            ``abs(offset_seconds) <= max_offset_seconds`` are considered (0
+            to :data:`MAX_MATCH_SECONDS`).
 
     Returns:
         The best segment (see :class:`VideoMatch`). When no aligned pair
@@ -604,14 +643,16 @@ def match_fingerprints(
     fps = query.fps
     check_int("max_distance", max_distance, minimum=0, maximum=bits)
     check_int("min_quality", min_quality, minimum=0, maximum=100)
-    check_int("min_distinct_frames", min_distinct_frames, minimum=1)
-    min_seconds = check_number("min_matched_seconds", min_matched_seconds, minimum=0.0)
+    check_int("min_distinct_frames", min_distinct_frames, minimum=1, maximum=MAX_DISTINCT_FRAMES)
+    min_seconds = _check_seconds("min_matched_seconds", min_matched_seconds)
     check_number("min_match_fraction", min_match_fraction, minimum=0.0, maximum=1.0)
-    gap_seconds = check_number("max_gap_seconds", max_gap_seconds, minimum=0.0)
+    gap_seconds = _check_seconds("max_gap_seconds", max_gap_seconds)
+    if static_distance is None:
+        static_distance = max_distance
     check_int("static_distance", static_distance, minimum=0, maximum=bits)
     max_offset: int | None = None
     if max_offset_seconds is not None:
-        seconds = check_number("max_offset_seconds", max_offset_seconds, minimum=0.0)
+        seconds = _check_seconds("max_offset_seconds", max_offset_seconds)
         max_offset = math.floor(seconds * fps + _EPSILON)
     rule = _Rule(
         max_distance=max_distance,
@@ -619,6 +660,8 @@ def match_fingerprints(
         min_distinct=min_distinct_frames,
         min_span=max(1, math.ceil(min_seconds * fps - _EPSILON)),
         min_fraction=float(min_match_fraction),
+        static_distance=static_distance,
+        distinct_cap=max(min_distinct_frames, _DISTINCT_RANK_CAP),
     )
 
     q_usable = np.array([quality >= min_quality for quality in query.qualities], dtype=bool)
@@ -632,11 +675,9 @@ def match_fingerprints(
     swapped = len(query) > len(reference)
     a_fp, b_fp = (reference, query) if swapped else (query, reference)
     a_usable, b_usable = (r_usable, q_usable) if swapped else (q_usable, r_usable)
-    scan = _scan(
-        _Side.of(a_fp, a_usable, static_distance),
-        _Side.of(b_fp, b_usable, static_distance),
-        rule,
-    )
+    a_side = _Side.of(a_fp, a_usable, static_distance)
+    b_side = _Side.of(b_fp, b_usable, static_distance)
+    scan = _scan(a_side, b_side, rule)
     shift = np.arange(scan.size, dtype=np.int64) - (len(a_fp) - 1)  # b index - a index
     offsets = -shift if swapped else shift  # reference index - query index
     allowed = np.ones(scan.size, dtype=bool)
@@ -669,6 +710,10 @@ def match_fingerprints(
     best = int(found[order[0]])
     offset = int(offsets[best])
     first, last = int(scan.best_first[best]), int(scan.best_last[best])
+    # The scan counts pictures only up to the ranking cap: recount this one.
+    distinct = _segment_pictures(
+        a_side, b_side, first=first, last=last, shift=int(shift[best]), rule=rule
+    )
     if swapped:  # first and last are reference indices
         first, last = first - offset, last - offset
     matched = int(scan.best_matched[best])
@@ -679,9 +724,9 @@ def match_fingerprints(
         offset_seconds=offset / fps,
         offset_frames=offset,
         matched_frames=matched,
-        distinct_frames=int(scan.best_distinct[best]),
+        distinct_frames=distinct,
         compared_frames=compared,
-        match_fraction=matched / compared,
+        match_fraction=matched / (last - first + 1),
         matched_seconds=(last - first + 1) / fps,
         query_start_seconds=first / fps,
         query_end_seconds=(last + 1) / fps,
@@ -698,13 +743,58 @@ def match_fingerprints(
 
 @dataclass(frozen=True, slots=True)
 class _Rule:
-    """The segment thresholds, in samples."""
+    """The segment thresholds, in samples and bits."""
 
     max_distance: int
     max_gap: int
     min_distinct: int
     min_span: int
     min_fraction: float
+    static_distance: int
+    distinct_cap: int
+
+
+class _Pictures:
+    """The distinct pictures of the segment in progress on each diagonal, on one side.
+
+    Up to ``cap`` pictures are kept per diagonal, each as the sample index of
+    its run's anchor. A matched sample whose run differs from the previous
+    matched sample's run is a new picture unless its anchor is within the
+    static distance of a picture already kept.
+    """
+
+    def __init__(self, size: int, side: _Side, rule: _Rule) -> None:
+        self.side = side
+        self.cap = rule.distinct_cap
+        self.static_distance = rule.static_distance
+        self.anchors = np.zeros((size, self.cap), dtype=np.int32)
+        self.count = np.zeros(size, dtype=np.int64)
+        self.last_run = np.full(size, -1, dtype=np.int64)
+
+    def start(self, diagonals: npt.NDArray[np.intp], samples: npt.NDArray[np.intp]) -> None:
+        """New segments on ``diagonals``, whose first match is ``samples`` on this side."""
+        self.anchors[diagonals, 0] = self.side.anchors[samples]
+        self.count[diagonals] = 1
+        self.last_run[diagonals] = self.side.runs[samples]
+
+    def extend(self, diagonals: npt.NDArray[np.intp], samples: npt.NDArray[np.intp]) -> None:
+        """Further matches ``samples`` (on this side) of the open segments ``diagonals``."""
+        runs = self.side.runs[samples]
+        changed = self.last_run[diagonals] != runs
+        self.last_run[diagonals] = runs
+        track = changed & (self.count[diagonals] < self.cap)
+        if not track.any():
+            return
+        rows, anchors = diagonals[track], self.side.anchors[samples[track]]
+        count = self.count[rows]
+        width = int(count.max())
+        kept = self.anchors[rows, :width]
+        hashes = self.side.hashes
+        dist = _popcount(hashes[kept] ^ hashes[anchors][:, None, :])
+        seen = ((dist <= self.static_distance) & (np.arange(width) < count[:, None])).any(axis=1)
+        new = ~seen
+        self.anchors[rows[new], count[new]] = anchors[new]
+        self.count[rows[new]] += 1
 
 
 class _Scan:
@@ -715,21 +805,18 @@ class _Scan:
     when nothing matches).
     """
 
-    def __init__(self, size: int) -> None:
+    def __init__(self, size: int, a: _Side, b: _Side, rule: _Rule) -> None:
         self.size = size
         self.cur_open = np.zeros(size, dtype=bool)
         self.cur_first = np.zeros(size, dtype=np.int64)
         self.cur_last = np.zeros(size, dtype=np.int64)
-        self.cur_gap = np.zeros(size, dtype=np.int64)
         self.cur_matched = np.zeros(size, dtype=np.int64)
         self.cur_compared = np.zeros(size, dtype=np.int64)  # including trailing misses
         self.cur_distance = np.zeros(size, dtype=np.int64)
         self.cur_compared_at_last = np.zeros(size, dtype=np.int64)
         self.cur_distance_at_last = np.zeros(size, dtype=np.int64)
-        self.cur_runs_a = np.zeros(size, dtype=np.int64)
-        self.cur_runs_b = np.zeros(size, dtype=np.int64)
-        self.cur_run_a = np.zeros(size, dtype=np.int64)
-        self.cur_run_b = np.zeros(size, dtype=np.int64)
+        self.pictures_a = _Pictures(size, a, rule)
+        self.pictures_b = _Pictures(size, b, rule)
         self.best_valid = np.zeros(size, dtype=bool)
         self.best_passes = np.zeros(size, dtype=bool)
         self.best_distinct = np.zeros(size, dtype=np.int64)
@@ -743,12 +830,10 @@ class _Scan:
         self.overlap_compared = np.zeros(size, dtype=np.int64)
         self.overlap_distance = np.zeros(size, dtype=np.int64)
 
-    def miss(self, index: npt.NDArray[np.intp], dist: npt.NDArray[np.int64], rule: _Rule) -> None:
-        """Unmatched pairs on open segments: longer gaps; too long a gap closes."""
-        self.cur_gap[index] += 1
+    def miss(self, index: npt.NDArray[np.intp], dist: npt.NDArray[np.int64]) -> None:
+        """Unmatched usable pairs on open segments (counted as compared)."""
         self.cur_compared[index] += 1
         self.cur_distance[index] += dist
-        self.close(index[self.cur_gap[index] > rule.max_gap], rule)
 
     def hit(
         self,
@@ -756,8 +841,7 @@ class _Scan:
         dist: npt.NDArray[np.int64],
         *,
         row: int,
-        run_a: int,
-        run_b: npt.NDArray[np.int64],
+        columns: npt.NDArray[np.intp],
     ) -> None:
         """Matched pairs: they extend the open segments and start the others."""
         extend = self.cur_open[index]
@@ -768,25 +852,19 @@ class _Scan:
         self.cur_compared_at_last[grow] = self.cur_compared[grow]
         self.cur_distance_at_last[grow] = self.cur_distance[grow]
         self.cur_last[grow] = row
-        self.cur_gap[grow] = 0
-        self.cur_runs_a[grow] += self.cur_run_a[grow] != run_a
-        self.cur_run_a[grow] = run_a
-        self.cur_runs_b[grow] += self.cur_run_b[grow] != run_b[extend]
-        self.cur_run_b[grow] = run_b[extend]
+        self.pictures_a.extend(grow, np.full(grow.size, row, dtype=np.intp))
+        self.pictures_b.extend(grow, columns[extend])
         new = index[~extend]
         self.cur_open[new] = True
         self.cur_first[new] = row
         self.cur_last[new] = row
-        self.cur_gap[new] = 0
         self.cur_matched[new] = 1
         self.cur_compared[new] = 1
         self.cur_distance[new] = dist[~extend]
         self.cur_compared_at_last[new] = 1
         self.cur_distance_at_last[new] = dist[~extend]
-        self.cur_runs_a[new] = 1
-        self.cur_runs_b[new] = 1
-        self.cur_run_a[new] = run_a
-        self.cur_run_b[new] = run_b[~extend]
+        self.pictures_a.start(new, np.full(new.size, row, dtype=np.intp))
+        self.pictures_b.start(new, columns[~extend])
 
     def close(self, index: npt.NDArray[np.intp], rule: _Rule) -> None:
         """Ends the segments in progress on the diagonals ``index``."""
@@ -795,14 +873,14 @@ class _Scan:
         matched = self.cur_matched[index]
         compared = self.cur_compared_at_last[index]
         distance = self.cur_distance_at_last[index]
-        distinct = np.minimum(self.cur_runs_a[index], self.cur_runs_b[index])
+        distinct = np.minimum(self.pictures_a.count[index], self.pictures_b.count[index])
         span = self.cur_last[index] - self.cur_first[index] + 1
-        fraction = matched / compared
+        fraction = matched / span
         mean = distance / compared
         passes = (
             (distinct >= rule.min_distinct)
             & (span >= rule.min_span)
-            & (fraction >= rule.min_fraction - _EPSILON)
+            & (matched >= np.ceil(span * rule.min_fraction - _EPSILON))
         )
         better = ~self.best_valid[index] | _ranks_higher(
             (passes, distinct, matched, fraction, -mean),
@@ -851,46 +929,93 @@ class _Side:
     hashes: npt.NDArray[np.uint8]
     usable: npt.NDArray[np.bool_]
     runs: npt.NDArray[np.int64]
+    anchors: npt.NDArray[np.int64]  # the first sample of each sample's run (-1: unusable)
 
     @classmethod
     def of(
         cls, fingerprint: VideoFingerprint, usable: npt.NDArray[np.bool_], static_distance: int
     ) -> _Side:
+        runs = _static_runs(fingerprint.hashes, usable, static_distance)
+        anchors = np.full(len(runs), -1, dtype=np.int64)
+        positions = np.flatnonzero(runs >= 0)
+        if positions.size:
+            starts = positions[np.r_[True, runs[positions[1:]] != runs[positions[:-1]]]]
+            anchors[positions] = starts[runs[positions]]
         return cls(
             hashes=_hash_matrix(fingerprint.hashes, fingerprint.hash_bits),
             usable=usable,
-            runs=_static_runs(fingerprint.hashes, usable, static_distance),
+            runs=runs,
+            anchors=anchors,
         )
 
 
 def _scan(a: _Side, b: _Side, rule: _Rule) -> _Scan:
     """Finds the best segment on every diagonal, one row of ``a`` at a time."""
     n_a, n_b = a.hashes.shape[0], b.hashes.shape[0]
-    scan = _Scan(n_a + n_b - 1)
+    scan = _Scan(n_a + n_b - 1, a, b, rule)
     distances = _RowDistances(b.hashes)
     for row in range(n_a):
         if not a.usable[row]:
             continue
         start = n_a - 1 - row  # the diagonal of the pair (row, 0)
         window = slice(start, start + n_b)
+        # A segment whose last match is more than max_gap samples back ends,
+        # whatever the samples in between were. Diagonals outside the window
+        # get no more pairs, so closing them at the end is equivalent.
+        stale = scan.cur_open[window] & (scan.cur_last[window] < row - rule.max_gap - 1)
+        scan.close(np.flatnonzero(stale) + start, rule)
         dist = distances.to(a.hashes[row])
         scan.overlap_compared[window] += b.usable
         scan.overlap_distance[window] += np.where(b.usable, dist, 0)
         hit = b.usable & (dist <= rule.max_distance)
         miss = np.flatnonzero(b.usable & ~hit & scan.cur_open[window])
         if miss.size:
-            scan.miss(miss + start, dist[miss], rule)
+            scan.miss(miss + start, dist[miss])
         columns = np.flatnonzero(hit)
         if columns.size:
-            scan.hit(
-                columns + start,
-                dist[columns],
-                row=row,
-                run_a=int(a.runs[row]),
-                run_b=b.runs[columns],
-            )
+            scan.hit(columns + start, dist[columns], row=row, columns=columns)
     scan.close(np.flatnonzero(scan.cur_open), rule)
     return scan
+
+
+def _segment_pictures(a: _Side, b: _Side, *, first: int, last: int, shift: int, rule: _Rule) -> int:
+    """The exact distinct-picture count of one segment (rows ``first`` to ``last`` of ``a``)."""
+    rows = np.arange(first, last + 1, dtype=np.intp)
+    columns = rows + shift
+    usable = a.usable[rows] & b.usable[columns]
+    rows, columns = rows[usable], columns[usable]
+    hits = _popcount(a.hashes[rows] ^ b.hashes[columns]) <= rule.max_distance
+    return min(
+        _count_pictures(a, rows[hits], rule.static_distance),
+        _count_pictures(b, columns[hits], rule.static_distance),
+    )
+
+
+def _count_pictures(side: _Side, samples: npt.NDArray[np.intp], static_distance: int) -> int:
+    """Counts pictures along matched ``samples`` as :class:`_Pictures` does, without a cap."""
+    kept: list[int] = []
+    last_run = -1
+    for sample in samples.tolist():
+        run = int(side.runs[sample])
+        if run == last_run:
+            continue
+        last_run = run
+        anchor = int(side.anchors[sample])
+        if kept:
+            dist = _popcount(side.hashes[kept] ^ side.hashes[anchor])
+            if bool((dist <= static_distance).any()):
+                continue
+        kept.append(anchor)
+    return len(kept)
+
+
+def _popcount(xor: npt.NDArray[np.uint8]) -> npt.NDArray[np.int64]:
+    """The number of set bits along the last axis of a ``uint8`` array."""
+    if hasattr(np, "bitwise_count"):
+        native: npt.NDArray[np.int64] = np.bitwise_count(xor).sum(axis=-1, dtype=np.int64)
+        return native
+    table: npt.NDArray[np.int64] = _POPCOUNT[xor].sum(axis=-1, dtype=np.int64)
+    return table
 
 
 class _RowDistances:
@@ -1000,6 +1125,25 @@ def _check_frame(array: object) -> None:
 def _require_fingerprint(name: str, value: object) -> None:
     if not isinstance(value, VideoFingerprint):
         raise TypeError(f"{name} must be a VideoFingerprint")
+
+
+def _check_fps(value: object) -> float:
+    """A sampling rate from MIN_FINGERPRINT_FPS to MAX_SAMPLING_FPS, as a float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("fps must be a number")
+    message = f"fps must be from {MIN_FINGERPRINT_FPS:g} to {_MAX_SAMPLING_FPS:g}"
+    try:
+        fps = float(value)
+    except OverflowError:  # an int beyond the float range
+        raise ValueError(message) from None
+    if not math.isfinite(fps) or not MIN_FINGERPRINT_FPS <= fps <= _MAX_SAMPLING_FPS:
+        raise ValueError(message)
+    return fps
+
+
+def _check_seconds(name: str, value: object) -> float:
+    """A time argument from 0 to MAX_MATCH_SECONDS, as a float."""
+    return check_number(name, value, minimum=0.0, maximum=MAX_MATCH_SECONDS)
 
 
 def _hash_quality(value: object) -> int:

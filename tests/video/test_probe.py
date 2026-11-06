@@ -165,6 +165,7 @@ def test_absurd_frame_rates_are_dropped():
         ([], {"rotate": "270"}, 270),
         ("garbage", {"rotate": 12345678}, 0),
         ([{"rotation": 1e300}], {}, 0),
+        ([{"rotation": int("9" * 400)}], {}, 0),  # too large for a float: ignored
     ],
 )
 def test_rotation(side_data, tags, expected):

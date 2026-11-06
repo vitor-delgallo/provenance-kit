@@ -80,6 +80,7 @@ and the limits are checked exactly as for built-in formats.
 
 ```python
 import pillow_heif  # installed and license-reviewed by the application
+from provenance_kit.image.loading import load_image
 from provenance_kit.mediatype import MediaType
 
 openers = {MediaType.HEIC: pillow_heif.HeifImageFile, MediaType.HEIF: pillow_heif.HeifImageFile}
@@ -155,6 +156,26 @@ to different sides of the median, and even one backend's hash is unstable
 under re-encoding. Do not rely on PDQ for images with a side under 64 px,
 whatever their quality score.
 
+**Crops are not handled.** PDQ (and pHash) describe the whole frame, so
+removing a border shifts every DCT coefficient. Measured on 2026-11-05 with
+30 generated 1200 x 900 images per style and 30 windows of a real photo, each
+cropped by the same percentage on every side and re-encoded as JPEG q85
+(`compare_fingerprints` with the defaults; median PDQ distance in
+parentheses where PDQ was reliable):
+
+| Content | 1 % per side | 2 % per side | 4 % per side |
+|---|---|---|---|
+| Line art | 17 / 30 matched (30 bits) | 3 / 30 (40) | 0 / 30 (68) |
+| Pencil sketch | 9 / 30 (34) | 4 / 30 (40) | 0 / 30 (64) |
+| Flat illustration | 30 / 30 (14) | 17 / 30 (30) | 0 / 30 (62) |
+| Photo | 26 / 30 (24) | 0 / 30 (44) | 0 / 30 (84) |
+| Night scene, light sketch, dark painting (pHash fallback) | 29, 13, 20 / 30 | 6, 5, 8 / 30 | 0 / 30 |
+
+Line art and sketches are the most fragile: thin strokes on a plain ground
+put most of the energy in a few coefficients near the median. To find
+cropped copies, hash the crops you expect (or use a local-feature matcher);
+a 2 % crop is already missed most of the time.
+
 Cost for one image (measured 2026-11-05): 8 ms (`pdqhash`) or 15 ms (NumPy)
 at 512 x 512; 34 or 40 ms for a 4000 x 3000 image with the default
 pre-scaling, 0.5 or 0.8 s without it; 30 or 140 ms for the most elongated
@@ -171,22 +192,59 @@ pinned commit into `.cache/threatexchange-pdq/`, checking each file's SHA-256.
 `BinaryHash` whose `hex()` equals `str(imagehash.phash(...))`.
 `fingerprint_image` computes all three; `compare_fingerprints` decides:
 
-* with PDQ hashes on both sides, PDQ alone decides, and only if both are
-  reliable (quality >= 50). A low-quality pair means a featureless image
-  (a flat canvas, a soft gradient), on which pHash and dHash are no better:
-  a white and a black canvas, or a red and a blue one, have pHash 0 to 1 bit
-  apart, and orthogonal ramps 7. The result is then `matched=False`,
-  `decided_by=None`, `undecided_reason=UndecidedReason.LOW_QUALITY`;
+* with PDQ hashes on both sides, both reliable (quality >= 50): PDQ decides;
+* with PDQ hashes on both sides, one below quality 50: **pHash decides in
+  PDQ's place**, if both pHashes have at least `min_bit_balance` (1/8) of
+  their bits set and clear. A pHash distance above `phash_max_distance` (10)
+  is no match; a closer pHash is a match only if the PDQ distance is within
+  `pdq_max_distance` (31) as well, and otherwise there is no decision. The
+  result has `decided_by=HashAlgorithm.PHASH`, `pdq_reliable=False` and
+  `low_quality_fallback=True`: weaker evidence than a reliable PDQ match,
+  which applications needing PDQ-grade evidence treat as undecided
+  (`MatchThresholds(allow_phash_fallback=False)` turns the fallback off).
+  When pHash cannot decide (missing, or not balanced: a flat canvas or a
+  soft gradient), the result is `matched=False`, `decided_by=None`,
+  `undecided_reason=UndecidedReason.LOW_QUALITY`;
 * without a PDQ pair, pHash and then dHash decide, each only if both hashes
-  have at least `min_bit_balance` (1/8) of their bits set and clear. Flat
-  and smoothly shaded images give nearly all-zero or all-one hashes;
-  `imagehash`'s pHash of an image without ties always has half its bits set.
-  Otherwise `undecided_reason=UndecidedReason.LOW_INFORMATION` (or
-  `NO_COMMON_HASH` when the fingerprints share no hash type).
+  pass the same `min_bit_balance` check. Flat and smoothly shaded images
+  give nearly all-zero or all-one hashes; `imagehash`'s pHash of an image
+  without ties always has half its bits set. Otherwise
+  `undecided_reason=UndecidedReason.LOW_INFORMATION` (or `NO_COMMON_HASH`
+  when the fingerprints share no hash type).
+
+**Why a fallback, and why PDQ must agree.** Artwork with sharp but sparse
+structure gets PDQ quality 13 to 49 (night scenes with silhouettes and a
+moon: median 26; light pencil sketches: 32; dark paintings: 15), so without
+a fallback every copy of it was undecided. pHash separates those copies from
+unrelated images of the same style, but pHash alone is not safe on minimal
+images: unrelated single shapes on plain backgrounds (logos, icons) and
+short texts on flat backgrounds have identical pHashes. Requiring the
+unreliable PDQ pair to agree removes almost all of those. Measured on
+2026-11-05 (NumPy PDQ, `imagehash` 4.3.2; 250 generated 1200 x 900 images per
+style; copies: JPEG q80 and q60, 50 % resize + JPEG q85, resize to 400 px +
+JPEG q85, WebP q75, 50 % resize + WebP q60; unrelated: every pair within the
+style; only pairs where PDQ was unreliable on a side):
+
+| Style (median PDQ quality) | Copies matched / undecided / no match | Unrelated pairs matched | pHash alone (<= 10) would match |
+|---|---|---|---|
+| Night scene (26) | 100 % / 0 / 0 | 6 of 31,125 (0.019 %: same moon position and horizon) | 0.69 % |
+| Light pencil sketch (32) | 98.1 % / 0.6 % / 1.3 % | 0 of 30,825 | 0 % |
+| Dark painting (15) | 88.4 % / 11.6 % / 0 | 0 of 31,125 | 0 % |
+| Soft pastel (9) | 99.8 % / 0.2 % / 0 | 0 of 31,125 | 0 % |
+| One shape on a plain background (25) | 99.5 % / 0.5 % / 0 | 17 of 31,125 (0.055 %: recolourings of the same layout) | 6.2 % |
+| Short text on a flat background (19) | 95.2 % / 3.6 % / 1.2 % | 2 of 30,264 (0.007 %) | 0.73 % |
+| Fog: smooth low-contrast noise (0) | 20 % / 80 % / 0.1 % | 0 of 31,125 | 0 % |
+
+The worst re-encoding was 50 % resize + WebP q60 (dark paintings 68 %
+matched, light sketches 92 %). Fog-like images have PDQ quality 0 to 5,
+whose PDQ hashes are noise, so most of their copies stay undecided rather
+than being guessed. The round-1 featureless pairs (a white and a black
+canvas, a red and a blue one, orthogonal ramps, two greys one level apart)
+have pHashes with 0 to 5 bits set and stay undecided.
 
 `MatchThresholds` defaults: PDQ 31 / quality 50 (Meta), pHash 10, dHash 10,
-`min_bit_balance` 0.125 (this library's starting points; there is no
-external standard, calibrate on your content).
+`min_bit_balance` 0.125, `allow_phash_fallback` true (this library's
+starting points; there is no external standard, calibrate on your content).
 
 ### Known-hash lists
 

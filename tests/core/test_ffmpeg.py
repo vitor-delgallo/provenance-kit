@@ -225,6 +225,14 @@ def test_json_float():
         assert json_float(bad) is None
 
 
+def test_json_float_ignores_integers_too_large_for_a_float():
+    # json.loads returns an int of any size; float() of one above ~1.8e308
+    # raises OverflowError, which must not escape the report parser.
+    assert json_float(10**308) == 1e308
+    assert json_float(int("9" * 400)) is None
+    assert json_float(-(10**400)) is None
+
+
 def test_json_rate():
     assert json_rate("30000/1001", maximum=1000) == pytest.approx(29.97, abs=0.01)
     assert json_rate("25:1", maximum=1000) == 25.0

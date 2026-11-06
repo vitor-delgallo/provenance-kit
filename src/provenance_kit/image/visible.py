@@ -31,7 +31,14 @@ font.
 
 The output has the input's size and mode (see :func:`tile_text` for the
 modes supported) and is deterministic: the same input, text and parameters
-give identical pixels with the same Pillow and FreeType versions.
+give identical pixels with the same Pillow build and FreeType version. Pixels
+can differ between platforms: a ``font`` file is laid out with Pillow's
+default engine, which is Raqm when libraqm (with FriBiDi and HarfBuzz) is
+available, as with Pillow's Linux wheels on a system that has FriBiDi, and
+the basic layout otherwise (Pillow's Windows wheels without FriBiDi). Raqm
+is kept on purpose: it shapes complex scripts (Arabic, Devanagari) correctly.
+Pillow's built-in default font always uses the basic layout, so the same
+font file can render slightly differently from the built-in font.
 
 Thread safety: :func:`tile_text` is thread-safe.
 """
@@ -169,11 +176,15 @@ def _check_number(
 ) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be a number")
-    number = float(value)
+    bound = "greater than" if not low_inclusive else "at least"
+    message = f"{name} must be {bound} {low:g} and at most {high:g}"
+    try:
+        number = float(value)
+    except OverflowError:  # an int beyond the float range
+        raise ValueError(message) from None
     too_low = number < low or (not low_inclusive and number == low)
     if not math.isfinite(number) or too_low or number > high:
-        bound = "greater than" if not low_inclusive else "at least"
-        raise ValueError(f"{name} must be {bound} {low:g} and at most {high:g}")
+        raise ValueError(message)
     return number
 
 
