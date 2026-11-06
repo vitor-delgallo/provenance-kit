@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import io
 import random
+import socket
 import sys
+import threading
 import time
 
 import pytest
@@ -40,7 +42,7 @@ from provenance_kit.provenance.timestamps import (
     sha256_stream,
 )
 from provenance_kit.provenance.timestamps._proof import HEADER_MAGIC
-from tests.provenance._calendar import MockCalendar
+from tests.provenance._calendar import MockCalendar, slow_dns
 from tests.support import HEAVY_MODULES, SEED, assert_imports_lightly
 
 DIGEST = hashlib.sha256(b"provenance-kit").digest()
@@ -337,3 +339,117 @@ def test_unreachable_calendar_fails_cleanly():
     with pytest.raises(_http.HttpFailure) as info:
         fetch(f"{url}/digest", method="POST", timeout=1.0)
     assert info.value.reason in ("connection failed", "timeout")
+
+
+# ------------------------------------------------------------------ every blocking step
+
+
+def test_slow_dns_cannot_outlive_the_deadline(monkeypatch):
+    """R2-S02: the watchdog used to fire while no socket existed, and was then spent.
+
+    The rest of the exchange ran with per-read timeouts only, so a calendar
+    that trickled its headers held the thread (and, through the thread pool,
+    the process) indefinitely.
+    """
+    with MockCalendar(mode="slow_headers") as server, slow_dns(monkeypatch) as lookups:
+        started = time.monotonic()
+        with pytest.raises(_http.HttpFailure, match="timeout"):
+            fetch(f"{server.url}/digest", method="POST", timeout=0.5)
+        elapsed = time.monotonic() - started
+        assert lookups == ["127.0.0.1"]
+        assert elapsed < 1.5
+        assert server.requests == []  # gave up before connecting
+
+
+class _SlowConnectSocket(socket.socket):
+    """A socket whose connect() waits for its whole timeout, then times out."""
+
+    def connect(self, address):
+        time.sleep(min(self.gettimeout() or 0.0, 2.0))
+        raise TimeoutError("simulated connect timeout")
+
+
+def test_connect_attempts_share_the_deadline(monkeypatch):
+    # Every address of a host gets the time that is left, not a fresh timeout
+    # each: five unreachable addresses do not make five deadlines.
+    addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 9))] * 5
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: addresses)
+    monkeypatch.setattr(socket, "socket", _SlowConnectSocket)
+    started = time.monotonic()
+    with pytest.raises(_http.HttpFailure, match="timeout"):
+        fetch("http://calendar.example/digest", method="POST", timeout=0.5)
+    assert time.monotonic() - started < 1.2
+
+
+def test_a_trickled_tls_handshake_hits_the_deadline():
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    stop = threading.Event()
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            connection.recv(4096)  # the ClientHello
+            connection.sendall(b"\x16\x03\x03\x40\x00")  # a 16 KiB handshake record...
+            while not stop.wait(0.05):  # ...arriving one byte at a time
+                try:
+                    connection.sendall(b"\x00")
+                except OSError:
+                    return
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        started = time.monotonic()
+        with pytest.raises(_http.HttpFailure, match=r"timeout|tls error"):
+            _http.request(
+                "POST",
+                f"https://127.0.0.1:{port}/digest",
+                body=b"x" * 32,
+                headers={},
+                timeout_seconds=0.5,
+                max_response_bytes=10_000,
+                allow_http=False,
+                ssl_context=None,
+            )
+        assert time.monotonic() - started < 1.5
+    finally:
+        stop.set()
+        listener.close()
+        thread.join(5)
+
+
+def test_no_request_thread_outlives_its_deadline(monkeypatch):
+    """A request in a non-daemon thread (like the stamp pool's) ends at its deadline."""
+    errors: list[BaseException] = []
+
+    def run(url: str) -> None:
+        try:
+            fetch(url, method="POST", timeout=0.5)
+        except BaseException as exc:  # recorded for the assertion below
+            errors.append(exc)
+
+    with MockCalendar(mode="slow_headers") as server, slow_dns(monkeypatch):
+        worker = threading.Thread(target=run, args=(f"{server.url}/digest",), daemon=False)
+        worker.start()
+        worker.join(1.5)
+        alive = worker.is_alive()
+    worker.join(15)
+    assert not alive
+    assert [type(e) for e in errors] == [_http.HttpFailure]
+    assert all(t.daemon for t in threading.enumerate() if t.name == "pk-dns")
+
+
+def test_lookups_are_capped_process_wide(monkeypatch):
+    # With every lookup slot held (lookups a slow resolver has not answered),
+    # a request waits for a slot only until its own deadline.
+    slots = threading.BoundedSemaphore(1)
+    slots.acquire()
+    monkeypatch.setattr(_http, "_LOOKUP_SLOTS", slots)
+    lookups: list[object] = []
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: lookups.append(args))
+    started = time.monotonic()
+    with pytest.raises(_http.HttpFailure, match="timeout"):
+        fetch("http://calendar.example/digest", method="POST", timeout=0.3)
+    assert time.monotonic() - started < 1.0
+    assert lookups == []

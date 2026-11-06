@@ -241,22 +241,23 @@ def sign_with_c2pa(
 
     Raises:
         BackendUnavailableError: If c2pa-python is not installed.
-        ValueError: If the signer's leaf certificate lacks the
-            ``digitalSignature`` key usage (checked here, because c2pa-rs
-            0.91 accepts a ``nonRepudiation``-only leaf).
+        ValueError: If the signer's chain is not strictly PEM certificates,
+            or its leaf certificate lacks the ``digitalSignature`` key usage
+            (checked here, because c2pa-rs 0.91 accepts a
+            ``nonRepudiation``-only leaf). The library receives the chain
+            re-encoded from the certificates checked, never the signer's
+            text, so that both see the same leaf.
         MediaDecodeError: If the asset or an ingredient cannot be parsed.
         UnsupportedMediaError: If the library refuses the media type.
         SigningError: For every other failure (see :class:`SigningError`).
     """
     settings = sign_settings(tsa_url=tsa_url)
     c2pa = load_c2pa()
-    check_signing_certificate(bridge.certificate_chain_pem)
+    chain = check_signing_certificate(bridge.certificate_chain_pem)
     algorithm = getattr(c2pa.C2paSigningAlg, bridge.algorithm.name)
     resources: list[Any] = []
     try:
-        native_signer = c2pa.Signer.from_callback(
-            bridge, algorithm, bridge.certificate_chain_pem, tsa_url
-        )
+        native_signer = c2pa.Signer.from_callback(bridge, algorithm, chain, tsa_url)
         resources.append(native_signer)
         context = c2pa.Context.from_dict(settings)
         resources.append(context)

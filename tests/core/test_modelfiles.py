@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import socket
+import ssl
 import sys
 import sysconfig
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -24,6 +28,7 @@ from provenance_kit.modelfiles import (
     read_model_file,
     verify_model_file,
 )
+from tests.support import require_module
 
 DATA = b"model weights" * 100
 SPEC = ModelFile(
@@ -299,3 +304,138 @@ def test_redirects_must_stay_on_https():
         handler.redirect_request(
             request, io.BytesIO(), 302, "Found", {}, "http://example.invalid/b"
         )
+
+
+# ------------------------------------------------------------ total deadline
+
+
+def test_the_download_deadline_scales_with_the_pinned_size():
+    rate = modelfiles.DOWNLOAD_MIN_BYTES_PER_SECOND
+    assert rate == 64 * 1024
+    assert modelfiles._download_deadline(1000, 60.0) == 600.0  # the floor: 10 timeouts
+    assert modelfiles._download_deadline(1000, 0.5) == 5.0
+    big = 400 * 1024 * 1024
+    assert modelfiles._download_deadline(big, 60.0) == big / rate  # 6400 s at 64 KiB/s
+
+
+class HttpsModelServer:
+    """Serves one pinned file over HTTPS on 127.0.0.1, fast or trickled.
+
+    ``mode`` is ``fast``, ``redirect`` (a 302 to ``/files/<name>`` first),
+    ``slow_body`` or ``slow_headers`` (one byte every 50 ms, well inside the
+    per-read timeout, so that only the total deadline can end the download).
+    """
+
+    def __init__(self, tls: ssl.SSLContext, data: bytes, mode: str) -> None:
+        self.data = data
+        self.mode = mode
+        self.paths: list[str] = []
+        self._tls = tls
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"https://127.0.0.1:{self._listener.getsockname()[1]}/model.bin"
+
+    def __enter__(self) -> HttpsModelServer:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._listener.close()
+        self._thread.join(5)
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                raw, _ = self._listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(raw,), daemon=True).start()
+
+    def _handle(self, raw: socket.socket) -> None:
+        try:
+            with self._tls.wrap_socket(raw, server_side=True) as conn:
+                conn.settimeout(10)
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    request += chunk
+                path = request.split(b" ", 2)[1].decode("ascii")
+                self.paths.append(path)
+                if self.mode == "redirect" and not path.startswith("/files/"):
+                    conn.sendall(
+                        b"HTTP/1.1 302 Found\r\nLocation: /files/model.bin\r\n"
+                        b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    return
+                head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(
+                    self.data
+                )
+                if self.mode == "slow_headers":
+                    self._trickle(conn, head + self.data)
+                elif self.mode == "slow_body":
+                    conn.sendall(head)
+                    self._trickle(conn, self.data)
+                else:
+                    conn.sendall(head + self.data)
+        except OSError:
+            return
+
+    def _trickle(self, conn: ssl.SSLSocket, data: bytes) -> None:
+        for byte in data:
+            if self._stop.wait(0.05):
+                return
+            conn.sendall(bytes([byte]))
+
+
+@pytest.fixture
+def tls_pair(tmp_path, monkeypatch):
+    """A server context, and downloads that trust only its CA."""
+    require_module("cryptography", extra="c2pa")  # generates the test certificates
+    from tests.provenance._certs import make_tls_contexts
+
+    server, client = make_tls_contexts(tmp_path)
+    monkeypatch.setattr(modelfiles, "_tls_context", lambda: client)
+    return server
+
+
+def spec_for(server: HttpsModelServer) -> ModelFile:
+    return ModelFile(
+        name="model.bin",
+        url=server.url,
+        sha256=hashlib.sha256(server.data).hexdigest(),
+        size=len(server.data),
+    )
+
+
+@pytest.mark.parametrize("mode", ["fast", "redirect"])
+def test_downloads_over_https(tls_pair, tmp_path, mode):
+    target = tmp_path / "models"
+    with HttpsModelServer(tls_pair, DATA, mode) as server:
+        path = download_model_file(spec_for(server), target, timeout_seconds=5)
+    assert path.read_bytes() == DATA
+    assert server.paths == (
+        ["/model.bin"] if mode == "fast" else ["/model.bin", "/files/model.bin"]
+    )
+    assert sorted(p.name for p in target.iterdir()) == ["model.bin"]
+
+
+@pytest.mark.parametrize("mode", ["slow_body", "slow_headers"])
+def test_a_trickled_download_hits_the_total_deadline(tls_pair, tmp_path, monkeypatch, mode):
+    """R2-S04: a per-read timeout alone let one byte per (timeout - epsilon) go on forever."""
+    monkeypatch.setattr(modelfiles, "_DEADLINE_TIMEOUTS", 2)  # deadline = 2 x 0.5 s
+    target = tmp_path / "models"
+    with HttpsModelServer(tls_pair, DATA, mode) as server:
+        started = time.monotonic()
+        with pytest.raises(ModelLoadError, match=r"in time \(deadline 1 s\)") as info:
+            download_model_file(spec_for(server), target, timeout_seconds=0.5)
+        elapsed = time.monotonic() - started
+    assert elapsed < 3.0
+    assert str(tmp_path) not in str(info.value)
+    assert list(target.iterdir()) == []  # nothing left behind

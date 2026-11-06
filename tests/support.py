@@ -2,7 +2,10 @@
 
 * :func:`require_module` and :func:`require_tool` skip a test, with a reason
   that says what to install, when an optional dependency or binary is missing.
-  Integration tests call them instead of failing.
+  Integration tests call them instead of failing. Setting
+  ``PROVENANCE_KIT_TEST_REQUIRE`` to a comma-separated list of extras (and
+  tool names) turns those skips into failures for the listed ones, so that
+  an environment that is meant to have them (CI) cannot pass by skipping.
 * :func:`find_tools` locates ffmpeg, ffprobe and fpcalc for tests: the
   ``PROVENANCE_KIT_<TOOL>`` environment variables first, then the repository's
   ``tools/`` directory (see docs/DEVELOPMENT.md), then ``PATH``.
@@ -20,6 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import NoReturn
 
 import pytest
 
@@ -40,6 +44,51 @@ _TOOL_SUBDIRS = {Tool.FFMPEG: "ffmpeg", Tool.FFPROBE: "ffmpeg", Tool.FPCALC: "fp
 
 #: A fixed seed for every random generator in the tests.
 SEED = 20261105
+
+#: Comma-separated extras (or tool names) whose absence fails the test run
+#: instead of skipping, for example ``c2pa,timestamps,image-hash,audio,video``.
+REQUIRE_ENV = "PROVENANCE_KIT_TEST_REQUIRE"
+
+#: The extras of pyproject.toml (``all`` and ``dev`` aside).
+EXTRAS = frozenset(
+    {
+        "image-watermark",
+        "image-hash",
+        "pdq-native",
+        "video",
+        "video-watermark",
+        "audio",
+        "audio-watermark",
+        "c2pa",
+        "timestamps",
+    }
+)
+
+#: The extras whose features run each binary: listing one requires the binary.
+_TOOL_EXTRAS = {
+    Tool.FFMPEG: ("video", "audio"),
+    Tool.FFPROBE: ("video", "audio"),
+    Tool.FPCALC: ("audio",),
+}
+
+
+def _required() -> frozenset[str]:
+    """Returns the names listed in ``PROVENANCE_KIT_TEST_REQUIRE``, validated."""
+    names = frozenset(
+        name.strip() for name in os.environ.get(REQUIRE_ENV, "").split(",") if name.strip()
+    )
+    unknown = names - EXTRAS - {tool.value for tool in Tool}
+    if unknown:
+        raise ValueError(
+            f"{REQUIRE_ENV} names unknown extras or tools: {', '.join(sorted(unknown))}"
+        )
+    return names
+
+
+def _skip_or_fail(reason: str, *, required: bool) -> NoReturn:
+    if required:
+        pytest.fail(f"{reason} ({REQUIRE_ENV} requires it)", pytrace=False)
+    pytest.skip(reason, allow_module_level=True)
 
 
 def _repo_tool(tool: Tool) -> Path | None:
@@ -67,13 +116,20 @@ def find_tools() -> ExternalTools:
 
 
 def require_tool(tool: Tool) -> Path:
-    """Returns the tool's path or skips the test with a clear reason."""
+    """Returns the tool's path or skips the test with a clear reason.
+
+    The skip is a failure instead when ``PROVENANCE_KIT_TEST_REQUIRE`` lists
+    the tool or an extra that needs it (``video``: ffmpeg and ffprobe;
+    ``audio``: those and fpcalc).
+    """
+    required = _required()
     try:
         return find_tools().resolve(tool)
     except BackendUnavailableError:
-        pytest.skip(
+        _skip_or_fail(
             f"needs the {tool.value} binary: set {ENV_PREFIX}{tool.name}, put it under "
-            f"tools/{_TOOL_SUBDIRS[tool]}/, or install it on PATH"
+            f"tools/{_TOOL_SUBDIRS[tool]}/, or install it on PATH",
+            required=tool.value in required or not required.isdisjoint(_TOOL_EXTRAS[tool]),
         )
 
 
@@ -135,14 +191,23 @@ def require_module(name: str, *, extra: str) -> ModuleType:
     other import failure propagates and fails the test: a missing transitive
     dependency, a broken native library, or an error inside the module, and
     above all a broken ``provenance_kit`` import, which must never be
-    mistaken for "extra not installed".
+    mistaken for "extra not installed". The skip is a failure instead when
+    ``PROVENANCE_KIT_TEST_REQUIRE`` lists ``extra``.
+
+    It may be called at module level (an integration file's import guard):
+    the skip, or the failure, then applies to the whole module.
     """
     if name == "provenance_kit" or name.startswith("provenance_kit."):
         raise ValueError("provenance_kit modules are not optional: import them directly")
+    if extra not in EXTRAS:
+        raise ValueError(f"unknown extra {extra!r}")
+    required = _required()
     try:
         return importlib.import_module(name)
     except ModuleNotFoundError as exc:
         missing = exc.name or ""
         if missing and (name == missing or name.startswith(missing + ".")):
-            pytest.skip(f'needs {name}: pip install "provenance-kit[{extra}]"')
+            _skip_or_fail(
+                f'needs {name}: pip install "provenance-kit[{extra}]"', required=extra in required
+            )
         raise

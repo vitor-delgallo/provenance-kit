@@ -41,15 +41,14 @@ from provenance_kit.provenance.c2pa import (
     read_manifest,
     sign_asset,
 )
-from tests.support import SEED
+from tests.support import SEED, require_module
 
 pytestmark = pytest.mark.integration
 
-try:
-    import c2pa
-    import cryptography  # noqa: F401 - LocalKeySigner and the test PKI need it
-except Exception:  # missing, or a native library that does not load
-    pytest.skip('needs c2pa-python: pip install "provenance-kit[c2pa]"', allow_module_level=True)
+# Skips only when c2pa-python or cryptography is not installed; a native
+# library that fails to load is an error, not a skip.
+c2pa = require_module("c2pa", extra="c2pa")
+require_module("cryptography", extra="c2pa")  # LocalKeySigner and the test PKI
 
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
@@ -57,7 +56,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from PIL import Image  # noqa: E402
 
 from tests.provenance._calendar import MockCalendar  # noqa: E402
-from tests.provenance._certs import make_c2pa_pki  # noqa: E402
+from tests.provenance._certs import make_c2pa_pki, pem_block  # noqa: E402
 from tests.provenance._cose import (  # noqa: E402
     assertion_cbor,
     claim_assertion_lists,
@@ -567,6 +566,34 @@ def test_leaf_without_digital_signature_is_refused_for_every_signer(key_usage):
     with pytest.raises(ValueError, match="digitalSignature"):
         sign_asset(image_bytes("JPEG"), "image/jpeg", simple_spec(), kms)
     assert kms.calls == 0
+
+
+@pytest.mark.parametrize("label", ["TRUSTED CERTIFICATE", "FOO"])
+def test_a_leaf_under_another_pem_label_is_refused(pki, label):
+    """R2-S03: c2pa-rs signs with every PEM block, cryptography skips other labels.
+
+    A nonRepudiation-only leaf labelled ``TRUSTED CERTIFICATE`` (or ``FOO``)
+    followed by a valid certificate used to pass the key usage check on the
+    second block, and the library then signed with the first and read the
+    manifest back as trusted.
+    """
+    bad = make_c2pa_pki("es256", key_usage="nonRepudiation")
+    kms = FakeKms(bad)
+    kms.certificate_chain_pem = pem_block(bad.leaf_pem, label) + pki.leaf_pem
+    with pytest.raises(ValueError, match="CERTIFICATE"):
+        sign_asset(image_bytes("PNG"), "image/png", simple_spec(), kms)
+    assert kms.calls == 0
+
+
+def test_the_library_receives_the_checked_chain(pki):
+    """The chain is re-encoded from the parsed certificates before the library sees it."""
+    kms = FakeKms(pki)
+    kms.certificate_chain_pem = "\r\n" + pki.leaf_pem.replace("\n", "\r\n") + "\n\n"
+    signed = sign_asset(image_bytes("PNG"), "image/png", simple_spec(), kms)
+    report = read_manifest(signed, trust_anchors_pem=pki.root_pem)
+    assert report.state is ValidationState.TRUSTED
+    assert report.signer is not None
+    assert report.signer.common_name == "provenance-kit test signer"
 
 
 def test_corrupt_asset_or_ingredient_is_a_media_error(signer):

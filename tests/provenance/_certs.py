@@ -8,15 +8,22 @@
   or without ``digitalSignature``).
 * :func:`make_tls_contexts` builds a CA and a ``127.0.0.1`` server certificate
   for HTTPS tests.
+* :func:`leaf_with_raw_key_usage` builds a certificate whose key usage
+  extensions are given as raw DER, for encodings ``cryptography``'s builder
+  refuses to produce (two key usage extensions, a value that is not a BIT
+  STRING).
+* :func:`pem_block` wraps a certificate in a PEM block with any label.
 
 Import this module only after ``require_module("cryptography", ...)``.
 """
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import ipaddress
 import ssl
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -199,3 +206,69 @@ def make_tls_contexts(directory: Path) -> tuple[ssl.SSLContext, ssl.SSLContext]:
     server.load_cert_chain(cert_file, key_file)
     client = ssl.create_default_context(cadata=_pem(root))
     return server, client
+
+
+def pem_block(certificate_pem: str, label: str) -> str:
+    """Re-wraps the first certificate of ``certificate_pem`` under another PEM label."""
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    der = certificate.public_bytes(serialization.Encoding.DER)
+    body = "\n".join(textwrap.wrap(base64.b64encode(der).decode("ascii"), 64))
+    return f"-----BEGIN {label}-----\n{body}\n-----END {label}-----\n"
+
+
+#: Placeholder OIDs whose DER encoding has the length of id-ce-keyUsage (2.5.29.15).
+_PLACEHOLDERS = (ObjectIdentifier("2.5.29.98"), ObjectIdentifier("2.5.29.99"))
+_KEY_USAGE_OID_DER = bytes.fromhex("0603551d0f")
+
+
+def _der_tlv(tag: int, body: bytes) -> bytes:
+    if len(body) < 0x80:
+        length = bytes([len(body)])
+    else:
+        raw = len(body).to_bytes((len(body).bit_length() + 7) // 8, "big")
+        length = bytes([0x80 | len(raw)]) + raw
+    return bytes([tag]) + length + body
+
+
+def leaf_with_raw_key_usage(values: list[tuple[bytes, bool]]) -> tuple[bytes, str]:
+    """Returns ``(key_pem, certificate_pem)``: a P-256 leaf with hand-encoded key usages.
+
+    Each ``(extn_value, critical)`` becomes one key usage extension whose
+    ``extnValue`` is the given DER (for example ``bytes.fromhex("03020780")``,
+    a BIT STRING with ``digitalSignature``). The builder refuses duplicate or
+    malformed extensions, so they are added under placeholder OIDs of the
+    same length, patched to id-ce-keyUsage in the TBS certificate, and the
+    certificate is signed again.
+    """
+    if not 1 <= len(values) <= len(_PLACEHOLDERS):
+        raise ValueError("one or two key usage extensions")
+    issuer_key = ec.generate_private_key(ec.SECP256R1())
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = dt.datetime.now(dt.UTC)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(_name("provenance-kit raw key usage"))
+        .issuer_name(_name("provenance-kit raw key usage"))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(days=1))
+        .not_valid_after(now + dt.timedelta(days=30))
+    )
+    for placeholder, (value, critical) in zip(_PLACEHOLDERS, values, strict=False):
+        builder = builder.add_extension(
+            x509.UnrecognizedExtension(placeholder, value), critical=critical
+        )
+    tbs = builder.sign(issuer_key, hashes.SHA256()).tbs_certificate_bytes
+    for placeholder in _PLACEHOLDERS[: len(values)]:
+        encoded = bytes.fromhex("0603551d") + bytes([int(placeholder.dotted_string.split(".")[-1])])
+        assert tbs.count(encoded) == 1
+        tbs = tbs.replace(encoded, _KEY_USAGE_OID_DER)
+    signature = issuer_key.sign(tbs, ec.ECDSA(hashes.SHA256()))  # DER Ecdsa-Sig-Value
+    ecdsa_with_sha256 = bytes.fromhex("300a06082a8648ce3d040302")
+    der = _der_tlv(0x30, tbs + ecdsa_with_sha256 + _der_tlv(0x03, b"\x00" + signature))
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    return key_pem, _pem(x509.load_der_x509_certificate(der))

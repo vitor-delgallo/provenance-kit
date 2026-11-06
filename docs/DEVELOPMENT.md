@@ -79,14 +79,47 @@ release branch and record its checksum. The LGPL variant is preferred over the
 GPL one so that the binaries used for development carry the least restrictive
 license (see [THIRD_PARTY.md](THIRD_PARTY.md)).
 
-On Linux, use the static builds from the same projects, as CI does: BtbN's
-`ffmpeg-n8.1-latest-linux64-lgpl-8.1.tar.xz` and Chromaprint's
-`chromaprint-fpcalc-1.6.2-linux-x86_64.tar.gz` (SHA-256
-`c968ad4a0821592a79b158fb2e1f46cbe0a22a0a1dbc0743c67d68e75d15d2bb`), and
-point the `PROVENANCE_KIT_*` variables at them. Distribution packages
-(`ffmpeg`, `libchromaprint-tools`) also work but are often older releases,
-and distribution FFmpeg packages are usually GPL builds
-([THIRD_PARTY.md](THIRD_PARTY.md)).
+On Linux, use the static builds from the same projects, as CI does, and
+point the `PROVENANCE_KIT_*` variables at them:
+
+| Binary | Version | Source | SHA-256 |
+|---|---|---|---|
+| ffmpeg, ffprobe | n8.1.3-27-g8dca1586f4 (2026-10-31), **LGPL** build | BtbN release `autobuild-2026-10-31-12-59`, asset `ffmpeg-n8.1.3-27-g8dca1586f4-linux64-lgpl-8.1.tar.xz` (<https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/ffmpeg-n8.1.3-27-g8dca1586f4-linux64-lgpl-8.1.tar.xz>) | `a64f3171e6ad1f7d358d28890a907ee478c331d1177ec696a93418f79ac3f1f3` (GitHub's asset digest and the release's `checksums.sha256` agree) |
+| fpcalc | 1.6.2 | Chromaprint release asset `chromaprint-fpcalc-1.6.2-linux-x86_64.tar.gz` | `c968ad4a0821592a79b158fb2e1f46cbe0a22a0a1dbc0743c67d68e75d15d2bb` |
+
+Distribution packages do not run the whole suite: the test media helpers
+encode H.264 with `libopenh264` (the LGPL builds have no `libx264`), and
+Debian and Ubuntu build FFmpeg without it. Measured on 2026-11-05 with
+Ubuntu 24.04's `ffmpeg` 7:6.1.1-3ubuntu5 (FFmpeg 6.1.1, a GPL build): 48
+video and audio integration tests error with "Encoder not found". Its
+dependencies also install `libfribidi`, which turns on Pillow's Raqm text
+layout and changes the pixels of the visible-watermark tests.
+`libchromaprint-tools` is fpcalc 1.5.1 there, older than the reference.
+
+### FFmpeg in CI
+
+The integration job downloads the pinned BtbN build above and checks its
+SHA-256 (`FFMPEG_URL` and `FFMPEG_SHA256` in `.github/workflows/ci.yml`).
+BtbN deletes its daily `autobuild-*` releases after about two weeks but has
+kept every month-end one (back to `autobuild-2024-12-31-13-02` as of
+2026-11-05), which is why a month-end build is pinned. The archive is also
+kept in the GitHub Actions cache under its digest (`actions/cache`, key
+`ffmpeg-<sha256>`), so the job keeps working if the release disappears
+while the cache entry lives; GitHub evicts entries unused for 7 days. When
+neither has it, the job fails with "The pinned FFmpeg build is neither
+cached nor downloadable". To update the pin:
+
+1. Pick the newest month-end release of
+   [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases)
+   (`autobuild-YYYY-MM-<last day>-*`) and its `linux64-lgpl-8.1` asset (or
+   the next release branch, after testing it).
+2. Take its SHA-256 from GitHub's asset digest (`gh api
+   repos/BtbN/FFmpeg-Builds/releases/tags/<tag> --jq '.assets[] |
+   select(.name == "<asset>") | .digest'`) and check that the release's
+   `checksums.sha256` lists the same value.
+3. Set `FFMPEG_URL` and `FFMPEG_SHA256`, update the version in the comment
+   above them, in the table above and in [THIRD_PARTY.md](THIRD_PARTY.md),
+   and run the integration job (or its Docker emulation) before merging.
 
 ## Model files and other downloaded test data
 
@@ -135,6 +168,16 @@ pytest                                         # everything available offline
 
 * Skipped tests print their reason with `-rs` (enabled by default through
   `-ra`): it names the extra to install or the binary to configure.
+* `PROVENANCE_KIT_TEST_REQUIRE` turns those skips into failures for the
+  extras it lists (comma-separated; tool names `ffmpeg`, `ffprobe` and
+  `fpcalc` work too, and `video` or `audio` also require the binaries their
+  features run). Set it wherever an extra is meant to be installed, so that
+  a broken install (a c2pa-python wheel whose native library does not load,
+  a missing binary) cannot pass as a run of skips; CI's integration job sets
+  `c2pa,timestamps,image-hash,audio,video`. An unknown name is an error.
+  Only a missing module skips at all: `tests.support.require_module` lets
+  every other import error fail, so integration files guard their imports
+  with it, never with `try: import ... except Exception: pytest.skip(...)`.
 * Warnings are errors (`filterwarnings = error`). If a third-party library
   emits a warning you cannot avoid, filter that specific warning in the test
   with `@pytest.mark.filterwarnings("ignore:...:DeprecationWarning")`.
@@ -144,13 +187,17 @@ pytest                                         # everything available offline
   ".[dev]"`): mypy must pass without the optional packages too, which is why
   `pyproject.toml` ignores their missing imports (including the typed
   `cryptography`; when it is installed, mypy still checks against its types).
-  `integration` runs `pytest -m integration` on Ubuntu with Python 3.11 and
-  3.13, with ffmpeg/ffprobe (BtbN's `linux64-lgpl` build of the 8.1 branch,
-  checked against the release's `checksums.sha256`), fpcalc 1.6.2 (the
-  `linux-x86_64` release asset, pinned by SHA-256) and the extras that need
-  no model weights (`image-hash,video,audio,c2pa,timestamps`). The
-  watermark tests skip there with their reason (no PyTorch, no weights), as
-  do the `network` tests; run them locally.
+  `integration` runs `pytest -m "not network"` (the unit tests again, now
+  with the extras installed, and the integration tests) on Ubuntu with
+  Python 3.11 and 3.13, with ffmpeg/ffprobe n8.1.3 (BtbN's `linux64-lgpl`
+  build, pinned by SHA-256 and cached; see "FFmpeg in CI" above), fpcalc
+  1.6.2 (the `linux-x86_64` release asset, pinned by SHA-256) and the
+  extras that need no model weights (`image-hash,video,audio,c2pa,timestamps`),
+  with `PROVENANCE_KIT_TEST_REQUIRE` set to those extras, so a missing or
+  broken one fails the job. The unit tests that need an extra, such as the
+  signing-certificate checks (`cryptography`), run only there. The watermark
+  tests skip there with their reason (no PyTorch, no weights), as do the
+  `network` tests; run them locally.
 
 ## Known quirks found while setting up
 

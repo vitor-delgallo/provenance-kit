@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import enum
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
@@ -24,6 +27,17 @@ __all__ = [
 ]
 
 _PEM_CERTIFICATE = "-----BEGIN CERTIFICATE-----"
+# A PEM block of any label; the label and the body are checked afterwards.
+_PEM_BLOCK = re.compile(
+    r"-----BEGIN (?P<begin>[^\r\n]*?)-----(?P<body>.*?)-----END (?P<end>[^\r\n]*?)-----",
+    re.DOTALL,
+)
+_PEM_SPACE = " \t\r\n"
+_PEM_SPACE_RE = re.compile(r"[ \t\r\n]+")
+_CHAIN_FORMAT = (
+    "the certificate chain must consist of PEM blocks labelled CERTIFICATE, "
+    "separated by whitespace only"
+)
 # RSA moduli from 2048 bits (the C2PA minimum) to 8192 bits.
 _RSA_SIGNATURE_BYTES = (256, 1024)
 
@@ -130,12 +144,16 @@ class C2paSigner(Protocol):
     Attributes:
         algorithm: The signature algorithm; it must match the key.
         certificate_chain_pem: The signing certificate followed by any
-            intermediate certificates, PEM-encoded, without the root. The
-            leaf must be a C2PA claim-signing certificate (a key usage
-            extension with ``digitalSignature``, which ``sign_asset`` checks
-            itself; an allowed extended key usage such as
+            intermediate certificates, PEM-encoded, without the root: only
+            blocks labelled exactly ``CERTIFICATE``, separated by whitespace
+            (no other labels such as ``TRUSTED CERTIFICATE``, no explanatory
+            text). The leaf must be a C2PA claim-signing certificate (a key
+            usage extension with ``digitalSignature``, which ``sign_asset``
+            checks itself; an allowed extended key usage such as
             ``id-kp-emailProtection`` or ``id-kp-documentSigning``; not a
-            CA). It is embedded in every manifest and is therefore public.
+            CA). ``sign_asset`` passes the C2PA library the chain re-encoded
+            from the certificates it checked. It is embedded in every
+            manifest and is therefore public.
         signature_format: The encoding :meth:`sign` returns.
     """
 
@@ -249,8 +267,9 @@ def check_signer(signer: C2paSigner) -> tuple[SigningAlgorithm, str, SignatureFo
 
     Raises:
         TypeError: If a property has the wrong type or ``sign`` is missing.
-        ValueError: If the chain is not PEM certificates, or the format does
-            not apply to the algorithm.
+        ValueError: If the chain is not PEM certificate blocks (see
+            :func:`split_pem_certificates`), or the format does not apply to
+            the algorithm.
     """
     algorithm = signer.algorithm
     if not isinstance(algorithm, SigningAlgorithm):
@@ -260,6 +279,7 @@ def check_signer(signer: C2paSigner) -> tuple[SigningAlgorithm, str, SignatureFo
         raise TypeError("signer.certificate_chain_pem must be a str")
     if _PEM_CERTIFICATE not in chain:
         raise ValueError("signer.certificate_chain_pem must contain PEM certificates")
+    split_pem_certificates(chain)
     signature_format = signer.signature_format
     if not isinstance(signature_format, SignatureFormat):
         raise TypeError("signer.signature_format must be a SignatureFormat")
@@ -270,7 +290,49 @@ def check_signer(signer: C2paSigner) -> tuple[SigningAlgorithm, str, SignatureFo
     return algorithm, chain, signature_format
 
 
-def check_signing_certificate(certificate_chain_pem: str) -> None:
+def split_pem_certificates(certificate_chain_pem: str) -> tuple[bytes, ...]:
+    """Splits a PEM chain into DER certificates, strictly (internal).
+
+    Every block must be labelled exactly ``CERTIFICATE`` and hold base64
+    only (ASCII whitespace inside it is ignored); only ASCII whitespace may
+    surround the blocks. Lenient parsers disagree on everything else:
+    ``cryptography`` skips blocks with other labels (``TRUSTED
+    CERTIFICATE``, ``FOO``) while c2pa-rs uses every block, so the leaf that
+    was checked would not be the leaf that signs.
+
+    Args:
+        certificate_chain_pem: The chain, leaf first.
+
+    Returns:
+        The DER bytes of each block, in order (not parsed as certificates).
+
+    Raises:
+        ValueError: If the text is not one or more such blocks.
+    """
+    ders: list[bytes] = []
+    position = 0
+    for match in _PEM_BLOCK.finditer(certificate_chain_pem):
+        if certificate_chain_pem[position : match.start()].strip(_PEM_SPACE):
+            raise ValueError(_CHAIN_FORMAT)
+        if match["begin"] != "CERTIFICATE" or match["end"] != "CERTIFICATE":
+            raise ValueError(_CHAIN_FORMAT)
+        body = _PEM_SPACE_RE.sub("", match["body"])
+        try:
+            der = base64.b64decode(body.encode("ascii"), validate=True)
+        except (UnicodeError, binascii.Error):
+            raise ValueError("the certificate chain could not be loaded (bad base64)") from None
+        if not der:
+            raise ValueError("the certificate chain could not be loaded (empty block)")
+        ders.append(der)
+        position = match.end()
+    if certificate_chain_pem[position:].strip(_PEM_SPACE):
+        raise ValueError(_CHAIN_FORMAT)
+    if not ders:
+        raise ValueError("the certificate chain is empty")
+    return tuple(ders)
+
+
+def check_signing_certificate(certificate_chain_pem: str) -> str:
     """Checks that a signer's leaf certificate may sign C2PA claims (internal).
 
     C2PA 2.3, section 14.5.1: certificates used to sign C2PA manifests "shall
@@ -279,25 +341,52 @@ def check_signing_certificate(certificate_chain_pem: str) -> None:
     ``nonRepudiation``, and then reads the manifests it signed back as
     trusted. This check closes that gap before the library is called.
 
+    The chain is parsed strictly (:func:`split_pem_certificates`) and
+    returned re-encoded from the parsed certificates: pass the returned text,
+    not the input, to the C2PA library, so that the certificate checked here
+    is the one it signs with.
+
     Args:
         certificate_chain_pem: The chain, leaf first, PEM-encoded.
+
+    Returns:
+        The chain in canonical PEM (one ``CERTIFICATE`` block per
+        certificate, 64-character lines, LF line endings).
 
     Raises:
         BackendUnavailableError: If ``cryptography`` is not installed (extra
             ``c2pa``).
-        ValueError: If the chain holds no loadable certificate, or the leaf
-            has no key usage extension or one without ``digitalSignature``.
+        ValueError: If the chain is not strictly PEM certificates, a block is
+            not a certificate, or the leaf has no key usage extension, one
+            that cannot be parsed, or one without ``digitalSignature``.
     """
+    certificates = _load_chain(certificate_chain_pem)
+    _check_leaf_key_usage(certificates[0])
+    return _canonical_pem(certificates)
+
+
+def _load_chain(certificate_chain_pem: str) -> list[x509.Certificate]:
     _require_cryptography()
     from cryptography import x509  # noqa: PLC0415 - optional dependency
 
-    try:
-        certificates = x509.load_pem_x509_certificates(certificate_chain_pem.encode("ascii"))
-    except (ValueError, UnicodeError) as exc:
-        raise ValueError("the certificate chain could not be loaded") from exc
-    if not certificates:
-        raise ValueError("the certificate chain is empty")
-    _check_leaf_key_usage(certificates[0])
+    certificates = []
+    for der in split_pem_certificates(certificate_chain_pem):
+        try:
+            certificates.append(x509.load_der_x509_certificate(der))
+        except MemoryError:
+            raise
+        except Exception as exc:  # ValueError, or a cryptography-specific type
+            raise ValueError("the certificate chain could not be loaded") from exc
+    return certificates
+
+
+def _canonical_pem(certificates: list[x509.Certificate]) -> str:
+    from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
+
+    return "".join(
+        certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
+        for certificate in certificates
+    )
 
 
 def _check_leaf_key_usage(leaf: x509.Certificate) -> None:
@@ -310,7 +399,9 @@ def _check_leaf_key_usage(leaf: x509.Certificate) -> None:
             "the signing certificate has no key usage extension; C2PA requires "
             "digitalSignature (C2PA 2.3, section 14.5.1)"
         ) from None
-    except ValueError as exc:  # a malformed extension
+    except MemoryError:
+        raise
+    except Exception as exc:  # malformed or duplicate extensions (DuplicateExtension)
         raise ValueError("the signing certificate's extensions could not be parsed") from exc
     if not usage.digital_signature:
         raise ValueError(
@@ -376,9 +467,11 @@ class LocalKeySigner:
     The algorithm defaults from the key: ES256, ES384 or ES512 for P-256,
     P-384 or P-521 keys, ED25519 for Ed25519 keys and PS256 for RSA keys (pass
     PS384 or PS512 to choose another hash). Signatures are returned as
-    :attr:`SignatureFormat.RAW`. The constructor checks that the first
-    certificate of the chain holds the key's public key and asserts the
-    ``digitalSignature`` key usage.
+    :attr:`SignatureFormat.RAW`. The constructor parses the chain strictly
+    (only ``CERTIFICATE`` blocks, see :class:`C2paSigner`), checks that the
+    first certificate holds the key's public key and asserts the
+    ``digitalSignature`` key usage, and keeps the chain re-encoded from the
+    parsed certificates (:attr:`certificate_chain_pem`).
 
     Thread safety: safe to share between threads.
 
@@ -392,9 +485,11 @@ class LocalKeySigner:
     Raises:
         BackendUnavailableError: If ``cryptography`` is not installed.
         TypeError: If an argument has the wrong type.
-        ValueError: If the key or the chain cannot be loaded, the key type or
-            size does not fit the algorithm, or the leaf certificate does not
-            match the key or lacks the ``digitalSignature`` key usage.
+        ValueError: If the key or the chain cannot be loaded (including a
+            chain with blocks other than ``CERTIFICATE`` or text between
+            them), the key type or size does not fit the algorithm, or the
+            leaf certificate does not match the key, has extensions that
+            cannot be parsed or lacks the ``digitalSignature`` key usage.
             Messages never contain key material.
     """
 
@@ -421,7 +516,6 @@ class LocalKeySigner:
             raise TypeError("password must be bytes or None")
 
         _require_cryptography()
-        from cryptography import x509  # noqa: PLC0415 - optional dependency
         from cryptography.hazmat.primitives import serialization  # noqa: PLC0415
 
         try:
@@ -430,22 +524,24 @@ class LocalKeySigner:
             raise ValueError("the private key could not be loaded") from exc
         except Exception as exc:  # cryptography's UnsupportedAlgorithm
             raise ValueError(f"the private key could not be loaded ({type(exc).__name__})") from exc
-        try:
-            certificates = x509.load_pem_x509_certificates(certificate_chain_pem.encode("ascii"))
-        except (ValueError, UnicodeError) as exc:
-            raise ValueError("the certificate chain could not be loaded") from exc
-        if not certificates:
-            raise ValueError("the certificate chain is empty")
+        certificates = _load_chain(certificate_chain_pem)
 
         der = serialization.Encoding.DER
         spki = serialization.PublicFormat.SubjectPublicKeyInfo
-        leaf_public = certificates[0].public_key().public_bytes(der, spki)
+        try:
+            leaf_public = certificates[0].public_key().public_bytes(der, spki)
+        except MemoryError:
+            raise
+        except Exception as exc:  # an unsupported or malformed public key
+            raise ValueError(
+                f"the first certificate's public key could not be loaded ({type(exc).__name__})"
+            ) from exc
         if leaf_public != key.public_key().public_bytes(der, spki):
             raise ValueError("the first certificate of the chain does not match the private key")
         _check_leaf_key_usage(certificates[0])
 
         self._algorithm, self._sign = _key_signer(key, algorithm)
-        self._chain = certificate_chain_pem
+        self._chain = _canonical_pem(certificates)
 
     @property
     def algorithm(self) -> SigningAlgorithm:
@@ -454,7 +550,7 @@ class LocalKeySigner:
 
     @property
     def certificate_chain_pem(self) -> str:
-        """The certificate chain, leaf first, PEM-encoded."""
+        """The certificate chain, leaf first, in canonical PEM."""
         return self._chain
 
     @property

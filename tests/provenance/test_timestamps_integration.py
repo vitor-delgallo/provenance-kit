@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import threading
 import time
 
 import pytest
@@ -22,17 +23,13 @@ from provenance_kit.provenance.timestamps import (
     OpenTimestamper,
     TimestampProof,
 )
-from tests.support import SEED
+from tests.support import SEED, require_module
 
 pytestmark = pytest.mark.integration
 
-try:
-    import bitcoin  # noqa: F401 - python-bitcoinlib, a dependency of opentimestamps
-    import opentimestamps  # noqa: F401
-except Exception:
-    pytest.skip(
-        'needs opentimestamps: pip install "provenance-kit[timestamps]"', allow_module_level=True
-    )
+# Skips only when the packages are not installed; a broken install is an error.
+require_module("opentimestamps", extra="timestamps")
+require_module("bitcoin", extra="timestamps")  # python-bitcoinlib, a dependency of opentimestamps
 
 from opentimestamps.core.notary import PendingAttestation  # noqa: E402
 from opentimestamps.core.op import OpAppend, OpSHA256  # noqa: E402
@@ -43,7 +40,12 @@ from opentimestamps.core.serialize import (  # noqa: E402
 from opentimestamps.core.timestamp import DetachedTimestampFile, Timestamp  # noqa: E402
 
 from tests.provenance import _ots_fixtures as fixtures  # noqa: E402
-from tests.provenance._calendar import BLOCK_HEIGHT, BLOCK_TIME, MockCalendar  # noqa: E402
+from tests.provenance._calendar import (  # noqa: E402
+    BLOCK_HEIGHT,
+    BLOCK_TIME,
+    MockCalendar,
+    slow_dns,
+)
 
 DIGEST = hashlib.sha256(b"the asset").digest()
 
@@ -174,6 +176,37 @@ def test_hostile_calendars_are_contained(mode, reason):
     assert OpenTimestamper().info(proof).pending_calendars == (honest.url,)
 
 
+def pool_threads() -> list[str]:
+    return [t.name for t in threading.enumerate() if t.name.startswith("pk-ots")]
+
+
+@pytest.mark.parametrize("operation", ["stamp", "upgrade"])
+def test_no_pool_thread_outlives_the_deadline(monkeypatch, operation):
+    """R2-S02: a calendar with slow DNS and trickled headers cannot pin a pool thread.
+
+    The pool threads are not daemons (ThreadPoolExecutor joins them when the
+    interpreter exits), so one blocked past the deadline kept the process
+    alive.
+    """
+    with MockCalendar(mode="slow_headers") as calendar, slow_dns(monkeypatch):
+        client = timestamper(calendar.url, timeout_seconds=0.5)
+        started = time.monotonic()
+        if operation == "stamp":
+            with pytest.raises(CalendarError) as info:
+                client.stamp(DIGEST)
+            assert [failure.reason for failure in info.value.failures] == ["timeout"]
+        else:
+            proof = proof_pending_at(calendar.url)
+            upgraded = client.upgrade(proof)
+            assert upgraded.failed_calendars == (CalendarFailure(calendar.url, "timeout"),)
+            assert upgraded.data == proof.data
+        assert time.monotonic() - started < 2.0
+        until = time.monotonic() + 1.0
+        while pool_threads() and time.monotonic() < until:
+            time.sleep(0.02)
+        assert pool_threads() == []
+
+
 def test_same_origin_redirect_is_followed_for_stamping():
     with MockCalendar(mode="redirect_same") as calendar:
         proof = timestamper(calendar.url).stamp(DIGEST)
@@ -182,7 +215,7 @@ def test_same_origin_redirect_is_followed_for_stamping():
 
 
 def test_https_calendar_with_a_custom_trust_store(tmp_path):
-    pytest.importorskip("cryptography", reason='needs cryptography: "provenance-kit[c2pa]"')
+    require_module("cryptography", extra="c2pa")
     from tests.provenance._certs import make_tls_contexts
 
     server_context, client_context = make_tls_contexts(tmp_path)

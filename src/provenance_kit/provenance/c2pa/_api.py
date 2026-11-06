@@ -68,8 +68,10 @@ def sign_asset(
     Raises:
         TypeError: If an argument has the wrong type.
         ValueError: If ``tsa_url`` is malformed or the signer's properties are
-            unusable, including a leaf certificate whose key usage lacks
-            ``digitalSignature`` (checked once the library is loaded).
+            unusable: a certificate chain that is not strictly PEM blocks
+            labelled ``CERTIFICATE``, or (checked once the library is loaded)
+            a block that is not a certificate or a leaf whose extensions
+            cannot be parsed or whose key usage lacks ``digitalSignature``.
         BackendUnavailableError: If c2pa-python is not installed
             (extra ``c2pa``).
         MediaLimitExceededError: If the asset or an ingredient exceeds

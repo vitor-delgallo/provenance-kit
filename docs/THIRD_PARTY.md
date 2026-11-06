@@ -239,7 +239,8 @@ them on your own servers does not trigger the distribution conditions.
 
   So macOS resolves 0.38.2, Linux 0.38.1 and Windows 0.38.0. The module was
   developed and measured against 0.38.0 (Windows); the Linux CI integration
-  job installs 0.38.1 and runs the C2PA integration tests against it.
+  job installs 0.38.1 and runs the C2PA integration tests against it (a
+  missing or unloadable c2pa-python fails that job instead of skipping).
   Signing certificates and trust lists come from your certificate authority
   and carry their own terms.
 * `cryptography` (installed 50.0.2) is also a direct dependency of the `c2pa`
@@ -316,7 +317,13 @@ them on your own servers does not trigger the distribution conditions.
 * The development binaries recorded in [DEVELOPMENT.md](DEVELOPMENT.md) are
   BtbN **LGPL** builds configured with `--enable-version3`, so they are
   LGPL-3.0-or-later (the bundled `LICENSE.txt` is the LGPL v3 text). Most Linux
-  distribution packages and "full" Windows builds are **GPL** builds.
+  distribution packages and "full" Windows builds are **GPL** builds (Ubuntu
+  24.04's `ffmpeg` 6.1.1, for one, is configured with `--enable-gpl`).
+* Versions in use: FFmpeg **n8.1.3-34-ga35157abb9** (2026-11-05) for the
+  Windows development binaries, and **n8.1.3-27-g8dca1586f4** (2026-10-31,
+  BtbN `autobuild-2026-10-31-12-59`, `linux64-lgpl-8.1`, pinned by SHA-256)
+  in the Linux CI integration job. CI downloads and runs that build and
+  distributes nothing.
 * Weights: none.
 * provenance-kit only **executes** FFmpeg as a separate process; that does not
   make the library or your application a derivative work. Shipping FFmpeg

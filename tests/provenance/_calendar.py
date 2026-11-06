@@ -17,17 +17,24 @@ needed for those): ``garbage``, ``trailing``, ``oversized``,
 ``oversized_chunked``, ``huge_declared``, ``truncated``, ``slow_body``,
 ``slow_headers``, ``status_500``, ``redirect_other``, ``redirect_same``, ``redirect_loop`` and
 ``redirect_https``.
+
+:func:`slow_dns` makes name lookups hang, for the deadline tests.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.server
 import os
+import socket
 import ssl
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+
+import pytest
 
 BLOCK_HEIGHT = 840_000
 BLOCK_TIME = 1_713_571_767  # any fixed header time
@@ -290,3 +297,26 @@ def _serialize(stamp: object) -> bytes:
     context = BytesSerializationContext()
     stamp.serialize(context)  # type: ignore[attr-defined]
     return context.getbytes()
+
+
+@contextlib.contextmanager
+def slow_dns(monkeypatch: pytest.MonkeyPatch, *, seconds: float = 10.0) -> Iterator[list[str]]:
+    """Makes every name lookup block (up to ``seconds``) until the block exits.
+
+    Models a slow resolver, or a calendar domain whose DNS answers slowly:
+    ``getaddrinfo`` has no timeout of its own. Yields the looked-up hosts.
+    """
+    real = socket.getaddrinfo
+    release = threading.Event()
+    lookups: list[str] = []
+
+    def lookup(host: object, *args: object, **kwargs: object) -> object:
+        lookups.append(str(host))
+        release.wait(seconds)
+        return real(host, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(socket, "getaddrinfo", lookup)
+    try:
+        yield lookups
+    finally:
+        release.set()

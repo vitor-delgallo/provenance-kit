@@ -587,7 +587,11 @@ def _digest(value: BytesLike) -> bytes:
 def _check_positive(name: str, value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be a number")
-    if not math.isfinite(value) or value <= 0:
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:  # an int beyond the float range
+        finite = False
+    if not finite or value <= 0:
         raise ValueError(f"{name} must be positive and finite")
 
 

@@ -152,6 +152,20 @@ usage extension; an extended key usage it accepts (for example
 identifier. A leaf without an accepted EKU, or without a key usage extension,
 is refused at signing time.
 
+The chain is parsed strictly: only PEM blocks labelled exactly `CERTIFICATE`,
+separated by whitespace (no other label, no explanatory text such as the
+`Bag Attributes` lines `openssl pkcs12` writes; remove them first). Lenient
+parsers disagree here: `cryptography` skips blocks with other labels, while
+c2pa-rs uses every block. Measured on 2026-11-05 before the strict parse: a
+`nonRepudiation`-only leaf labelled `TRUSTED CERTIFICATE` (or `FOO`) followed
+by a valid certificate passed the key usage check below on the second block,
+and the library signed with the first and read the manifest back as
+`TRUSTED`. `sign_asset` also hands the library the chain re-encoded from the
+certificates it parsed (canonical PEM), never the signer's text, so the leaf
+it checked is the leaf that signs; `LocalKeySigner.certificate_chain_pem`
+returns that canonical form. Every failure to parse the chain or the leaf's
+extensions (for example two key usage extensions) is a `ValueError`.
+
 The specification also says that claim-signing certificates "shall assert the
 digitalSignature bit". c2pa-rs 0.91 does not enforce that bit. Measured on
 2026-11-05 with a KMS-style signer before provenance-kit added its own check:
@@ -364,11 +378,22 @@ python-opentimestamps' `RemoteCalendar`, so that every limit is enforced:
 
 * `https` only (`allow_insecure_http=True` is for tests); an optional
   `ssl_context` (for a private CA), otherwise the system trust store;
-* one deadline for the whole exchange: socket timeouts bound each read and a
-  watchdog shuts the socket down at the deadline, so a server that trickles
-  headers or body cannot hold the call (tested on Windows and Linux: there a
-  read blocked on a shut-down socket returns end of file instead of raising,
-  and an exchange the watchdog cut is still a `timeout`, never a short body);
+* one deadline for the whole exchange, covering every blocking step, so that
+  no request thread outlives it by more than a moment (the stamp and upgrade
+  pool threads are not daemons: Python joins them when the interpreter
+  exits). Name lookup runs in a daemon thread that the request stops waiting
+  for at the deadline (`getaddrinfo` has no timeout; at most 32 lookups run
+  at once, process-wide); the addresses of a host share the time left
+  instead of getting a full timeout each; the TLS handshake is bounded as a
+  whole by the time left; socket timeouts bound each read, and a watchdog
+  shuts down every socket of the exchange at the deadline, so a server that
+  trickles headers or body cannot hold the call. A socket opened after the
+  watchdog fired (DNS or connect took the whole time) ends the exchange as a
+  `timeout`; before 2026-11-05 the watchdog was spent in that case and the
+  headers could be read without a deadline. Tested on Windows and Linux: on
+  Linux a read blocked on a shut-down socket returns end of file instead of
+  raising, and an exchange the watchdog cut is still a `timeout`, never a
+  short body;
 * a body shorter than its `Content-Length` is a `truncated response` failure;
 * response size cap, checked against `Content-Length` and while reading
   (chunked responses included);

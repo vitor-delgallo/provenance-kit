@@ -58,10 +58,12 @@ jobs:
         run: pytest -m "not integration and not network"
 
   # Integration tests against the real binaries and the light extras, on
-  # Linux. They need no network beyond the installs below: tests marked
-  # `network` skip without --run-network, and the watermark tests skip with
-  # a reason because the model weights (about 390 MB) and PyTorch are not
-  # installed here; run those locally (docs/DEVELOPMENT.md).
+  # Linux, together with the unit tests (some of those, such as the
+  # signing-certificate checks, need an extra and run only here). They need
+  # no network beyond the downloads below: tests marked `network` skip
+  # without --run-network, and the watermark tests skip with a reason
+  # because the model weights (about 390 MB) and PyTorch are not installed
+  # here; run those locally (docs/DEVELOPMENT.md).
   integration:
     name: integration / ubuntu-latest / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
@@ -71,16 +73,24 @@ jobs:
       matrix:
         python-version: ["3.11", "3.13"]
     env:
-      # FFmpeg: BtbN's LGPL static build of the 8.1 branch (the branch the
-      # Windows reference binaries come from), verified against the
-      # checksums.sha256 published in the same release. "latest" moves daily;
-      # BtbN deletes dated releases after a while, so a dated URL would break.
-      FFMPEG_RELEASE: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest
-      FFMPEG_ARCHIVE: ffmpeg-n8.1-latest-linux64-lgpl-8.1.tar.xz
+      # FFmpeg: BtbN's LGPL static build of the 8.1 branch, n8.1.3-27-g8dca1586f4,
+      # from a month-end release (BtbN prunes its daily releases after about
+      # two weeks and has kept every month-end one so far), pinned by SHA-256
+      # (the digest GitHub reports for the asset, also in the release's
+      # checksums.sha256). The archive is cached under that digest, so the job
+      # keeps working once the release is gone; when neither the cache nor
+      # the URL has it, the job fails: pin a newer build as described in
+      # docs/DEVELOPMENT.md ("FFmpeg in CI").
+      FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-31-12-59/ffmpeg-n8.1.3-27-g8dca1586f4-linux64-lgpl-8.1.tar.xz
+      FFMPEG_SHA256: a64f3171e6ad1f7d358d28890a907ee478c331d1177ec696a93418f79ac3f1f3
       # fpcalc: the Chromaprint 1.6.2 release asset, pinned by SHA-256 (the
       # digest GitHub reports for the asset; same release as on Windows).
       FPCALC_URL: https://github.com/acoustid/chromaprint/releases/download/v1.6.2/chromaprint-fpcalc-1.6.2-linux-x86_64.tar.gz
       FPCALC_SHA256: c968ad4a0821592a79b158fb2e1f46cbe0a22a0a1dbc0743c67d68e75d15d2bb
+      # A test that would skip because one of these extras (or the binaries
+      # they need) is missing fails instead (tests/support.py), so a broken
+      # install cannot pass as a green run of skips.
+      PROVENANCE_KIT_TEST_REQUIRE: c2pa,timestamps,image-hash,audio,video
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,23 +102,38 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      # Keyed by the pinned digest: a new pin starts a new cache entry, and
+      # the next step checks the digest of a restored archive as well.
+      - name: Cache the FFmpeg archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/provenance-kit-ci/ffmpeg
+          key: ffmpeg-${{ env.FFMPEG_SHA256 }}
+
       # Outside the checkout, so the working tree stays clean; the tests find
       # the binaries through the PROVENANCE_KIT_* variables.
       - name: Fetch ffmpeg, ffprobe and fpcalc
         run: |
           set -euo pipefail
+          cache="$HOME/.cache/provenance-kit-ci/ffmpeg"
+          name="${FFMPEG_URL##*/}"
+          if [ ! -f "$cache/$name" ]; then
+            mkdir -p "$cache"
+            if ! curl -fsSL --retry 3 -o "$cache/$name.part" "$FFMPEG_URL"; then
+              echo "::error::The pinned FFmpeg build is neither cached nor downloadable (BtbN may have pruned its release): pin a newer one, see docs/DEVELOPMENT.md"
+              exit 1
+            fi
+            mv "$cache/$name.part" "$cache/$name"
+          fi
+          echo "$FFMPEG_SHA256  $cache/$name" | sha256sum --check --strict -
           dest="$RUNNER_TEMP/tools"
           mkdir -p "$dest/download"
+          tar -xJf "$cache/$name" -C "$dest"
           cd "$dest/download"
-          curl -fsSL --retry 3 -o "$FFMPEG_ARCHIVE" "$FFMPEG_RELEASE/$FFMPEG_ARCHIVE"
-          curl -fsSL --retry 3 -o checksums.sha256 "$FFMPEG_RELEASE/checksums.sha256"
-          awk -v name="$FFMPEG_ARCHIVE" '$2 == name' checksums.sha256 > ffmpeg.sha256
-          sha256sum --check --strict ffmpeg.sha256  # fails if the line is missing
           curl -fsSL --retry 3 -o fpcalc.tar.gz "$FPCALC_URL"
           echo "$FPCALC_SHA256  fpcalc.tar.gz" | sha256sum --check --strict -
-          tar -xJf "$FFMPEG_ARCHIVE" -C "$dest"
           tar -xzf fpcalc.tar.gz -C "$dest"
-          ffmpeg_bin="$dest/${FFMPEG_ARCHIVE%.tar.xz}/bin"
+          ffmpeg_bin="$dest/${name%.tar.xz}/bin"
           fpcalc_dir="$dest/${FPCALC_URL##*/}"
           fpcalc_dir="${fpcalc_dir%.tar.gz}"
           {
@@ -127,5 +152,5 @@ jobs:
           python -m pip install -e ".[image-hash,video,audio,c2pa,timestamps,dev]"
           python -m pip list --format=freeze | grep -i -E "^(c2pa-python|cryptography|imagehash|opentimestamps)=="
 
-      - name: Integration tests
-        run: pytest -m integration
+      - name: Unit and integration tests
+        run: pytest -m "not network"

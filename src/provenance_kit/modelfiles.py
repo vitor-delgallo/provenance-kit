@@ -16,10 +16,18 @@ weights through this module, so the rules of ARCHITECTURE.md (section 6,
   raises :class:`~provenance_kit.errors.ModelLoadError`.
 * **Opt-in downloads.** Nothing here touches the network unless a download
   function is called. Downloads use HTTPS only (redirects included), a
-  timeout per read, a cap at the pinned size, and an atomic write: the bytes
-  are hashed while they stream into a private temporary file in the target
-  directory, which is renamed into place only after the size and hash
-  matched. Nothing is left behind on failure.
+  timeout per read, a total deadline (see below), a cap at the pinned size,
+  and an atomic write: the bytes are hashed while they stream into a private
+  temporary file in the target directory, which is renamed into place only
+  after the size and hash matched. Nothing is left behind on failure.
+* **A total deadline per file.** A server that sends one byte just inside
+  every read timeout would otherwise keep a download alive forever. Each
+  file must arrive within ``max(10 x timeout_seconds, size /
+  DOWNLOAD_MIN_BYTES_PER_SECOND)`` seconds (64 KiB/s: about 27 minutes for
+  100 MiB); a watchdog shuts the connection down when the deadline passes.
+  The deadline is checked again once a connection is open, because name
+  resolution cannot be interrupted. On a slower link, raise
+  ``timeout_seconds`` or provision the files yourself.
 * **Quiet and safe to log.** Progress goes to logging only. Messages name the
   file, never its directory.
 
@@ -50,15 +58,19 @@ import math
 import os
 import re
 import site
+import socket
+import ssl
 import sys
 import sysconfig
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from provenance_kit._logging import get_logger
 from provenance_kit._typing import StrPath
@@ -66,6 +78,7 @@ from provenance_kit.errors import ModelLoadError
 
 __all__ = [
     "DEFAULT_DOWNLOAD_TIMEOUT_SECONDS",
+    "DOWNLOAD_MIN_BYTES_PER_SECOND",
     "MODEL_DIR_ENV",
     "ModelFile",
     "default_model_dir",
@@ -86,6 +99,14 @@ MODEL_DIR_ENV = "PROVENANCE_KIT_MODEL_DIR"
 
 #: Default network timeout of each read during a download, in seconds.
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 60.0
+
+#: The slowest average rate a download may have, in bytes per second. With
+#: the read timeout, it sets each file's total deadline:
+#: ``max(10 * timeout_seconds, size / DOWNLOAD_MIN_BYTES_PER_SECOND)``.
+DOWNLOAD_MIN_BYTES_PER_SECOND = 64 * 1024
+
+# The deadline is never shorter than this many read timeouts.
+_DEADLINE_TIMEOUTS = 10
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _BACKEND_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
@@ -315,7 +336,8 @@ def find_model_file(
             ``model_dir / spec.name``.
         sha256: A different expected digest (see :func:`verify_model_file`).
         download: Whether a missing file may be fetched from ``spec.url``.
-        timeout_seconds: The network timeout of each read.
+        timeout_seconds: The network timeout of each read; the download also
+            has a total deadline (see :func:`download_model_file`).
 
     Returns:
         The path of the verified file.
@@ -399,13 +421,17 @@ def download_model_file(
     The file is fetched from ``spec.url`` over HTTPS (redirects must stay on
     HTTPS), hashed while it streams into a private temporary file in
     ``directory``, and renamed to ``spec.name`` only when its size and
-    SHA-256 match. An existing file of that name is replaced.
+    SHA-256 match. An existing file of that name is replaced. Besides the
+    timeout of each read, the whole download has a deadline of
+    ``max(10 * timeout_seconds, spec.size / DOWNLOAD_MIN_BYTES_PER_SECOND)``
+    seconds.
 
     Args:
         spec: The pinned file.
         directory: The target directory (created if missing). It is used as
             given; resolve it with :func:`model_directory` first.
-        timeout_seconds: The network timeout of each read.
+        timeout_seconds: The network timeout of each read; ten times this is
+            also the shortest total deadline.
 
     Returns:
         The path of the verified file, ``directory / spec.name``.
@@ -413,8 +439,9 @@ def download_model_file(
     Raises:
         TypeError: If ``timeout_seconds`` is not a number.
         ValueError: If ``timeout_seconds`` is not positive and finite.
-        ModelLoadError: If the download fails, exceeds the pinned size or
-            fails the hash check. Nothing is left behind on failure.
+        ModelLoadError: If the download fails, misses its deadline, exceeds
+            the pinned size or fails the hash check. Nothing is left behind
+            on failure.
     """
     timeout = _check_timeout(timeout_seconds)
     target_dir = Path(os.fspath(directory))
@@ -424,7 +451,10 @@ def download_model_file(
     except OSError as exc:
         raise ModelLoadError(f"the model directory for {spec.name} could not be created") from exc
     _log.info("downloading model file %s (%d bytes)", spec.name, spec.size)
-    opener = urllib.request.build_opener(_HttpsOnlyRedirects())
+    deadline = _Deadline(_download_deadline(spec.size, timeout))
+    opener = urllib.request.build_opener(
+        _HttpsOnlyRedirects(), _DeadlineHTTPSHandler(deadline, _tls_context())
+    )
     request = urllib.request.Request(spec.url, headers={"User-Agent": _USER_AGENT})  # noqa: S310 - HTTPS checked in ModelFile
     try:
         fd, temp_name = tempfile.mkstemp(prefix=".download-", suffix=".part", dir=target_dir)
@@ -432,32 +462,141 @@ def download_model_file(
         raise ModelLoadError(f"model file {spec.name} could not be written") from exc
     temp_path = Path(temp_name)
     try:
-        digest = hashlib.sha256()
-        received = 0
+        deadline.start()
         with os.fdopen(fd, "wb") as out, opener.open(request, timeout=timeout) as response:
-            while chunk := response.read(min(_CHUNK, spec.size + 1 - received)):
-                received += len(chunk)
-                if received > spec.size:
-                    raise ModelLoadError(f"model file {spec.name} is larger than expected")
-                digest.update(chunk)
-                out.write(chunk)
-        if received != spec.size or digest.hexdigest() != spec.sha256:
+            received, digest = _stream(response, out, spec, deadline)
+        if received != spec.size or digest != spec.sha256:
+            deadline.check()  # cut short by the watchdog: a timeout, not a bad file
             raise ModelLoadError(f"downloaded model file {spec.name} failed its SHA-256 check")
         os.replace(temp_path, target)
     except ModelLoadError:
         _discard(temp_path)
         raise
     except (OSError, http.client.HTTPException, ValueError) as exc:
-        # URLError, HTTPError and socket timeouts are OSErrors.
+        # URLError, HTTPError, socket timeouts and the deadline are OSErrors.
         _discard(temp_path)
+        if deadline.expired:
+            raise ModelLoadError(
+                f"model file {spec.name} could not be downloaded in time "
+                f"(deadline {deadline.seconds:g} s)"
+            ) from exc
         raise ModelLoadError(
             f"model file {spec.name} could not be downloaded ({type(exc).__name__})"
         ) from exc
     except BaseException:
         _discard(temp_path)
         raise
+    finally:
+        deadline.cancel()
     _log.info("downloaded and verified model file %s", spec.name)
     return target
+
+
+def _stream(response: Any, out: IO[bytes], spec: ModelFile, deadline: _Deadline) -> tuple[int, str]:
+    """Copies the body to ``out``, at most ``spec.size + 1`` bytes; returns size and SHA-256."""
+    digest = hashlib.sha256()
+    received = 0
+    while True:
+        deadline.check()
+        # read1 returns what has arrived, so the deadline is checked between
+        # short reads too; the watchdog covers a read that blocks.
+        chunk = response.read1(min(_CHUNK, spec.size + 1 - received))
+        if not chunk:
+            return received, digest.hexdigest()
+        received += len(chunk)
+        if received > spec.size:
+            raise ModelLoadError(f"model file {spec.name} is larger than expected")
+        digest.update(chunk)
+        out.write(chunk)
+
+
+def _download_deadline(size: int, timeout: float) -> float:
+    """Returns the total deadline of a download, in seconds."""
+    return max(_DEADLINE_TIMEOUTS * timeout, size / DOWNLOAD_MIN_BYTES_PER_SECOND)
+
+
+def _tls_context() -> ssl.SSLContext:
+    """Returns the TLS context of downloads: the system trust store, hostnames checked."""
+    return ssl.create_default_context()
+
+
+class _Deadline:
+    """The total deadline of one download; a watchdog shuts its sockets down."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self._end = time.monotonic() + seconds
+        self._lock = threading.Lock()
+        self._sockets: list[socket.socket] = []
+        self._fired = threading.Event()
+        self._timer = threading.Timer(seconds, self._fire)
+        self._timer.daemon = True
+
+    @property
+    def expired(self) -> bool:
+        """Whether the deadline has passed."""
+        return self._fired.is_set() or time.monotonic() >= self._end
+
+    def start(self) -> None:
+        """Starts the watchdog."""
+        self._timer.start()
+
+    def cancel(self) -> None:
+        """Stops the watchdog (the download is over)."""
+        self._timer.cancel()
+
+    def check(self) -> None:
+        """Raises :class:`TimeoutError` once the deadline has passed."""
+        if self.expired:
+            raise TimeoutError("the download deadline passed")
+
+    def watch(self, sock: socket.socket) -> None:
+        """Registers a connected socket, or refuses it after the deadline."""
+        with self._lock:
+            if self._fired.is_set():
+                raise TimeoutError("the download deadline passed")
+            self._sockets.append(sock)
+
+    def _fire(self) -> None:
+        with self._lock:
+            self._fired.set()
+            sockets = list(self._sockets)
+        for sock in sockets:
+            # socket.socket.shutdown, not SSLSocket.shutdown: the TLS object
+            # must stay intact while the downloading thread reads through it.
+            with contextlib.suppress(OSError):
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    """An HTTPS connection whose socket the download's watchdog can shut down."""
+
+    def __init__(self, host: str, *, deadline: _Deadline, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        """Connects (name lookup, TCP, proxy tunnel, TLS), then joins the deadline."""
+        self._deadline.check()
+        super().connect()
+        self._deadline.watch(self.sock)
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    """Opens HTTPS connections that belong to one download's deadline."""
+
+    def __init__(self, deadline: _Deadline, context: ssl.SSLContext) -> None:
+        super().__init__(context=context)
+        self._deadline = deadline
+        self._tls = context
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        deadline = self._deadline
+
+        def connection(host: str, **kwargs: Any) -> http.client.HTTPConnection:
+            return _DeadlineHTTPSConnection(host, deadline=deadline, **kwargs)
+
+        return self.do_open(connection, req, context=self._tls)
 
 
 def ensure_model_files(
@@ -477,7 +616,8 @@ def ensure_model_files(
         specs: The pinned files.
         directory: The target directory (created if needed). It is used as
             given; resolve it with :func:`model_directory` first.
-        timeout_seconds: The network timeout of each read.
+        timeout_seconds: The network timeout of each read; each file also
+            has a total deadline (see :func:`download_model_file`).
 
     Returns:
         The path of each verified file, in the order of ``specs``.
@@ -506,7 +646,11 @@ def ensure_model_files(
 def _check_timeout(timeout_seconds: object) -> float:
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
         raise TypeError("timeout_seconds must be a number")
-    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+    try:
+        finite = math.isfinite(timeout_seconds)
+    except OverflowError:  # an int beyond the float range
+        finite = False
+    if not finite or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive and finite")
     return float(timeout_seconds)
 
