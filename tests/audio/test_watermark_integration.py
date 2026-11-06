@@ -11,7 +11,6 @@ SHA-256. Run with ``-s`` to print the measured numbers; they are recorded in
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import pickle
 import time
@@ -62,12 +61,13 @@ SOURCES = {"broadband": BROADBAND, "tones": TONES}
 
 
 def require_audioseal() -> None:
-    # Only check that it is installed: importing audioseal here would trip
-    # upstream FutureWarnings (errors in this suite) that the backend
-    # silences while it imports the package.
-    if importlib.util.find_spec("audioseal") is None:
-        pytest.skip('needs audioseal: pip install "provenance-kit[audio-watermark]"')
+    # Through require_module, so PROVENANCE_KIT_TEST_REQUIRE applies. Importing
+    # audioseal trips upstream FutureWarnings (errors in this suite), so it is
+    # imported the way the backend imports it: torch first, then audioseal
+    # with the backend's own filters.
     require_module("torch", extra="audio-watermark")
+    with _audioseal._quiet_upstream():
+        require_module("audioseal", extra="audio-watermark")
 
 
 def ensure_models(request: pytest.FixtureRequest) -> None:
@@ -281,6 +281,36 @@ def test_unmarked_click_trains_fool_the_detector_but_not_the_check_bits(backend)
     assert verified == 0
 
 
+def _buzz(rate: int, hz: int = 170, *, seconds: float = 2.0) -> np.ndarray:
+    """An unmarked band-limited pulse train (harmonics up to 4 kHz), shaped (1, n)."""
+    t = np.arange(int(seconds * rate)) / rate
+    k = np.arange(1, 4000 // hz + 1)
+    s = np.cos(2 * np.pi * hz * np.outer(t + 2 / (4 * hz), k)).sum(axis=1) / k.size
+    return (0.9 * s).astype(np.float32)[None, :]
+
+
+def test_the_recommended_check_bits_reject_what_4_check_bits_let_through(backend):
+    """R2-M06: ``verified`` is 2**-c evidence, so the docs recommend c = 8.
+
+    Measured on 612 unmarked periodic signals: 83 found, 3 verified with 4
+    check bits (this 170 Hz buzz at 16, 44.1 and 48 kHz: its bits are the
+    same at every rate), none with 8. The bits of a borderline detection
+    (0.500 here) can differ on another platform, so only the 8-bit outcome
+    is asserted.
+    """
+    four = PayloadCodec(16, version_bits=0, check_bits=4)
+    eight = PayloadCodec(16, version_bits=0, check_bits=8)
+    for rate in (16000, 44100):
+        samples = _buzz(rate)
+        detection = detect_watermark(samples, rate, backend=backend, codec=eight)
+        passes_four = detection.found and four.decode(detection.decoded_bits or "").check_ok
+        print(
+            f"\nunmarked 170 Hz buzz @ {rate}: p={detection.confidence:.3f}, "
+            f"passes 4 check bits: {passes_four}, 8: {detection.verified}"
+        )
+        assert not detection.verified
+
+
 def _matching(read: str | None, bits: str) -> int:
     return sum(a == b for a, b in zip(read or "", bits, strict=False))
 
@@ -313,12 +343,10 @@ def test_the_checkpoint_loader_refuses_code(tmp_path, request):
     path = tmp_path / "evil.pth"
     torch.save({"model": {}, "extra": Exploit()}, str(path))
     with pytest.raises(ModelLoadError):
-        _audioseal._load_state_dict(torch, path)
+        _audioseal._load_state_dict(torch, path.read_bytes(), name=path.name)
     assert not marker.exists()
-    legacy = tmp_path / "legacy.pth"
-    legacy.write_bytes(pickle.dumps({"model": {}}))
     with pytest.raises(ModelLoadError):
-        _audioseal._load_state_dict(torch, legacy)
+        _audioseal._load_state_dict(torch, pickle.dumps({"model": {}}), name="legacy.pth")
 
 
 def test_tampered_checkpoints_are_refused(tmp_path, request):

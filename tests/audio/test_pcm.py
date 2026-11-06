@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import tracemalloc
 
 import numpy as np
 import pytest
 
+from provenance_kit.audio import pcm
 from provenance_kit.audio.pcm import PcmAudio, _parse_probe_output, decode_pcm, probe_audio
 from provenance_kit.errors import (
     MediaDecodeError,
@@ -39,8 +41,6 @@ def test_audio_modules_import_lightly():
 
 def test_pcm_exposes_only_its_public_api():
     """Helpers start with an underscore (ARCHITECTURE.md, section 8)."""
-    from provenance_kit.audio import pcm
-
     defined_here = {
         name
         for name, value in vars(pcm).items()
@@ -51,6 +51,8 @@ def test_pcm_exposes_only_its_public_api():
     for helper in (
         "pcm_args",
         "read_pcm",
+        "read_samples",
+        "ChannelBuffer",
         "sample_cap_bytes",
         "duration_cap_bytes",
         "check_declared_decoded_size",
@@ -112,6 +114,120 @@ def test_nan_samples_are_zeroed():
     )
     audio = decode_pcm(WAV, tools=tools)  # type: ignore[arg-type]
     assert audio.samples.tolist() == [[0.0, 0.5]]
+
+
+def test_infinities_are_clipped_and_nan_zeroed_across_chunks(monkeypatch):
+    monkeypatch.setattr(pcm, "_READ_CHUNK", 20)  # 1 2/3 frames of 3 channels per chunk
+    values = np.array([np.nan, np.inf, -np.inf, 0.25, -2.0, 1.5, np.nan] * 9, "<f4")
+    tools = FakeTools(ffprobe=probe_json(channels=3), ffmpeg=values.tobytes())
+    audio = decode_pcm(WAV, tools=tools)  # type: ignore[arg-type]
+    expected = np.nan_to_num(np.clip(values[: 21 * 3], -1, 1), nan=0.0).reshape(-1, 3).T
+    np.testing.assert_array_equal(audio.samples, expected)
+
+
+@pytest.mark.parametrize("channels", [1, 2, 3, 6])
+@pytest.mark.parametrize(
+    ("declared", "runs"), [("exact", 1), ("short", 3), ("long", 1), ("none", 2)]
+)
+def test_samples_are_deinterleaved_whatever_the_chunks(rng, monkeypatch, channels, declared, runs):
+    # Chunks that cut frames anywhere, a trailing partial frame (dropped),
+    # and a declared duration that is right, too short, too long or absent.
+    # Too short: the first run stops when the buffer is full, a second one
+    # counts the samples and a third decodes them into an exact buffer;
+    # absent: count, then decode. Too long: the unused room is released.
+    monkeypatch.setattr(pcm, "_READ_CHUNK", 4 * 1021)
+    frames = 30_011
+    source = rng.uniform(-1.5, 1.5, size=(channels, frames)).astype(np.float32)
+    seconds = {"exact": frames / 1000, "short": 3.0, "long": 90.0, "none": None}[declared]
+    report = json.loads(probe_json(channels=channels, sample_rate="1000"))
+    if seconds is None:
+        del report["format"]["duration"]
+        del report["streams"][0]["duration"]
+    else:
+        report["format"]["duration"] = str(seconds)
+    output = f32(source) + b"\x01\x02\x03"
+    tools = FakeTools(ffprobe=json.dumps(report).encode(), ffmpeg=output)
+    audio = decode_pcm(WAV, tools=tools)  # type: ignore[arg-type]
+    np.testing.assert_array_equal(audio.samples, np.clip(source, -1, 1))
+    assert audio.samples.flags.c_contiguous
+    assert audio.samples.flags.writeable
+    assert len(tools.args_of("ffmpeg")) == runs
+    # At most a quarter of unused room is kept alive (1 % and 1 s here when
+    # the duration is right; none after the exact second run, or a release).
+    owner = audio.samples if audio.samples.base is None else audio.samples.base
+    assert owner.nbytes <= 1.25 * audio.samples.nbytes
+    if declared != "exact":
+        assert owner.nbytes == audio.samples.nbytes
+
+
+def test_a_decoder_whose_output_changes_between_runs_is_an_error(rng):
+    report = json.loads(probe_json(channels=1))
+    del report["format"]["duration"]
+    del report["streams"][0]["duration"]
+    counted, decoded = np.zeros(4800, "<f4").tobytes(), np.zeros(9600, "<f4").tobytes()
+    tools = FakeTools(ffprobe=json.dumps(report).encode(), ffmpeg=[counted, decoded])
+    with pytest.raises(MediaDecodeError, match="changed between two runs"):
+        decode_pcm(WAV, tools=tools)  # type: ignore[arg-type]
+
+
+_READ_BUFFERS = 4 * 1024 * 1024  # a read chunk, its copy with a cut frame, masks
+
+
+def _traced_decode(tools: FakeTools, limits: MediaLimits) -> tuple[PcmAudio, int]:
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        audio = decode_pcm(WAV, tools=tools, limits=limits)  # type: ignore[arg-type]
+        return audio, tracemalloc.get_traced_memory()[1] - before
+    finally:
+        tracemalloc.stop()
+
+
+@pytest.mark.parametrize(
+    ("declared", "bound"),
+    [
+        ("exact", 1.05),  # sized from the declared duration (+1 %, +1 s)
+        ("short", 1.05),  # the 30 s buffer, then counted and decoded exactly
+        ("none", 1.05),  # counted, then decoded exactly
+        ("long", (50 * 1.01 + 1) / (2_000_000 / 48000)),  # the declared 50 s
+    ],
+)
+def test_decoding_holds_about_one_copy_of_the_samples(rng, declared, bound):
+    """R2-S01: the peak was 3.25x the samples (chunk list, joined bytes, a copy).
+
+    The samples are written channel by channel into one buffer whose size is
+    fixed before each run: from the declared duration, or counted by a
+    first run when nothing (or too little) is declared. No buffer is ever
+    reallocated (NumPy 2.5 traces a reallocation as old plus new size, and
+    a growing one can hold both for real).
+    """
+    frames = 2_000_000  # 16 MB of stereo float32, about 41.7 s at 48 kHz
+    source = rng.uniform(-1, 1, size=(2, frames)).astype(np.float32)
+    seconds = {"exact": frames / 48000, "short": 30.0, "long": 50.0, "none": None}[declared]
+    report = json.loads(probe_json())
+    if seconds is None:
+        del report["format"]["duration"]
+        del report["streams"][0]["duration"]
+    else:
+        report["format"]["duration"] = str(seconds)
+    tools = FakeTools(ffprobe=json.dumps(report).encode(), ffmpeg=f32(source))
+    audio, peak = _traced_decode(tools, dataclasses.replace(LIMITS, max_decoded_audio_bytes=10**9))
+    assert peak <= bound * source.nbytes + _READ_BUFFERS, peak / source.nbytes
+    np.testing.assert_array_equal(audio.samples, source)
+
+
+def test_decoding_never_holds_more_than_the_limit(rng):
+    # Undeclared media just under max_decoded_audio_bytes: counted, then
+    # decoded into a buffer of exactly its size.
+    source = rng.uniform(-1, 1, size=(2, 2_000_000)).astype(np.float32)
+    report = json.loads(probe_json())
+    del report["format"]["duration"]
+    del report["streams"][0]["duration"]
+    tools = FakeTools(ffprobe=json.dumps(report).encode(), ffmpeg=f32(source))
+    limit = source.nbytes + 4096
+    audio, peak = _traced_decode(tools, dataclasses.replace(LIMITS, max_decoded_audio_bytes=limit))
+    assert peak <= limit + _READ_BUFFERS, peak / limit
+    assert audio.samples.nbytes == source.nbytes
 
 
 def test_more_audio_than_the_duration_limit_raises():

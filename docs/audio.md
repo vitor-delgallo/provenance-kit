@@ -47,6 +47,20 @@ again on the running byte count, for media that declares no duration or
 lies; the error names `max_decoded_audio_bytes`. 1 GiB holds 46 minutes of
 48 kHz stereo or 3 hours of 16 kHz mono: decode long media at a lower rate or
 channel count, or raise the limit. `embed_verified` decodes the encoder's output the same way.
+
+The limit bounds memory, not just the result: ffmpeg's output is
+de-interleaved chunk by chunk (1 MiB) straight into one float32 buffer,
+clipped and with NaN set to 0 as it arrives. The buffer is sized from the
+declared duration (plus 1 % and one second), grows by 25 % at a time when
+the media declares no duration or too little, never past
+`max_decoded_audio_bytes`, and is shrunk to the samples at the end. The peak
+is therefore about the result plus a few MiB of read buffers, at most 1.25
+times the result while a buffer grows, and never more than the limit plus
+those buffers. Measured with `tracemalloc` on 345 s of 48 kHz stereo FLAC
+(132.5 MB of samples) under a 128 MiB limit: 1.02 times the result (1.01
+times the limit; the process's private bytes grew by the same 136 MB).
+Earlier versions kept a list of chunks, joined it, then copied it into the
+array, and peaked at 3.2 times the limit.
 `embed_watermark` and `detect_watermark` take arrays the caller already
 holds; the AudioSeal backend allocates two to three times their size again.
 Fingerprinting streams its 16-bit PCM into `fpcalc` and holds none of it, so
@@ -124,10 +138,28 @@ cross-correlations of the 32 bit planes. The decision rule:
    error rate (`AudioMatch.chance_bit_error_rate`) is the BER that two
    unrelated signals with the same bit statistics would show: the mean over
    bits of `p_q (1 - p_r) + p_r (1 - p_q)`, with `p` how often the bit is 1 on
-   each side of the overlap. It is about 0.42 for music, 0.16 to 0.32 for
-   stationary noise and 0 for a constant value: noise recordings share the
-   bits that the noise statistics fix, and agree at a BER as low as a genuine
-   match (0.15) without being related.
+   each side of the compared pairs. It is about 0.42 for music, 0.16 to 0.32
+   for stationary noise and 0 for a constant value: noise recordings share
+   the bits that the noise statistics fix, and agree at a BER as low as a
+   genuine match (0.15) without being related. Two details keep content
+   without information from looking related:
+   * the bit statistics come from the **compared pairs** only, the same
+     pairs the BER counts. Taken from each side's own non-silent items, they
+     let a query that ends in digital silence borrow the statistics of the
+     reference's music facing that silence (never compared): the chance rate
+     of white and blue noise rose from about 0.17 to between 0.42 and 0.46,
+     and independent recordings matched at BER 0.18 to 0.19;
+   * in this test, a **run of identical pairs counts once** (a pair whose two
+     codes both repeat the previous item's is left out of the chance rate and
+     of the BER it is compared with, `AudioMatch.chance_test_bit_error_rate`).
+     Two steady drones give one code each for their whole length, and the
+     same one: about 180 identical pairs, then the 16 or so items where the
+     drones end. Over all pairs the BER was 0.014 to 0.023, 0.38 to 0.50 of
+     chance, and 8 of 12 such pairs matched; counted once, the run leaves
+     0.60 to 0.76 of chance. `chance_test_bit_error_rate` equals
+     `bit_error_rate` when no two consecutive pairs repeat, as for music
+     (the genuine clips below drop at most 10 of their pairs, 0.5 on
+     average).
 4. `is_match` is true when **any** offset passes; the reported offset is the
    passing one with the highest binomial z-score, `(0.5 - BER) *
    sqrt(compared bits)`, which prefers a long low-error overlap to a short
@@ -137,6 +169,22 @@ cross-correlations of the 32 bit planes. The decision rule:
    long unrelated overlap scores a higher z-score (before, the z-score chose
    first and the threshold decided after: a genuine 7.3 s overlap at BER
    0.015 lost to a long unrelated overlap at 0.325, so no match).
+   The distinct-value test runs on at most 64 offsets that pass the other
+   two tests, best first, to bound its cost. When more pass, they are first
+   narrowed, in linear time, to the offsets whose overlap holds 8 distinct
+   values on each side, silence aside. This step matters: an alternation of
+   two codes (a two-tone alarm) passes the BER and chance tests at hundreds
+   of offsets with a better z-score than a genuine 8 s overlap, and the 64
+   checks used to run out on it (no match). Only one case is left where the
+   cap can hide a passing offset: more than 64 better offsets whose overlap
+   holds 8 distinct values but whose compared pairs do not, which takes
+   digital silence on one side hiding the other side's values.
+
+`min_overlap_seconds` and `max_offset_seconds` accept at most
+`MAX_COMPARISON_SECONDS`, the span of the longest fingerprint
+(`MAX_FINGERPRINT_ITEMS` x 0.124 s, about 34.4 hours): no overlap or offset
+is longer. Larger finite values raise `ValueError` (1e308 used to overflow
+into an `OverflowError`).
 
 **Measured genuine matches** (fpcalc 1.6.2, LGPL ffmpeg 8.1, 2026-11-05).
 16 generated pieces of 75 s, 44.1 kHz stereo: four of the suite's songs
@@ -184,7 +232,10 @@ volume x0.3 with a 4 kHz low-pass and MP3 (0.037 to 0.046), AAC clips of 5, 6
 and 8 s (63 of 63, BER 0.039 to 0.094), and an upload made of a reference's
 last 10 s followed by another song (BER 0.025 over a 7.3 s overlap, threshold
 0.124). Clips shorter than 4.6 s never match (below 16 items). Genuine matches
-stayed at or below 0.43 of their chance error rate.
+stayed at or below 0.43 of their chance error rate (0.39 for the clips of the
+table above). The table and the false-match rates below were re-run with the
+chance test over the compared pairs and the distinct-value filter of rule 4,
+on the same fingerprints and window draws: every outcome is the same.
 
 **Measured false matches: signals that are alike for a few seconds.** The
 suite's `song(k)` generator renders slow glissandos whose frequency
@@ -242,9 +293,17 @@ threshold, minimum overlap shrinking to the shorter fingerprint):
 | White, blue, violet, velvet noise; hiss (-40 dBFS, high-passed); -60 dBFS noise floor | match (BER 0.15 to 0.16) | no | 0.89 to 0.92 of chance (0.16 to 0.18) |
 | Pink, brown noise | no (BER 0.24, 0.30) | no | 0.91, 0.94 of chance |
 | A steady tone (one value throughout, like hum) | match (BER 0.000) | no | chance 0.000 |
+| 20 s of white, blue or pink noise then 40 s of digital silence, vs independent noise of the same color then 40 s of unrelated music (9 pairs) | match (white, blue: BER 0.18 to 0.19) | no | 0.85 to 0.96 of chance |
+| 25 s drones (50 Hz hum, 110 Hz sawtooth, organ chord) then 40 s of silence, vs another drone of the kind then 40 s of music (12 pairs) | match (BER 0.014 to 0.023) | no | 0.60 to 0.76 of chance, a run of identical pairs counted once |
 
 Stationary noise stays at 0.82 or more of its chance error rate at every
-offset, against at most 0.43 for genuine matches.
+offset, against at most 0.43 for genuine matches. The last two rows are what
+rule 3's two details are for: with the statistics of each side's own
+non-silent items, the chance rate rose to 0.42 to 0.46 and white and blue
+noise matched, as did all 12 drone pairs; with the statistics of the compared
+pairs but every identical pair counted, 8 of the 12 drone pairs still matched
+(`test_low_information_audio_followed_by_silence_or_music_does_not_match`
+covers both).
 
 Offsets are found to within one sub-fingerprint (0.124 s). Not handled:
 tempo or pitch changes and heavy mixing with other audio.
@@ -256,7 +315,7 @@ from provenance_kit import PayloadCodec
 from provenance_kit.audio.watermark import AudioSealBackend, detect_watermark, embed_verified
 
 backend = AudioSealBackend(model_dir="/srv/models/audioseal")
-codec = PayloadCodec(16, version_bits=0, check_bits=4)  # 4,096 identifiers
+codec = PayloadCodec(16, version_bits=0, check_bits=8)  # 256 identifiers, see below
 result = embed_verified(
     audio.samples,
     audio.sample_rate,
@@ -309,8 +368,10 @@ statement. The backend loads only the pinned Hugging Face files.
 
 **Safe loading.** The checkpoints are pickles that also hold `omegaconf`
 configuration objects, which `torch.load(weights_only=True)` refuses. The
-backend therefore verifies the SHA-256 first, then reads the file with an
-allowlist unpickler: tensors, plain containers and inert placeholders for the
+backend therefore reads each checkpoint into memory, checks the bytes read
+against the SHA-256 (and size), and unpickles those same bytes, never the
+path, so a file replaced after its check is not loaded. The unpickler is an
+allowlist: tensors, plain containers and inert placeholders for the
 configuration classes. Anything else, and the legacy non-zip format, is
 refused. The model configuration comes from the adapter (copied from the
 `audioseal` 0.2.1 cards), not from the file. A test checks that a checkpoint
@@ -338,20 +399,56 @@ correction (decision 8). `found` is the detector's decision (its probability
 reaches 0.5) and is **not evidence on its own**: the detector is fooled by
 some unmarked periodic signals. Use a `PayloadCodec` with check bits and rely
 on `AudioWatermarkDetection.verified`: true only when the watermark is found
-**and** the check bits match (with 4 check bits random bits pass with
-probability 1/16). Without a codec, or with a codec without check bits,
-`verified` is always false.
+**and** the check bits match. Without a codec, or with a codec without check
+bits, `verified` is always false.
 
-Measured on unmarked signals (`detect_watermark` without search, codec with
-4 check bits; `test_unmarked_click_trains_fool_the_detector_but_not_the_check_bits`
-and a one-off script run on 2026-11-05):
+`verified` is strong evidence, not proof. An unmarked signal that the
+detector finds is verified when its 16 bits happen to pass the check: with
+`c` check bits, probability `2**-c`. The bits are deterministic, so this is a
+property of the signal, not a coin flip per call: an unmarked 2 s, 170 Hz
+band-limited pulse train (a buzz with harmonics up to 4 kHz) is found at
+0.500 and its bits pass 4 check bits, as identifier 3919, at 16, 44.1 and
+48 kHz alike. With the alignment search (below), a signal gets **two
+chances**, the shifted payload and then the unshifted one: up to
+`2 * 2**-c`.
 
-| Unmarked signal | Detection probability | `found` | `verified` |
+**Choosing the check bits.** The 16 bits are shared: identifier bits +
+check bits = 16 (with `version_bits=0`). Each check bit halves the number of
+identifiers and halves the rate at which found unmarked signals verify:
+
+| `check_bits` | Identifiers | Found unmarked signal verifies | With `AlignmentSearch` |
 |---|---|---|---|
-| Broadband and tonal test signals, 16 / 44.1 / 48 kHz (6) | 0.000 to 0.247 | 0 | 0 |
-| White, pink, brown noise (3) | 0.000 | 0 | 0 |
-| Sines at 50 Hz and 1 kHz, 100 Hz square wave, 3 rates (9) | 0.000 to 0.426 | 0 | 0 |
-| One-sample click trains at 50 and 100 Hz, 3 rates, 4 phases (24) | 0.000 to 0.967 | 12 | 0 |
+| 4 | 4,096 | 1 in 16 (6.3 %) | up to 2 in 16 (12.5 %) |
+| 6 | 1,024 | 1 in 64 (1.6 %) | up to 3.1 % |
+| **8 (recommended)** | **256** | **1 in 256 (0.39 %)** | **up to 0.78 %** |
+| 10 | 64 | 1 in 1,024 (0.10 %) | up to 0.20 % |
+
+Use `PayloadCodec(16, version_bits=0, check_bits=8)` when 256 identifiers
+are enough, and in general as many check bits as the identifier space
+allows. With fewer check bits, treat `verified` as a lead to confirm: the
+identifier must exist in your records, and the record's stored Chromaprint
+fingerprint should match the audio (`compare_fingerprints`).
+
+Measured on unmarked signals (`detect_watermark`, without and with the
+search; `test_unmarked_click_trains_fool_the_detector_but_not_the_check_bits`
+and one-off scripts run on 2026-11-05). `verified` is counted for 4 and for 8
+check bits, from the same 16 bits:
+
+| Unmarked signal | Detection probability | `found` | `verified`, 4 check bits | `verified`, 8 check bits |
+|---|---|---|---|---|
+| Broadband and tonal test signals, 16 / 44.1 / 48 kHz (6) | 0.000 to 0.247 | 0 | 0 | 0 |
+| White, pink, brown noise (3) | 0.000 | 0 | 0 | 0 |
+| Sines at 50 Hz and 1 kHz, 100 Hz square wave, 3 rates (9) | 0.000 to 0.426 | 0 | 0 | 0 |
+| One-sample click trains at 50 and 100 Hz, 3 rates, 4 phases (24) | 0.000 to 0.967 | 12 | 0 | 0 |
+| Periodic signals, 2 s: one-sample clicks, decaying clicks (a metronome or buzz), band-limited pulse trains; 40 to 200 Hz in 10 Hz steps, 4 phases, 16 / 44.1 / 48 kHz (612) | 0.000 to 0.962 | 83 (47 distinct bit patterns) | 3 (the 170 Hz buzz at 3 rates); with the search, 6 | 0; with the search, 0 |
+
+In the last row the same signal at three rates mostly gives the same bits
+(the backend resamples to 16 kHz), so the 83 found signals hold 47 distinct
+payloads; 3 of 83 (1 of 47 distinct) passed 4 check bits, against 1 in 16
+expected. The search (`AlignmentSearch(step_samples=16)`, run on all 612)
+picked a shift for 18 of them, 16 of which were found after it, and 3 more
+(a 200 Hz decaying click, identifier 1785 after the shift) passed 4 check
+bits that way. None passed 8, with or without the search.
 
 The click trains' detection probability depends on their phase (for 50 Hz at
 44.1 kHz: 0.935, 0.933, 0.967 and 0.021 for the four phases). Earlier versions
@@ -419,7 +516,9 @@ enough: an unmarked 100 Hz click train at 44.1 kHz reaches 0.205 at offset
 380, its bits are the same in every window because the content repeats, and
 dropping those 380 samples raised its detection probability from 0.136 to
 0.948 (the first implementation reported it as found). The chosen offset is
-therefore used only when:
+therefore used only when the shifted signal is found (a search never turns
+"found" into "not found": with the shifted detection below the threshold
+and no check bits, it used to) and:
 
 * the codec has check bits and the payload read after the shift passes them
   (the click train's did not; the genuine shifts below all did); or
@@ -428,12 +527,35 @@ therefore used only when:
   turns "not found" into "found".
 
 Otherwise the result is the unshifted detection, with `offset_samples=0`.
-Requiring the bits of two disjoint windows to agree was measured and
-rejected: the click train's windows agree on 16 of 16 bits, while the genuine
-shifted marks agree on only 12 to 16 (0.5 s windows are noisy; the bits over
-the whole signal are right). Pass a codec with check bits: a shifted mark
-that is weakly detected unshifted (raw ADTS AAC, payload 777: 0.421) is
-recovered only with them.
+Pass a codec with check bits: a shifted mark that is weakly detected
+unshifted (raw ADTS AAC, payload 777: 0.421) is recovered only with them.
+
+**Two chances.** With check bits, unmarked audio can verify through the
+shifted payload or, when that fails, through the unshifted one: up to
+`2 * 2**-check_bits` instead of `2**-check_bits` (with random bits and 4
+check bits, measured 7.2 % without the search and 13.6 % with it). The
+fall back to the unshifted result is kept because genuine marks need it: on
+audio that is already aligned, the default search picked a non-zero offset
+for 9 of the 28 broadband marks after the seven delay-signaling pipelines of
+the robustness table (1774 and 1768 after M4A at 64 kb/s, 958, 956 and 40
+after Ogg Opus, 10 and 6 after MP3 files, 4 at 22.05 kHz). The shifted
+payload of one Opus mark failed its check bits and the unshifted one,
+correct, was used; without the fall back it would not have verified. Every
+other aligned mark came back with all 16 bits, and the 8 marks after the two
+pipelines that shift the audio were all recovered at the encoder delay. Run
+the search only on audio from pipelines that need it, and count on the
+`2 * 2**-c` bound when sizing the check bits.
+
+**Two disjoint windows were measured and rejected** as an extra condition
+for `verified`. The two halves of a found unmarked periodic signal give the
+same 16 bits (82 of the 83 found signals of the unmarked table: the content
+repeats), while the halves of genuine marks agree on as few as 4 to 10 of 16
+bits even when the whole signal's 16 bits are right (4 s halves of the 8 s
+marks above; 0.5 s windows of the shifted ones, 12 to 16). Requiring the
+halves to agree would have left 0 of 4 marks verified on eight of the nine
+broadband pipelines (2 of 4 after Ogg Opus), while the 170 Hz buzz, whose
+halves agree, still verified; it stopped only the three signals verified
+through a shift.
 
 Cost: one detector call on 0.5 s of audio per offset, plus the detection of
 the whole signal unshifted and, when an offset stands out, shifted: 20 to

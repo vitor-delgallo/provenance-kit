@@ -17,9 +17,13 @@ a callable and checks the watermark after that real encoding.
 The payload is 16 bits with no room for error correction (decision 8). The
 detector's ``found`` is not evidence on its own (unmarked impulse trains
 score up to 0.97): give the :class:`~provenance_kit.payload.PayloadCodec`
-check bits, for example ``PayloadCodec(16, version_bits=0, check_bits=4)``
-(4,096 identifiers, random bits pass the check with probability 1/16), and
-rely on ``detection.verified`` (found and the check bits match).
+check bits and rely on ``detection.verified`` (found and the check bits
+match). The 16 bits are shared between identifier and check bits: with
+``PayloadCodec(16, version_bits=0, check_bits=8)`` (256 identifiers) an
+unmarked signal that the detector finds verifies with probability 1/256
+(up to 2/256 with an :class:`AlignmentSearch`); with ``check_bits=4``
+(4,096 identifiers), 1/16 (up to 2/16). Use as many check bits as the
+identifier space allows (measured rates in ``docs/audio.md``).
 
 Example::
 
@@ -28,7 +32,7 @@ Example::
     from provenance_kit.audio.watermark import AudioSealBackend, detect_watermark, embed_watermark
 
     backend = AudioSealBackend(model_dir="/srv/models/audioseal")
-    codec = PayloadCodec(16, version_bits=0, check_bits=4)
+    codec = PayloadCodec(16, version_bits=0, check_bits=8)  # 256 identifiers
     audio = decode_pcm(data)
     marked = embed_watermark(audio.samples, audio.sample_rate, codec.encode(42), backend=backend)
     detection = detect_watermark(marked, audio.sample_rate, backend=backend, codec=codec)

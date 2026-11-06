@@ -294,6 +294,70 @@ def test_independent_noise_recordings_do_not_match(tools, source):
     assert ratio > 0.75  # measured 0.82 to 0.94: agreement at chance level
 
 
+def _noise(kind: str, seconds: float, rate: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(int(seconds * rate))
+    if kind == "blue":
+        x = np.diff(x, prepend=0.0)
+    return 0.2 * x / np.max(np.abs(x))
+
+
+def _drone(kind: str, seconds: float, rate: int, seed: int) -> np.ndarray:
+    """A steady drone with a slow tremolo: 50 Hz mains hum or a 110 Hz sawtooth pad."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(int(seconds * rate)) / rate
+    tremolo = 1 + 0.3 * np.sin(2 * np.pi * rng.uniform(0.1, 0.5) * t + rng.uniform(0, 6))
+    if kind == "hum":
+        partials = ((50 * k, a) for k, a in ((1, 1.0), (2, 0.5), (3, 0.4), (5, 0.2)))
+    else:
+        partials = ((110 * k, 1 / k) for k in range(1, 30))
+    s = sum(a * np.sin(2 * np.pi * f * t + rng.uniform(0, 6)) for f, a in partials)
+    s = s / np.max(np.abs(s))
+    return 0.4 * tremolo * s + 0.01 * rng.standard_normal(t.size)
+
+
+@pytest.mark.parametrize(
+    ("kind", "make"),
+    [("white", _noise), ("blue", _noise), ("hum", _drone), ("saw", _drone)],
+)
+def test_low_information_audio_followed_by_silence_or_music_does_not_match(tools, kind, make):
+    """R2-M01: the chance error rate is taken over the compared pairs only.
+
+    Two independent 20 s recordings, the query followed by 40 s of digital
+    silence and the reference by 40 s of unrelated music. The music faces the
+    silence and is never compared, but it used to count in the reference's
+    bit statistics: the chance rate rose to 0.42 to 0.46 and independent
+    white and blue noise matched at BER 0.18 to 0.19, as did hum, sawtooth
+    and organ drones (12 of 12 pairs).
+    """
+    rate = 22050
+    first, second = make(kind, 20, rate, 1), make(kind, 20, rate, 2)
+    alone = compare_fingerprints(
+        fingerprint_audio(wav(first, rate), tools=tools),
+        fingerprint_audio(wav(second, rate), tools=tools),
+    )
+    query = fingerprint_audio(wav(np.concatenate([first, np.zeros(40 * rate)]), rate), tools=tools)
+    reference = fingerprint_audio(
+        wav(np.concatenate([second, music(40, rate, 70)]), rate), tools=tools
+    )
+    match = compare_fingerprints(query, reference)
+    print(
+        f"\n{kind}: alone BER {alone.bit_error_rate:.3f} / chance "
+        f"{alone.chance_bit_error_rate:.3f}; followed by silence / music: BER "
+        f"{match.bit_error_rate:.3f} / chance {match.chance_bit_error_rate:.3f}"
+    )
+    assert not alone.is_match
+    assert not match.is_match
+    if make is _noise:
+        # A copy of the noise behind the same asymmetry is still found. (A copy
+        # of a drone is not: its codes agree with any drone by chance, which
+        # is the point of the chance test.)
+        copy = fingerprint_audio(
+            wav(np.concatenate([first, music(40, rate, 70)]), rate), tools=tools
+        )
+        assert compare_fingerprints(query, copy).is_match
+
+
 def test_short_unrelated_clips_never_match_a_long_reference(tools):
     """Clips of 2.7 to 3.6 s give 1 to 8 sub-fingerprints: below MIN_COMPARED_ITEMS."""
     rate = 11025

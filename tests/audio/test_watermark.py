@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sysconfig
 import types
@@ -315,6 +316,47 @@ def test_alignment_search_does_not_turn_unmarked_audio_into_a_detection():
     assert right.payload.identifier == 99
 
 
+class WeakAfterShift(FakeBackend):
+    """Found unshifted (0.9); 6 samples dropped, the bits stand out but the detection is 0.2.
+
+    The samples are a ramp, so the first value tells which offset is scored.
+    """
+
+    def __init__(self, bits: str) -> None:
+        super().__init__()
+        self.bits = bits
+
+    def score(self, samples, sample_rate):
+        sure = tuple(0.9 if b == "1" else 0.1 for b in self.bits)
+        if int(samples[0, 0]) == 6:
+            return AudioScores(detection_probability=0.2, bit_probabilities=sure)
+        return AudioScores(detection_probability=0.9, bit_probabilities=(0.6,) * 16)
+
+
+@pytest.mark.parametrize(
+    "codec",
+    [None, PayloadCodec(16, version_bits=4, check_bits=0), PayloadCodec(16, check_bits=4)],
+)
+def test_alignment_search_never_loses_a_found_signal(codec):
+    """R2-M07: a shift is used only if the shifted detection is found.
+
+    With no check bits the shift was accepted whenever the unshifted signal
+    was found, and the shifted detection, not found, was returned. With check
+    bits, payload bits that pass them were enough even when the shifted
+    signal was not found.
+    """
+    search = AlignmentSearch(max_offset_samples=10, step_samples=1, window_seconds=0.1)
+    bits = (codec or PayloadCodec(16, version_bits=0, check_bits=4)).encode(5)
+    plain = detect_watermark(ramp(), 1000, backend=WeakAfterShift(bits), codec=codec)
+    searched = detect_watermark(
+        ramp(), 1000, backend=WeakAfterShift(bits), codec=codec, alignment=search
+    )
+    assert plain.found
+    assert searched.found
+    assert searched.offset_samples == 0
+    assert searched.confidence == plain.confidence
+
+
 def test_alignment_search_stops_at_the_end_of_the_signal():
     backend = DelaySensitiveBackend()
     search = AlignmentSearch(max_offset_samples=2048, step_samples=1, window_seconds=0.1)
@@ -524,6 +566,57 @@ def test_backend_passes_the_download_timeout(tmp_path, monkeypatch):
         AudioSealBackend(model_dir=tmp_path, download=True, download_timeout_seconds=7)
     assert [call["timeout_seconds"] for call in seen] == [7, 7]
     assert [call["download"] for call in seen] == [True, True]
+
+
+def test_the_models_are_built_from_the_bytes_that_were_verified(tmp_path, monkeypatch):
+    """A checkpoint replaced after its check is refused, not unpickled.
+
+    find_model_file verifies the file on disk; the backend then reads the
+    bytes once more, checks them, and builds the model from them, so the
+    file cannot be swapped between the check and torch.load.
+    """
+    swapped = []
+
+    def find(spec, **kwargs):
+        path = tmp_path / spec.name
+        path.write_bytes(b"replaced after the check")  # what an attacker swapped in
+        swapped.append(spec.name)
+        return path
+
+    def no_build(*args, **kwargs):
+        pytest.fail("a model was built from unverified bytes")
+
+    monkeypatch.setattr(_audioseal, "import_optional", fake_import)
+    monkeypatch.setattr(_audioseal, "find_model_file", find)
+    monkeypatch.setattr(_audioseal, "_build", no_build)
+    with pytest.raises(ModelLoadError, match="SHA-256"):
+        AudioSealBackend(model_dir=tmp_path)
+    assert swapped
+
+
+def test_read_verified_checks_the_bytes_it_returns(tmp_path):
+    content = b"checkpoint bytes"
+    spec = modelfiles.ModelFile(
+        name="tiny.pth",
+        url="https://example.invalid/tiny.pth",
+        sha256=hashlib.sha256(content).hexdigest(),
+        size=len(content),
+    )
+    path = tmp_path / spec.name
+    path.write_bytes(content)
+    assert _audioseal._read_verified(path, spec, None) == content
+    path.write_bytes(content + b"!")  # one byte more than pinned
+    with pytest.raises(ModelLoadError, match="SHA-256"):
+        _audioseal._read_verified(path, spec, None)
+    other = b"weights you converted yourself"
+    path.write_bytes(other)
+    custom = hashlib.sha256(other).hexdigest().upper()  # find_model_file accepts any case
+    assert _audioseal._read_verified(path, spec, f" {custom} ") == other
+    with pytest.raises(ModelLoadError, match="SHA-256"):
+        _audioseal._read_verified(path, spec, "0" * 64)
+    path.unlink()
+    with pytest.raises(ModelLoadError, match="could not be read"):
+        _audioseal._read_verified(path, spec, None)
 
 
 def test_model_dir_inside_site_packages_is_refused(monkeypatch):

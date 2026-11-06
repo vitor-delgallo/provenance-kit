@@ -7,12 +7,14 @@ are MIT-licensed since the 2024-04-02 relicensing of the weights; see
 ``docs/THIRD_PARTY.md`` and ``docs/audio.md`` for the provenance check. The
 streaming checkpoints of the same repository are not used.
 
-Loading never runs an unrestricted unpickler: the checkpoints are verified
-against their pinned hash first, then read with ``torch.load`` and a
+Loading never runs an unrestricted unpickler: each checkpoint is read into
+memory and the bytes read are checked against the pinned hash (or the
+caller's), then those same bytes are unpickled with ``torch.load`` and a
 restricted unpickler that allows only tensors, plain containers and the
 configuration classes the checkpoints reference (which are replaced by inert
 placeholders: the configuration is taken from this module, copied from the
-``audioseal`` 0.2.1 model cards).
+``audioseal`` 0.2.1 model cards). Loading from the verified bytes rather
+than from the path means a file replaced after its check is never loaded.
 """
 
 from __future__ import annotations
@@ -20,7 +22,9 @@ from __future__ import annotations
 import collections
 import contextlib
 import copy
+import hashlib
 import importlib
+import io
 import itertools
 import math
 import pickle
@@ -100,6 +104,9 @@ AUDIOSEAL_SAMPLE_RATE = 16_000
 _BACKEND = "audioseal"
 _MIN_TAIL_SECONDS = 1.0
 _PROBABILITY_EPS = 1e-7
+# The most a checkpoint with a caller-supplied digest may hold (the pinned
+# ones are read up to their pinned size).
+_MAX_CUSTOM_CHECKPOINT_BYTES = 512 * 1024 * 1024
 
 # Model configuration from audioseal 0.2.1's cards (audioseal_wm_16bits.yaml
 # and audioseal_detector_16bits.yaml, MIT), matching the pinned checkpoints.
@@ -311,6 +318,9 @@ class AudioSealBackend:
             download=download and detector_path is None,
             timeout_seconds=download_timeout_seconds,
         )
+        # The bytes that are unpickled are the bytes that are checked here.
+        generator_bytes = _read_verified(generator_file, AUDIOSEAL_GENERATOR, generator_sha256)
+        detector_bytes = _read_verified(detector_file, AUDIOSEAL_DETECTOR, detector_sha256)
         try:
             with _quiet_upstream():
                 self._generator = _build(
@@ -319,18 +329,22 @@ class AudioSealBackend:
                     create=builder.create_generator,
                     config_type=builder.AudioSealWMConfig,
                     config=_GENERATOR_CONFIG,
-                    path=generator_file,
+                    data=generator_bytes,
+                    name=AUDIOSEAL_GENERATOR.name,
                     device=self._device,
                 )
+                del generator_bytes
                 self._detector = _build(
                     torch,
                     loader,
                     create=builder.create_detector,
                     config_type=builder.AudioSealDetectorConfig,
                     config=_DETECTOR_CONFIG,
-                    path=detector_file,
+                    data=detector_bytes,
+                    name=AUDIOSEAL_DETECTOR.name,
                     device=self._device,
                 )
+                del detector_bytes
         except ModelLoadError:
             raise
         except Exception as exc:
@@ -549,14 +563,15 @@ def _build(
     create: Any,
     config_type: Any,
     config: dict[str, Any],
-    path: Path,
+    data: bytes,
+    name: str,
     device: str,
 ) -> Any:
     parsed = loader.AudioSeal.parse_config(
         copy.deepcopy(config), config_type=config_type, nbits=AUDIOSEAL_PAYLOAD_BITS
     )
     model = create(parsed)
-    state = _load_state_dict(torch, path)
+    state = _load_state_dict(torch, data, name=name)
     loader.load_state_dict(model, loader.convert_state_dict_for_scriptable_model(state))
     return model.to(device).eval()
 
@@ -596,8 +611,47 @@ def _refuse_legacy(*args: object, **kwargs: object) -> Any:
     raise pickle.UnpicklingError("legacy (non-zip) checkpoints are not supported")
 
 
-def _load_state_dict(torch: Any, path: Path) -> dict[str, Any]:
-    """Reads a verified checkpoint with an allowlist unpickler; returns its state dict."""
+def _read_verified(path: Path, spec: ModelFile, sha256: str | None) -> bytes:
+    """Reads a checkpoint into memory and checks the bytes read against its digest.
+
+    :func:`~provenance_kit.modelfiles.find_model_file` has verified the file
+    on disk; the model is built from the bytes returned here, so what is
+    unpickled is what was verified even if the file is replaced in between.
+    This is :func:`provenance_kit.modelfiles.read_model_file`'s guarantee,
+    for the explicit paths and custom digests that it does not take.
+
+    Args:
+        path: The located, verified file.
+        spec: The pinned file.
+        sha256: The caller's digest, or ``None`` for the pinned one (and
+            size).
+
+    Returns:
+        The verified content.
+
+    Raises:
+        ModelLoadError: If the file cannot be read or the bytes read fail
+            the size or hash check.
+    """
+    expected = spec.sha256 if sha256 is None else sha256.strip().lower()
+    pinned = expected == spec.sha256
+    limit = spec.size if pinned else _MAX_CUSTOM_CHECKPOINT_BYTES
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(limit + 1)
+    except OSError as exc:
+        raise ModelLoadError(f"model file {spec.name} could not be read") from exc
+    if (
+        len(data) > limit
+        or (pinned and len(data) != spec.size)
+        or hashlib.sha256(data).hexdigest() != expected
+    ):
+        raise ModelLoadError(f"model file {spec.name} failed its SHA-256 check")
+    return data
+
+
+def _load_state_dict(torch: Any, data: bytes, *, name: str) -> dict[str, Any]:
+    """Reads verified checkpoint bytes with an allowlist unpickler; returns the state dict."""
     allowed: dict[tuple[str, str], Any] = {
         ("collections", "OrderedDict"): collections.OrderedDict,
         ("collections", "defaultdict"): _InertDict,
@@ -626,13 +680,13 @@ def _load_state_dict(torch: Any, path: Path) -> dict[str, Any]:
     restricted.load = _refuse_legacy  # type: ignore[attr-defined]
     try:
         checkpoint = torch.load(
-            str(path), map_location="cpu", weights_only=False, pickle_module=restricted
+            io.BytesIO(data), map_location="cpu", weights_only=False, pickle_module=restricted
         )
     except Exception as exc:
-        raise ModelLoadError(f"checkpoint {path.name} could not be read") from exc
+        raise ModelLoadError(f"checkpoint {name} could not be read") from exc
     state = checkpoint.get("model") if isinstance(checkpoint, dict) else None
     if not isinstance(state, dict) or not all(
         isinstance(key, str) and isinstance(value, torch.Tensor) for key, value in state.items()
     ):
-        raise ModelLoadError(f"checkpoint {path.name} does not hold a state dict")
+        raise ModelLoadError(f"checkpoint {name} does not hold a state dict")
     return state

@@ -25,6 +25,16 @@ Limits (:class:`~provenance_kit.limits.MediaLimits`), in order:
    :class:`~provenance_kit.errors.MediaLimitExceededError` instead of
    decoding without bound.
 
+Memory: the samples are de-interleaved chunk by chunk into one float32
+buffer whose size is fixed before the decode: the declared duration plus 1 %
+and one second, never past ``max_decoded_audio_bytes``. Media that declares
+no duration, or holds more than it declares, is decoded twice: once only to
+count the samples (under the same limits, keeping nothing), then into a
+buffer of exactly that size. The peak is therefore about the result plus a
+few MiB of read buffers (the declared size if the media holds less), never
+more than ``max_decoded_audio_bytes`` plus those buffers, and nothing
+reallocates a buffer while it is full.
+
 Downmixing (``channels`` below the source's) uses ffmpeg's matrix normalized
 so that no output sample can exceed full scale (``-rematrix_maxval 1.0``):
 stereo to mono is the mean of the two channels, as in the 16-bit path that
@@ -102,6 +112,12 @@ _AUDIO_CONTAINERS: frozenset[MediaType] = frozenset(
 _MAX_PROBE_OUTPUT = 1024 * 1024
 _DURATION_SLACK_SECONDS = 1.0
 _READ_CHUNK = 1024 * 1024
+# The decoded samples' buffer (_ChannelBuffer): the room it gets beyond the
+# declared duration (plus one second), the unused room it may keep at the end
+# (more is released), and the block size of the moves that pack its rows.
+_DECLARED_SLACK = 0.01
+_KEPT_SLACK = 0.25
+_MOVE_BLOCK = 1024 * 1024
 _PROBE_ENTRIES = (
     "format=format_name,duration,bit_rate"
     ":stream=index,codec_type,codec_name,sample_rate,channels,duration"
@@ -263,7 +279,9 @@ def decode_pcm(
             ``limits.subprocess_timeout_seconds``.
 
     Returns:
-        The decoded audio.
+        The decoded audio. At its peak the call holds about one copy of it
+        plus a few MiB of read buffers, and never more than
+        ``limits.max_decoded_audio_bytes`` plus those buffers.
 
     Raises:
         TypeError: If an argument has the wrong type.
@@ -306,23 +324,16 @@ def decode_pcm(
             channels=out_channels,
             max_duration_seconds=max_duration_seconds,
         )
-        raw = _read_pcm(
+        samples = _read_samples(
             staged,
             info,
             tools=tools,
             limits=limits,
-            sample_format="f32le",
             sample_rate=out_rate,
             channels=out_channels,
             max_duration_seconds=max_duration_seconds,
             timeout_seconds=timeout_seconds,
         )
-    frame_bytes = 4 * out_channels
-    usable = len(raw) - len(raw) % frame_bytes
-    interleaved = np.frombuffer(raw, dtype="<f4", count=usable // 4).reshape(-1, out_channels)
-    samples = np.array(interleaved.T, dtype=np.float32, order="C")  # always a writable copy
-    np.clip(samples, -1.0, 1.0, out=samples)
-    np.nan_to_num(samples, copy=False, nan=0.0)
     return PcmAudio(samples=samples, sample_rate=out_rate)
 
 
@@ -479,42 +490,119 @@ def _sample_cap_bytes(
     return min(duration_cap, limits.max_decoded_audio_bytes)
 
 
-def _read_pcm(
+def _read_samples(
     staged: _ffmpeg.StagedInput,
     info: AudioInfo,
     *,
     tools: ExternalTools,
     limits: MediaLimits,
-    sample_format: str,
     sample_rate: int,
     channels: int,
     max_duration_seconds: float | None,
     timeout_seconds: float | None,
-) -> bytes:
-    """Runs ffmpeg and returns the raw PCM bytes, counting them against the limits.
+) -> npt.NDArray[np.float32]:
+    """Runs ffmpeg and returns its float32 PCM as ``(channels, samples)``.
 
-    The output is held in memory, so it is capped by both the duration limit
-    and ``max_decoded_audio_bytes``; the error names the limit that was hit.
+    The output is counted against the duration limit and
+    ``max_decoded_audio_bytes`` before it is kept; the error names the limit
+    that was hit. Each chunk is de-interleaved straight into one
+    :class:`_ChannelBuffer` (clipped to ``[-1, 1]``, NaN set to 0), whose
+    size is fixed before the decode, so the call holds about one copy of the
+    result: no list of chunks, no joined bytes, no second array, and no
+    buffer that grows (a reallocation can hold the old and the new block at
+    once).
+
+    The size comes from the declared duration (or the caller's truncation),
+    with :data:`_DECLARED_SLACK` and one second to spare. When nothing is
+    declared, or the media turns out to hold more than that, ffmpeg runs once
+    only to count the samples (the limits apply as it runs, and nothing is
+    kept) and once more into a buffer of exactly that size.
     """
     args = _pcm_args(
         staged,
         info,
         limits=limits,
-        sample_format=sample_format,
+        sample_format="f32le",
         sample_rate=sample_rate,
         channels=channels,
         max_duration_seconds=max_duration_seconds,
     )
-    bytes_per_frame = (4 if sample_format == "f32le" else 2) * channels
+    bytes_per_frame = 4 * channels
     duration_cap = _duration_cap_bytes(
         limits,
         bytes_per_frame=bytes_per_frame,
         sample_rate=sample_rate,
         max_duration_seconds=max_duration_seconds,
     )
+    max_frames = (
+        _sample_cap_bytes(
+            limits,
+            bytes_per_frame=bytes_per_frame,
+            sample_rate=sample_rate,
+            max_duration_seconds=max_duration_seconds,
+        )
+        // bytes_per_frame
+    )
     timeout = limits.subprocess_timeout_seconds if timeout_seconds is None else timeout_seconds
-    parts: list[bytes] = []
+
+    def decode(buffer: _ChannelBuffer | None) -> int | None:
+        return _run_decoder(
+            staged,
+            args,
+            tools=tools,
+            limits=limits,
+            timeout=timeout,
+            channels=channels,
+            sample_rate=sample_rate,
+            duration_cap=duration_cap,
+            truncated=max_duration_seconds is not None,
+            buffer=buffer,
+        )
+
+    known = [s for s in (info.duration_seconds, max_duration_seconds) if s is not None]
+    if known:
+        expected = math.ceil(min(known) * sample_rate * (1 + _DECLARED_SLACK)) + sample_rate
+        buffer = _ChannelBuffer(channels, min(expected, max_frames))
+        if decode(buffer) is not None:
+            return buffer.finish()
+        del buffer  # the media holds more than it declares
+    frames = decode(None)  # count only; raises if a limit is exceeded
+    if frames is None:  # pragma: no cover - a counting run keeps nothing, so it never stops
+        raise MediaDecodeError("audio decoding: the decoder stopped while counting")
+    buffer = _ChannelBuffer(channels, frames)
+    if decode(buffer) is None:
+        raise MediaDecodeError("audio decoding: the decoder's output changed between two runs")
+    return buffer.finish()
+
+
+def _run_decoder(
+    staged: _ffmpeg.StagedInput,
+    args: list[str],
+    *,
+    tools: ExternalTools,
+    limits: MediaLimits,
+    timeout: float,
+    channels: int,
+    sample_rate: int,
+    duration_cap: int,
+    truncated: bool,
+    buffer: _ChannelBuffer | None,
+) -> int | None:
+    """Runs ffmpeg once, into ``buffer`` (or counting only, without one).
+
+    Returns:
+        The complete frames decoded, or ``None`` when they do not fit in
+        ``buffer`` (ffmpeg is then stopped). A trailing partial frame is
+        dropped.
+
+    Raises:
+        MediaLimitExceededError: If the output exceeds the duration limit or
+            ``max_decoded_audio_bytes``.
+        MediaDecodeError: If ffmpeg fails.
+    """
+    bytes_per_frame = 4 * channels
     total = 0
+    pending = b""  # the start of a frame cut by the chunk boundary
     try:
         with tools.stream(Tool.FFMPEG, args, stdin=staged.stdin, timeout_seconds=timeout) as proc:
             for chunk in proc.iter_chunks(_READ_CHUNK):
@@ -525,17 +613,89 @@ def _read_pcm(
                     raise MediaLimitExceededError(
                         "max_duration_seconds", limits.max_duration_seconds, seconds
                     )
-                parts.append(chunk)
+                if buffer is None:
+                    continue
+                data = pending + chunk if pending else chunk
+                usable = len(data) - len(data) % bytes_per_frame
+                if usable:
+                    frames = np.frombuffer(data, dtype="<f4", count=usable // 4)
+                    if not buffer.append(frames.reshape(-1, channels)):
+                        proc.stop()
+                        return None
+                pending = data[usable:]
     except ExternalToolError as exc:
         raise _ffmpeg.as_media_error(exc, "audio decoding") from exc
-    if max_duration_seconds is None and total > duration_cap - bytes_per_frame:
+    if not truncated and total > duration_cap - bytes_per_frame:
         # Exactly at the cap: the stream ran into the duration limit.
         raise MediaLimitExceededError(
             "max_duration_seconds",
             limits.max_duration_seconds,
             total / (bytes_per_frame * sample_rate),
         )
-    return b"".join(parts)
+    return total // bytes_per_frame
+
+
+class _ChannelBuffer:
+    """Float32 samples kept channel by channel in one flat buffer of fixed size.
+
+    The buffer holds ``channels`` rows of ``capacity`` samples back to back.
+    :meth:`finish` packs the rows together and returns a C-contiguous
+    ``(channels, frames)`` view of the buffer. It never grows: a reallocation
+    may hold the old and the new block at once.
+    """
+
+    def __init__(self, channels: int, capacity: int) -> None:
+        self._channels = channels
+        self._capacity = max(1, capacity)
+        self._frames = 0
+        self._flat = np.empty(channels * self._capacity, dtype=np.float32)
+
+    def append(self, frames: npt.NDArray[np.float32]) -> bool:
+        """Adds interleaved ``(count, channels)`` frames, clipped and with NaN zeroed.
+
+        Returns:
+            False, adding nothing, when they do not fit.
+        """
+        count = int(frames.shape[0])
+        start = self._frames
+        if start + count > self._capacity:
+            return False
+        for channel in range(self._channels):
+            row = channel * self._capacity
+            target = self._flat[row + start : row + start + count]
+            target[...] = frames[:, channel]
+            np.clip(target, -1.0, 1.0, out=target)  # +-inf become +-1; NaN stays NaN
+            np.copyto(target, np.float32(0.0), where=np.isnan(target))
+        self._frames += count
+        return True
+
+    def finish(self) -> npt.NDArray[np.float32]:
+        """Returns the samples as ``(channels, frames)``; the buffer is spent.
+
+        Unused room of up to :data:`_KEPT_SLACK` of the samples stays part of
+        the buffer; beyond that, the buffer is shrunk in place to the samples.
+        """
+        frames, capacity, channels = self._frames, self._capacity, self._channels
+        if frames == 0:
+            return np.zeros((channels, 0), dtype=np.float32)
+        if frames < capacity:
+            for channel in range(1, channels):  # pack the rows: each moves back
+                start = 0
+                while start < frames:
+                    stop = min(start + _MOVE_BLOCK, frames)
+                    source = channel * capacity
+                    target = channel * frames
+                    # Forward, block by block: a block never overwrites samples
+                    # not yet moved; NumPy handles one overlapping its source.
+                    self._flat[target + start : target + stop] = self._flat[
+                        source + start : source + stop
+                    ]
+                    start = stop
+            if capacity - frames > _KEPT_SLACK * frames:
+                # A shrink stays in place with the usual allocators (no second
+                # block; NumPy 2.5 traces it as old plus new size, though).
+                self._flat.resize(channels * frames, refcheck=False)
+        return self._flat[: channels * frames].reshape(channels, frames)
 
 
 def _probe_staged(

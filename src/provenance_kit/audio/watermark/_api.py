@@ -36,8 +36,9 @@ __all__ = [
 #: Default decision threshold on the detection probability (AudioSeal's own
 #: default). Measured on unmarked signals: 0.0 to 0.25 for broadband content,
 #: tonal content and noise; up to 0.43 for a steady 1 kHz sine; **up to
-#: 0.97 for impulse trains** (12 of 24 click trains at 50 and 100 Hz were
-#: "found", none passed 4 check bits). On marked signals after AAC in M4A,
+#: 0.97 for impulse trains** (83 of 612 periodic signals, clicks and pulse
+#: trains at 40 to 200 Hz, were "found"; 3 of them passed 4 check bits, none
+#: passed 8). On marked signals after AAC in M4A,
 #: MP3 files and Ogg Opus: 0.995 to 1.0; after encodings that shift the
 #: audio without recording the delay (raw ADTS AAC, MP3 written to a pipe):
 #: 0.36 to 1.0 (see docs/audio.md). The probability alone is therefore not
@@ -73,14 +74,29 @@ class AlignmentSearch:
     range of misalignments, while the bit confidence peaks near the true
     delay.
 
-    A non-zero offset is then used only if it is **corroborated**; otherwise
-    the result is the unshifted detection (offset 0):
+    A non-zero offset is then used only if the shifted detection is found
+    (a search never turns "found" into "not found") and the shift is
+    **corroborated**; otherwise the result is the unshifted detection
+    (offset 0):
 
     * with a codec that has check bits, the payload read after the shift
       must pass them (random bits do with probability ``2**-check_bits``);
     * without check bits, nothing independent backs the shift, so it may
       only refine the bits of a signal that is already found unshifted: the
       search never turns "not found" into "found".
+
+    With check bits the search gives unmarked audio **two chances** to
+    verify: the shifted payload, and then the unshifted one. Random bits
+    then pass with probability up to ``2 * 2**-check_bits`` instead of
+    ``2**-check_bits`` (measured with random bits: 7.2 % without the search,
+    13.6 % with it, for 4 check bits). Size the check bits for that
+    (``docs/audio.md``). The fall back to the unshifted result stays because
+    genuine marks need it: on audio that was already aligned, the search
+    picked a non-zero offset for 9 of 28 broadband marks (after M4A, MP3
+    files and Ogg Opus), and one of them verified only unshifted. Requiring
+    two disjoint windows to agree does not help: the windows of unmarked
+    periodic audio agree (the content repeats), those of genuine marks often
+    do not.
 
     The bit confidence alone is no evidence: an unmarked 100 Hz click train
     at 44.1 kHz reaches 0.205 at offset 380, its bits are identical in every
@@ -335,18 +351,21 @@ def _corroborated(
 ) -> bool:
     """Whether a non-zero shift chosen by the search may be used.
 
-    The bit confidence that picked the shift is no evidence on its own:
-    unmarked periodic content (a 100 Hz click train) reaches the floor, its
-    bits are identical in every window, and dropping samples raised its
-    detection probability from 0.14 to 0.95 (measured, ``docs/audio.md``).
-    With check bits, the shifted payload must pass them (random bits do with
-    probability ``2**-check_bits``). Without them, nothing independent backs
-    the shift, so it may only refine the bits of a signal that is already
-    found unshifted; it never turns "not found" into "found".
+    The shifted detection must be found: a search may refine a detection,
+    never turn "found" into "not found". The bit confidence that picked the
+    shift is no evidence on its own: unmarked periodic content (a 100 Hz
+    click train) reaches the floor, its bits are identical in every window,
+    and dropping samples raised its detection probability from 0.14 to 0.95
+    (measured, ``docs/audio.md``). With check bits, the shifted payload must
+    also pass them (random bits do with probability ``2**-check_bits``).
+    Without them, nothing independent backs the shift, so it may only refine
+    the bits of a signal that is already found unshifted; it never turns
+    "not found" into "found".
     """
+    if not shifted.found:
+        return False
     if codec is not None and codec.check_bits > 0:
-        decoded = codec.decode(shifted.decoded_bits or "0" * codec.total_bits)
-        return decoded.check_ok is True and decoded.valid
+        return shifted.verified
     return unshifted.found
 
 

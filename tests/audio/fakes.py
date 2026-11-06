@@ -46,6 +46,7 @@ class FakeProcess:
         self.tool = "ffmpeg"
         self.bytes_read = 0
         self.output_limit_exceeded = False
+        self.stopped = False
 
     def read(self, size: int = 65536) -> bytes:
         chunk = self._output[self._pos : self._pos + size]
@@ -57,22 +58,26 @@ class FakeProcess:
         return chunk
 
     def iter_chunks(self, size: int = 65536) -> Iterator[bytes]:
-        while chunk := self.read(size):
+        while not self.stopped and (chunk := self.read(size)):
             yield chunk
+
+    def stop(self) -> None:
+        self.stopped = True
 
 
 class FakeTools:
     """An ExternalTools stand-in with canned outputs; records calls.
 
     ``fpcalc`` is a callable receiving the PCM bytes it was fed and returning
-    ``(returncode, stdout)``.
+    ``(returncode, stdout)``. ``ffmpeg`` is the output of every ffmpeg run, or
+    a list of outputs for successive runs (the last one repeats).
     """
 
     def __init__(
         self,
         *,
         ffprobe: bytes = b"{}",
-        ffmpeg: bytes = b"",
+        ffmpeg: bytes | list[bytes] = b"",
         fpcalc: Callable[[bytes], tuple[int, bytes]] | None = None,
         ffmpeg_returncode: int = 0,
     ) -> None:
@@ -112,7 +117,9 @@ class FakeTools:
     def stream(self, tool: Tool | str, args: list[str], **kwargs: Any) -> Iterator[FakeProcess]:
         name = Tool(tool).value
         self.calls.append((name, list(args), kwargs))
-        yield FakeProcess(self._ffmpeg, kwargs.get("max_stdout_bytes"))
+        outputs = self._ffmpeg if isinstance(self._ffmpeg, list) else [self._ffmpeg]
+        runs = len(self.args_of("ffmpeg"))
+        yield FakeProcess(outputs[min(runs, len(outputs)) - 1], kwargs.get("max_stdout_bytes"))
         if self._ffmpeg_returncode:
             raise ExternalToolError(name, "failed", returncode=self._ffmpeg_returncode)
 

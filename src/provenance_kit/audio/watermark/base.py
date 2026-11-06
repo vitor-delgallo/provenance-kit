@@ -116,11 +116,22 @@ class AudioWatermarkDetection(WatermarkDetection):
 
         True only when ``found`` is true **and** the bits were decoded with a
         :class:`~provenance_kit.payload.PayloadCodec` that has check bits,
-        and they match (``payload.check_ok``) and the version is known. With
-        ``check_bits=c``, random bits pass with probability ``2**-c`` (1/16
-        for the recommended ``c=4``). Without a codec, or with a codec that
-        has no check bits, this is always false: nothing but the detector's
-        own score would back the result.
+        and they match (``payload.check_ok``) and the version is known.
+        Without a codec, or with a codec that has no check bits, this is
+        always false: nothing but the detector's own score would back the
+        result.
+
+        It is strong evidence, not proof. With ``check_bits=c``, an unmarked
+        signal that the detector finds passes with probability ``2**-c``,
+        and up to ``2 * 2**-c`` with an
+        :class:`~provenance_kit.audio.watermark.AlignmentSearch` (the
+        shifted and the unshifted payload each get a chance). The bits are
+        deterministic, so this is a property of the signal, not of the call:
+        an unmarked 2 s, 170 Hz band-limited pulse train is found and passes
+        4 check bits (identifier 3919) at 16, 44.1 and 48 kHz alike. The 16
+        bits are shared: 8 check bits (1 in 256) leave 256 identifiers, 4
+        check bits (1 in 16) leave 4,096. Measured rates and the
+        recommended setup are in ``docs/audio.md``.
         """
         payload = self.payload
         return self.found and payload is not None and payload.check_ok is True and payload.valid

@@ -21,9 +21,11 @@ its offset. Low-information overlaps cannot match: digital silence
 (:data:`SILENCE_VALUE`) is left out of the comparison, an overlap needs at
 least :data:`MIN_COMPARED_ITEMS` compared sub-fingerprints (audio shorter
 than about 4.6 s never matches), its agreement must be well above the
-chance level of its own bit statistics (:data:`MAX_CHANCE_ERROR_FRACTION`;
-stationary noise and steady tones agree by chance at bit error rates as
-low as 0.15) and it must hold :data:`MIN_DISTINCT_VALUES` distinct values.
+chance level of the compared pairs' own bit statistics
+(:data:`MAX_CHANCE_ERROR_FRACTION`; stationary noise and steady tones agree
+by chance at bit error rates as low as 0.15; in this test a run of
+identical pairs, as two steady drones give, counts once) and it must hold
+:data:`MIN_DISTINCT_VALUES` distinct values.
 
 The bit error rate threshold depends on the overlap
 (:func:`overlap_threshold`): :data:`DEFAULT_MAX_BIT_ERROR_RATE` (0.20) for
@@ -50,6 +52,7 @@ import math
 import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -85,6 +88,7 @@ __all__ = [
     "ITEM_SECONDS",
     "LONG_OVERLAP_SECONDS",
     "MAX_CHANCE_ERROR_FRACTION",
+    "MAX_COMPARISON_SECONDS",
     "MAX_FINGERPRINT_ITEMS",
     "MIN_COMPARED_ITEMS",
     "MIN_DISTINCT_VALUES",
@@ -162,11 +166,14 @@ MIN_COMPARED_ITEMS = 16
 #: An offset matches only if its bit error rate is below this fraction of its
 #: chance error rate (:attr:`AudioMatch.chance_bit_error_rate`): the agreement
 #: must be well above what the bits' own statistics give unrelated signals.
+#: Both rates are taken over the compared pairs, with a run of identical
+#: pairs counted once (:attr:`AudioMatch.chance_test_bit_error_rate`).
 #: Measured: genuine matches stay at or below 0.43 of chance (0.29 with 5 s
 #: of overlap or more); independent recordings of stationary noise (white,
 #: pink, brown, blue, violet, velvet, hiss, a -60 dBFS noise floor) are at
 #: 0.82 to 0.94 of it at their best offset, although their bit error rate
-#: (0.13 to 0.30) is as low as that of a genuine match. 0.6 would leave more
+#: (0.13 to 0.30) is as low as that of a genuine match, and the ends of two
+#: steady drones (hum, sawtooth, organ) at 0.60 to 0.76. 0.6 would leave more
 #: room for genuine short clips but let more windows of the suite's
 #: similar-structure songs through (``docs/audio.md``).
 MAX_CHANCE_ERROR_FRACTION = 0.5
@@ -178,6 +185,13 @@ MIN_DISTINCT_VALUES = MIN_COMPARED_ITEMS // 2
 
 #: The longest fingerprint accepted (about 34 hours).
 MAX_FINGERPRINT_ITEMS = 1_000_000
+
+#: The largest ``min_overlap_seconds`` and ``max_offset_seconds`` that
+#: :func:`compare_fingerprints` accepts: the span of the longest fingerprint
+#: (:data:`MAX_FINGERPRINT_ITEMS` x :data:`ITEM_SECONDS`, about 34.4 hours).
+#: No overlap or offset can be longer, so a larger value could only mean
+#: "the whole fingerprint" or "any offset", which this value already says.
+MAX_COMPARISON_SECONDS = MAX_FINGERPRINT_ITEMS * ITEM_SECONDS
 
 _MAGIC = b"PKAF"
 _HEADER = struct.Struct(">4sBBHdI")  # magic, version, algorithm, reserved, duration, count
@@ -198,9 +212,18 @@ _FPCALC_ARGS = (
 )
 # Chromaprint needs 4096 + 19 * 1365 samples for its first sub-fingerprint.
 _MIN_SAMPLES = 4096 + 19 * 1365
-# Passing offsets whose diversity is checked, best first, before giving up:
-# bounds the cost when a long low-information overlap passes everywhere.
+# The distinct-value check (_diverse) runs on at most this many offsets that
+# pass the other tests, best first: it bounds the cost of a long
+# low-information overlap. When more pass, they are first narrowed to the
+# offsets whose overlap holds MIN_DISTINCT_VALUES distinct values on each side
+# at all (_may_be_diverse, linear time), so the cap only matters when more
+# than 64 better offsets hold enough values in their overlap but not in their
+# compared pairs, which takes silence on one side hiding the other's values.
 _MAX_DIVERSITY_CHECKS = 64
+# _chance_test counts the pairs directly for at most this many
+# offsets and pairs in all; beyond, FFT correlations give every offset at once.
+_DIRECT_CHANCE_OFFSETS = 16
+_DIRECT_CHANCE_BUDGET = 1 << 22
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,9 +336,19 @@ class AudioMatch:
         chance_bit_error_rate: The bit error rate two unrelated signals with
             the same bit statistics would show at that offset:
             ``mean over bits of p_q (1 - p_r) + p_r (1 - p_q)``, where ``p``
-            is how often the bit is 1 on each side of the overlap (silence
-            excluded). About 0.42 for music, 0.16 to 0.32 for stationary
-            noise, 0.0 for a constant value; 0.0 when nothing was compared.
+            is how often the bit is 1 on each side of the **chance-test
+            pairs**: the compared pairs, with a run of identical pairs
+            counted once (a pair whose two codes both repeat the previous
+            item's is left out). About 0.42 for music, 0.16 to 0.32 for
+            stationary noise, 0.0 for a constant value; 0.0 when nothing was
+            compared.
+        chance_test_bit_error_rate: The bit error rate over the same
+            chance-test pairs, which the chance test compares with
+            ``MAX_CHANCE_ERROR_FRACTION * chance_bit_error_rate``. Equal to
+            ``bit_error_rate`` unless consecutive pairs repeat (steady
+            sounds); two steady drones that end at the same time agree at
+            0.018 over all their pairs but 0.18 to 0.29 over these (1.0 when
+            nothing was compared).
         bit_error_threshold: The bit error rate threshold that applied at
             that offset: :func:`overlap_threshold` of ``overlap_items``
             (stricter for short overlaps).
@@ -330,6 +363,7 @@ class AudioMatch:
     overlap_seconds: float
     query_coverage: float
     chance_bit_error_rate: float
+    chance_test_bit_error_rate: float
     bit_error_threshold: float
 
 
@@ -534,7 +568,11 @@ def compare_fingerprints(
     2. its bit error rate is below :data:`MAX_CHANCE_ERROR_FRACTION` times its
        chance error rate (:attr:`AudioMatch.chance_bit_error_rate`), which
        rejects stationary noise, steady tones and other content whose bits
-       agree by chance;
+       agree by chance. Both rates are taken over the compared pairs, with a
+       run of identical pairs counted once
+       (:attr:`AudioMatch.chance_test_bit_error_rate`): the long run of one
+       code that two steady drones share would otherwise make the few items
+       where they end look related;
     3. each side of the compared pairs holds at least
        :data:`MIN_DISTINCT_VALUES` distinct values.
 
@@ -548,6 +586,15 @@ def compare_fingerprints(
     starts with the last seconds of the reference) is found even when a long
     unrelated overlap scores a higher z-score.
 
+    Test 3 runs on at most 64 offsets that pass tests 1 and 2, best first,
+    which bounds its cost. When more pass, they are first narrowed, in linear
+    time, to the offsets whose overlap holds :data:`MIN_DISTINCT_VALUES`
+    distinct values on each side (silence aside). An alternation of two
+    codes that passes tests 1 and 2 at hundreds of offsets is removed there,
+    so "any offset passes" holds unless more than 64 better offsets hold
+    enough distinct values in their overlap but not in their compared pairs,
+    which takes silence on one side hiding the other side's values.
+
     Args:
         query: The fingerprint to look up (for example a clip).
         reference: The fingerprint to search in.
@@ -555,9 +602,11 @@ def compare_fingerprints(
             overlaps, in ``[0, 1]``; shorter overlaps are held to a
             proportionally stricter one (:func:`overlap_threshold`).
         min_overlap_seconds: Minimum compared overlap, in seconds (at least
-            :data:`MIN_COMPARED_ITEMS` sub-fingerprints in any case).
+            :data:`MIN_COMPARED_ITEMS` sub-fingerprints in any case), at
+            most :data:`MAX_COMPARISON_SECONDS`.
         max_offset_seconds: If given, only offsets with
-            ``abs(offset_seconds) <= max_offset_seconds`` are considered.
+            ``abs(offset_seconds) <= max_offset_seconds`` are considered; at
+            most :data:`MAX_COMPARISON_SECONDS`.
 
     Returns:
         The alignment; ``is_match`` is false when nothing passes, including
@@ -566,7 +615,8 @@ def compare_fingerprints(
 
     Raises:
         TypeError: If an argument has the wrong type.
-        ValueError: If the algorithms differ or a threshold is out of range.
+        ValueError: If the algorithms differ or a threshold is out of range
+            (including durations above :data:`MAX_COMPARISON_SECONDS`).
     """
     for name, value in (("query", query), ("reference", reference)):
         if not isinstance(value, AudioFingerprint):
@@ -574,10 +624,14 @@ def compare_fingerprints(
     if query.algorithm != reference.algorithm:
         raise ValueError("the fingerprints use different Chromaprint algorithms")
     check_number("max_bit_error_rate", max_bit_error_rate, minimum=0.0, maximum=1.0)
-    min_overlap = check_number("min_overlap_seconds", min_overlap_seconds, minimum=0.0)
+    min_overlap = check_number(
+        "min_overlap_seconds", min_overlap_seconds, minimum=0.0, maximum=MAX_COMPARISON_SECONDS
+    )
     max_offset: int | None = None
     if max_offset_seconds is not None:
-        seconds = check_number("max_offset_seconds", max_offset_seconds, minimum=0.0)
+        seconds = check_number(
+            "max_offset_seconds", max_offset_seconds, minimum=0.0, maximum=MAX_COMPARISON_SECONDS
+        )
         max_offset = math.floor(seconds / ITEM_SECONDS + 1e-9)
 
     nothing = AudioMatch(
@@ -590,6 +644,7 @@ def compare_fingerprints(
         overlap_seconds=0.0,
         query_coverage=0.0,
         chance_bit_error_rate=0.0,
+        chance_test_bit_error_rate=1.0,
         bit_error_threshold=float(_thresholds(np.array([0]), max_bit_error_rate)[0]),
     )
     q = np.asarray(query.values, dtype=np.uint32)
@@ -620,22 +675,20 @@ def compare_fingerprints(
     ranked = candidates[order]
     thresholds = _thresholds(compared[candidates], max_bit_error_rate)
     passing = ranked[(rates <= thresholds)[order]]
-    best, chance, matched = int(ranked[0]), None, False
+    best, matched = int(ranked[0]), False
     if passing.size:
-        passing_chance = _chance_error_rates(q, r, offsets[passing])
-        informative = errors[passing] < (
-            MAX_CHANCE_ERROR_FRACTION * passing_chance * _BITS * compared[passing]
-        )
-        for index, rate in zip(
-            passing[informative][:_MAX_DIVERSITY_CHECKS],
-            passing_chance[informative][:_MAX_DIVERSITY_CHECKS],
-            strict=True,
-        ):
+        chances, test_errors, test_pairs = _chance_test(q, r, offsets[passing])
+        passing = passing[test_errors < MAX_CHANCE_ERROR_FRACTION * chances * _BITS * test_pairs]
+        if passing.size > _MAX_DIVERSITY_CHECKS:
+            # A long low-information overlap (an alternation of two codes)
+            # can pass the other tests at hundreds of offsets: keep only the
+            # offsets whose overlap holds enough distinct values at all.
+            passing = passing[_may_be_diverse(q, r, offsets[passing])]
+        for index in passing[:_MAX_DIVERSITY_CHECKS]:
             if _diverse(q, r, int(offsets[index])):
-                best, chance, matched = int(index), float(rate), True
+                best, matched = int(index), True
                 break
-    if chance is None:
-        chance = float(_chance_error_rates(q, r, offsets[[best]])[0])
+    chance, test_error_count, test_pair_count = _chance_test_at(q, r, int(offsets[best]))
     rate = float(errors[best] / (_BITS * compared[best]))
     overlap = int(compared[best])
     offset = int(offsets[best])
@@ -649,6 +702,9 @@ def compare_fingerprints(
         overlap_seconds=overlap * ITEM_SECONDS,
         query_coverage=overlap / q.size,
         chance_bit_error_rate=chance,
+        chance_test_bit_error_rate=(
+            test_error_count / (_BITS * test_pair_count) if test_pair_count else 1.0
+        ),
         bit_error_threshold=float(_thresholds(np.array([overlap]), max_bit_error_rate)[0]),
     )
 
@@ -733,53 +789,218 @@ def _offset_counts(
     n_q, n_r = q.size, r.size
     q_ok = (q != SILENCE_VALUE).astype(np.float64)
     r_ok = (r != SILENCE_VALUE).astype(np.float64)
-    size = 1 << (n_q + n_r - 1).bit_length()
+    size = _fft_size(n_q, n_r)
     spectrum = np.zeros(size // 2 + 1, dtype=np.complex128)
     for bit in range(_BITS):
         q_plane = (((q >> bit) & 1).astype(np.float64) * 2.0 - 1.0) * q_ok
         r_plane = (((r >> bit) & 1).astype(np.float64) * 2.0 - 1.0) * r_ok
         spectrum += np.conj(np.fft.rfft(q_plane, size)) * np.fft.rfft(r_plane, size)
     pairs = np.conj(np.fft.rfft(q_ok, size)) * np.fft.rfft(r_ok, size)
-
-    def by_offset(spectrum: npt.NDArray[np.complex128]) -> npt.NDArray[np.float64]:
-        correlation = np.fft.irfft(spectrum, size)
-        # correlation[k] = sum_i q[i] r[i + k]; negative k wrap around to the end.
-        return np.concatenate((correlation[size - (n_q - 1) :], correlation[:n_r]))
-
-    compared = np.clip(np.rint(by_offset(pairs)), 0, None).astype(np.int64)
-    errors = np.rint((_BITS * compared - by_offset(spectrum)) / 2.0).astype(np.int64)
-    return np.clip(errors, 0, _BITS * compared), compared
+    compared = np.clip(np.rint(_by_offset(pairs, n_q, n_r, size)), 0, None).astype(np.int64)
+    errors = np.rint((_BITS * compared - _by_offset(spectrum, n_q, n_r, size)) / 2.0)
+    return np.clip(errors.astype(np.int64), 0, _BITS * compared), compared
 
 
-def _chance_error_rates(
-    q: npt.NDArray[np.uint32], r: npt.NDArray[np.uint32], offsets: npt.NDArray[np.int64]
+def _fft_size(n_q: int, n_r: int) -> int:
+    """A power of two that holds every offset's correlation without wrapping."""
+    return 1 << (n_q + n_r - 1).bit_length()
+
+
+def _by_offset(
+    spectrum: npt.NDArray[np.complex128], n_q: int, n_r: int, size: int
 ) -> npt.NDArray[np.float64]:
-    """The bit error rate unrelated signals with the same bit statistics would show.
+    """The correlation of a cross spectrum, indexed by offset (``d + n_q - 1``)."""
+    correlation = np.fft.irfft(spectrum, size)
+    # correlation[k] = sum_i q[i] r[i + k]; negative k wrap around to the end.
+    return np.concatenate((correlation[size - (n_q - 1) :], correlation[:n_r]))
 
-    For each offset: the mean over the 32 bits of ``p_q (1 - p_r) + p_r (1 -
-    p_q)``, where ``p_q`` and ``p_r`` are how often the bit is 1 in the query
-    and the reference over the overlap, silence excluded on each side
-    (prefix sums: linear in the fingerprint lengths and the offsets).
+
+def _chance_test(
+    q: npt.NDArray[np.uint32], r: npt.NDArray[np.uint32], offsets: npt.NDArray[np.int64]
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """The chance test's numbers at each offset: chance error rate, bit errors, pairs.
+
+    All three are taken over the **chance-test pairs**: the compared pairs
+    (neither side silence), with a run of identical pairs counted once (a
+    pair whose two codes both repeat the previous item's is left out). The
+    chance error rate is the mean over the 32 bits of ``p_q (1 - p_r) + p_r
+    (1 - p_q)``, where ``p_q`` and ``p_r`` are how often the bit is 1 on each
+    side of those pairs.
+
+    Both choices keep content that carries no information from looking
+    related: taking each side's own non-silent items instead of the compared
+    pairs let a query that ends in silence borrow the bit statistics of the
+    reference's music facing that silence (round-2 finding M01), and the 180
+    or so identical pairs of two steady drones made the 20 items where both
+    drones end look far better than chance.
+
+    A few short overlaps are counted directly; otherwise every offset is
+    computed at once with FFT correlations (:func:`_chance_test_all`).
     """
     n_q, n_r = q.size, r.size
-    q0 = np.maximum(0, -offsets)
-    q1 = np.minimum(n_q, n_r - offsets)
-    r0, r1 = q0 + offsets, q1 + offsets
-    q_ok = (q != SILENCE_VALUE).astype(np.int64)
-    r_ok = (r != SILENCE_VALUE).astype(np.int64)
-    q_count = np.concatenate(([0], np.cumsum(q_ok)))
-    r_count = np.concatenate(([0], np.cumsum(r_ok)))
-    q_items = np.maximum(q_count[q1] - q_count[q0], 1)
-    r_items = np.maximum(r_count[r1] - r_count[r0], 1)
-    total = np.zeros(offsets.size, dtype=np.float64)
+    spans = np.minimum(n_q, n_r - offsets) - np.maximum(0, -offsets)
+    if offsets.size <= _DIRECT_CHANCE_OFFSETS and int(spans.sum()) <= _DIRECT_CHANCE_BUDGET:
+        rows = [_chance_test_at(q, r, int(d)) for d in offsets]
+        return (
+            np.array([row[0] for row in rows], dtype=np.float64),
+            np.array([row[1] for row in rows], dtype=np.int64),
+            np.array([row[2] for row in rows], dtype=np.int64),
+        )
+    chance, errors, pairs = _chance_test_all(q, r)
+    index = offsets + (n_q - 1)
+    return chance[index], errors[index], pairs[index]
+
+
+def _chance_test_at(
+    q: npt.NDArray[np.uint32], r: npt.NDArray[np.uint32], offset: int
+) -> tuple[float, int, int]:
+    """:func:`_chance_test` at one offset, counted directly."""
+    start = max(0, -offset)
+    stop = min(q.size, r.size - offset)
+    q_part = q[start:stop]
+    r_part = r[start + offset : stop + offset]
+    kept = (q_part != SILENCE_VALUE) & (r_part != SILENCE_VALUE)
+    kept[1:] &= (q_part[1:] != q_part[:-1]) | (r_part[1:] != r_part[:-1])
+    q_part, r_part = q_part[kept], r_part[kept]
+    pairs = int(q_part.size)
+    if not pairs:
+        return 0.0, 0, 0
+    total = 0.0
+    errors = 0
+    differ = q_part ^ r_part
     for bit in range(_BITS):
-        q_ones = np.concatenate(([0], np.cumsum(((q >> bit) & 1).astype(np.int64) * q_ok)))
-        r_ones = np.concatenate(([0], np.cumsum(((r >> bit) & 1).astype(np.int64) * r_ok)))
-        p_q = (q_ones[q1] - q_ones[q0]) / q_items
-        p_r = (r_ones[r1] - r_ones[r0]) / r_items
+        p_q = int(np.count_nonzero((q_part >> bit) & 1)) / pairs
+        p_r = int(np.count_nonzero((r_part >> bit) & 1)) / pairs
         total += p_q * (1.0 - p_r) + p_r * (1.0 - p_q)
-    result: npt.NDArray[np.float64] = total / _BITS
+        errors += int(np.count_nonzero((differ >> bit) & 1))
+    return total / _BITS, errors, pairs
+
+
+def _chance_test_all(
+    q: npt.NDArray[np.uint32], r: npt.NDArray[np.uint32]
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    """:func:`_chance_test` at every offset (indexed like :func:`_offset_counts`).
+
+    The weight of the pair ``(i, i + d)`` is ``ok_q[i] ok_r[i + d] - rep_q[i]
+    rep_r[i + d]``, where ``ok`` marks non-silent items and ``rep`` the
+    non-silent items equal to the item before them (a repeated pair is then
+    compared and weighs 0). Each weighted sum over the pairs is the
+    difference of two correlations: the pairs, a bit's ones on each side, and
+    the pairs where both sides hold a 1 (which give the errors). Without
+    repeats on one side, no pair repeats and those correlations are skipped.
+    """
+    n_q, n_r = q.size, r.size
+    size = _fft_size(n_q, n_r)
+    q_ok = q != SILENCE_VALUE
+    r_ok = r != SILENCE_VALUE
+    q_rep = np.zeros(n_q, dtype=np.bool_)
+    q_rep[1:] = (q[1:] == q[:-1]) & q_ok[1:]
+    r_rep = np.zeros(n_r, dtype=np.bool_)
+    r_rep[1:] = (r[1:] == r[:-1]) & r_ok[1:]
+    repeats = bool(q_rep.any() and r_rep.any())
+
+    def spectrum(values: npt.NDArray[np.bool_], *, repeated: bool = False) -> Any:
+        if repeated and not repeats:
+            return 0.0
+        return np.fft.rfft(values.astype(np.float64), size)
+
+    q_ok_f, q_rep_f = np.conj(spectrum(q_ok)), np.conj(spectrum(q_rep, repeated=True))
+    r_ok_f, r_rep_f = spectrum(r_ok), spectrum(r_rep, repeated=True)
+
+    def weighted(q_ok_part: Any, q_rep_part: Any, r_ok_part: Any, r_rep_part: Any) -> Any:
+        correlation = _by_offset(q_ok_part * r_ok_part - q_rep_part * r_rep_part, n_q, n_r, size)
+        return np.clip(np.rint(correlation), 0, None)
+
+    pairs = weighted(q_ok_f, q_rep_f, r_ok_f, r_rep_f)
+    total = np.zeros(n_q + n_r - 1, dtype=np.float64)
+    ones = np.zeros(n_q + n_r - 1, dtype=np.float64)
+    both = np.zeros(size // 2 + 1, dtype=np.complex128)
+    for bit in range(_BITS):
+        q_bit = ((q >> bit) & 1).astype(np.bool_)
+        r_bit = ((r >> bit) & 1).astype(np.bool_)
+        q_ones_ok = np.conj(spectrum(q_bit & q_ok))
+        q_ones_rep = np.conj(spectrum(q_bit & q_rep, repeated=True))
+        r_ones_ok = spectrum(r_bit & r_ok)
+        r_ones_rep = spectrum(r_bit & r_rep, repeated=True)
+        a = weighted(q_ones_ok, q_ones_rep, r_ok_f, r_rep_f)  # query ones over the pairs
+        b = weighted(q_ok_f, q_rep_f, r_ones_ok, r_ones_rep)  # reference ones
+        both += q_ones_ok * r_ones_ok - q_ones_rep * r_ones_rep
+        # p_q (1 - p_r) + p_r (1 - p_q), times pairs**2.
+        total += (a + b) * pairs - 2.0 * a * b
+        ones += a + b
+    agree = np.clip(np.rint(_by_offset(both, n_q, n_r, size)), 0, None)
+    errors = np.clip(ones - 2.0 * agree, 0, None).astype(np.int64)
+    squared = np.maximum(pairs, 1.0) ** 2
+    chance: npt.NDArray[np.float64] = total / (squared * _BITS)
+    return chance, errors, pairs.astype(np.int64)
+
+
+def _may_be_diverse(
+    q: npt.NDArray[np.uint32], r: npt.NDArray[np.uint32], offsets: npt.NDArray[np.int64]
+) -> npt.NDArray[np.bool_]:
+    """Whether each side's overlap holds :data:`MIN_DISTINCT_VALUES` distinct values.
+
+    A filter before :func:`_diverse`: it counts each side's non-silent items
+    over the whole overlap, so it can only overcount the distinct values of
+    the compared pairs (where silence on the other side removes pairs), never
+    reject an offset that :func:`_diverse` accepts.
+    """
+    q0 = np.maximum(0, -offsets)
+    q1 = np.minimum(q.size, r.size - offsets)
+    return _holds_distinct(q, q0, q1) & _holds_distinct(r, q0 + offsets, q1 + offsets)
+
+
+def _holds_distinct(
+    values: npt.NDArray[np.uint32], starts: npt.NDArray[np.int64], stops: npt.NDArray[np.int64]
+) -> npt.NDArray[np.bool_]:
+    """Whether ``values[start:stop]`` holds :data:`MIN_DISTINCT_VALUES` non-silent values.
+
+    Linear in the number of items: consecutive equal values (and silence) are
+    collapsed into runs, and one sweep over the runs finds, for each run, how
+    far a range starting there must reach to hold enough distinct values.
+    """
+    result = np.zeros(starts.size, dtype=np.bool_)
+    informative = values != SILENCE_VALUE
+    kept = values[informative]
+    if not kept.size:
+        return result
+    new_run = np.ones(kept.size, dtype=np.bool_)
+    new_run[1:] = kept[1:] != kept[:-1]
+    run_of = np.cumsum(new_run) - 1
+    reach = _distinct_reach(kept[new_run].tolist(), MIN_DISTINCT_VALUES)
+    # Non-silent items before each index: the kept items of values[start:stop]
+    # are kept[before[start]:before[stop]].
+    before = np.concatenate(([0], np.cumsum(informative)))
+    first, last = before[starts], before[stops]
+    some = last > first
+    result[some] = run_of[last[some] - 1] + 1 >= reach[run_of[first[some]]]
     return result
+
+
+def _distinct_reach(runs: list[int], count: int) -> npt.NDArray[np.int64]:
+    """For each start, the smallest end with ``count`` distinct values in ``runs[start:end]``.
+
+    ``len(runs) + 1`` where no end does. A two-pointer sweep: the end only
+    moves forward.
+    """
+    size = len(runs)
+    reach = np.full(size, size + 1, dtype=np.int64)
+    seen: dict[int, int] = {}
+    end = 0
+    for start, value in enumerate(runs):
+        while len(seen) < count and end < size:
+            added = runs[end]
+            seen[added] = seen.get(added, 0) + 1
+            end += 1
+        if len(seen) < count:
+            break  # later starts see a subset of what is left
+        reach[start] = end
+        left = seen[value] - 1
+        if left:
+            seen[value] = left
+        else:
+            del seen[value]
+    return reach
 
 
 def _diverse(q: npt.NDArray[np.uint32], r: npt.NDArray[np.uint32], offset: int) -> bool:
